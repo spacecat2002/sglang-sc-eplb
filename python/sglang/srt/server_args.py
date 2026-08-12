@@ -268,6 +268,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
 MOE_A2A_BACKEND_CHOICES = [
     "none",
     "deepep",
+    "hybridep",  # legacy/experimental HybridEP-compatible DeepEP fork
     "mooncake",
     "nixl",
     "mori",

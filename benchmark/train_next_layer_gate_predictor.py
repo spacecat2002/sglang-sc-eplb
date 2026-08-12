@@ -4,7 +4,7 @@
 Each predictor learns from the previous MoE gate input ``h[l]`` while the
 teacher is the real next gate output ``gate[l + 1](h[l + 1])``:
 
-    predicted_logits = frozen_gate[l + 1](h[l]) + low_rank_residual(h[l])
+    predicted_logits = frozen_gate[l + 1](h[l]) + residual(h[l])
 
 The base model and every original router remain frozen.  The checkpoint only
 contains the small residual predictors, so it can be loaded independently by
@@ -17,6 +17,10 @@ Example:
       --num-samples 2000 --max-length 1024 --batch-size 1 \
       --top-m 16 --rank 64 --epochs 3 \
       --checkpoint-out next_gate_predictor.pt
+
+To reproduce PROBE's lookahead predictor (Eq. 7), use ``--trainer probe``.
+It freezes the target-layer router, adds ``W2 * SiLU(W1 * h[l])`` with W2
+zero-initialized, and uses only router-distribution distillation.
 """
 
 from __future__ import annotations
@@ -58,6 +62,21 @@ class LowRankGateResidual(nn.Module):
         x = hidden_states.float()
         x = x * torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + self.eps)
         return self.up(F.silu(self.down(x)))
+
+
+class ProbeGateResidual(nn.Module):
+    """PROBE Eq. 7 residual MLP, without extra normalization or auxiliary inputs."""
+
+    def __init__(self, hidden_size: int, num_experts: int, width: int):
+        super().__init__()
+        self.w1 = nn.Linear(hidden_size, width, bias=False)
+        self.w2 = nn.Linear(width, num_experts, bias=False)
+        nn.init.kaiming_uniform_(self.w1.weight, a=5**0.5)
+        # The initial predictor exactly matches the frozen target-layer gate.
+        nn.init.zeros_(self.w2.weight)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.w2(F.silu(self.w1(hidden_states.float())))
 
 
 @dataclass
@@ -128,12 +147,20 @@ def _build_predictors(
 ) -> nn.ModuleDict:
     predictors = nn.ModuleDict()
     for pair in pair_batches:
-        predictors[str(pair.index)] = LowRankGateResidual(
-            pair.previous.shape[-1],
-            pair.teacher_logits.shape[-1],
-            args.rank,
-            args.rms_norm_eps,
-        ).to(args.device)
+        if args.trainer == "probe":
+            predictor: nn.Module = ProbeGateResidual(
+                pair.previous.shape[-1],
+                pair.teacher_logits.shape[-1],
+                args.probe_hidden_size,
+            )
+        else:
+            predictor = LowRankGateResidual(
+                pair.previous.shape[-1],
+                pair.teacher_logits.shape[-1],
+                args.rank,
+                args.rms_norm_eps,
+            )
+        predictors[str(pair.index)] = predictor.to(args.device)
     if not predictors:
         raise RuntimeError("no usable adjacent gate pairs were captured")
     return predictors
@@ -146,6 +173,24 @@ def _losses(
     top_m: int,
     args: argparse.Namespace,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
+    temperature = args.temperature
+    distill_loss = F.kl_div(
+        F.log_softmax(predicted_logits / temperature, dim=-1),
+        F.softmax(teacher_logits / temperature, dim=-1),
+        reduction="batchmean",
+    ) * temperature**2
+    if args.trainer == "probe":
+        # PROBE Eq. 7: cross-entropy against the target router distribution.
+        target_probability = F.softmax(teacher_logits / temperature, dim=-1)
+        cross_entropy = -(
+            target_probability * F.log_softmax(predicted_logits / temperature, dim=-1)
+        ).sum(dim=-1).mean()
+        return cross_entropy, {
+            "rank": 0.0,
+            "distill": cross_entropy.detach().item(),
+            "load": 0.0,
+        }
+
     num_experts = predicted_logits.shape[-1]
     teacher_topk = teacher_logits.topk(top_k, dim=-1).indices
     positive_logits = predicted_logits.gather(1, teacher_topk)
@@ -163,13 +208,6 @@ def _losses(
         rank_loss = F.softplus(boundary.unsqueeze(-1) + args.margin - positive_logits).mean()
     else:
         rank_loss = predicted_logits.new_zeros(())
-
-    temperature = args.temperature
-    distill_loss = F.kl_div(
-        F.log_softmax(predicted_logits / temperature, dim=-1),
-        F.softmax(teacher_logits / temperature, dim=-1),
-        reduction="batchmean",
-    ) * temperature**2
 
     target_load = torch.zeros_like(predicted_logits)
     target_load.scatter_(1, teacher_topk, 1.0 / top_k)
@@ -325,7 +363,7 @@ def run(args: argparse.Namespace) -> None:
     if not train_texts:
         raise ValueError("no training prompts remain after the validation split")
     print(
-        f"[setup] gates={len(gates)} pairs={len(gates) - 1} "
+        f"[setup] trainer={args.trainer} gates={len(gates)} pairs={len(gates) - 1} "
         f"train_prompts={len(train_texts)} validation_prompts={len(validation_texts)} "
         f"batch_size={args.batch_size}",
         flush=True,
@@ -458,10 +496,12 @@ def run(args: argparse.Namespace) -> None:
     checkpoint = {
         "format_version": 1,
         "model": args.model,
+        "trainer": args.trainer,
         "gate_pattern": args.gate_pattern,
         "top_k": top_k,
         "top_m": args.top_m,
         "rank": args.rank,
+        "probe_hidden_size": args.probe_hidden_size,
         "pair_names": {
             index: (gates[int(index)][0], gates[int(index) + 1][0])
             for index in predictors.keys()
@@ -494,10 +534,22 @@ def main() -> None:
     parser.add_argument("--dtype", choices=["auto", "bf16", "fp16", "fp32"], default="auto")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--gate-pattern", default=r"(?:^|\.)(?:gate|router)$")
+    parser.add_argument(
+        "--trainer",
+        choices=["residual", "probe"],
+        default="residual",
+        help="residual: RMSNorm low-rank predictor; probe: paper Eq. 7 predictor and CE distillation",
+    )
     parser.add_argument("--top-k", type=int, default=None)
     parser.add_argument("--top-m", type=int, required=True, help="deployment prefetch candidate size M")
     parser.add_argument("--train-pairs", type=int, nargs="+", default=None, help="e.g. 0 1 trains L0->L1 and L1->L2")
     parser.add_argument("--rank", type=int, default=64)
+    parser.add_argument(
+        "--probe-hidden-size",
+        type=int,
+        default=256,
+        help="PROBE residual MLP width for --trainer probe",
+    )
     parser.add_argument("--rms-norm-eps", type=float, default=1e-6)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--learning-rate", type=float, default=1e-4)

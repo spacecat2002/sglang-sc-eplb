@@ -136,6 +136,21 @@ def _get_deepep_comm_group(a2a_backend):
 
 def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
+    if a2a_backend.is_hybridep():
+        # Deliberately lazy: importing the legacy runtime must not affect normal
+        # SGLang startup or users with a stock DeepEP installation.
+        from sglang.srt.layers.moe.token_dispatcher.legacy_experimental.hybridep import (
+            HybridEPDispatcher,
+        )
+
+        return HybridEPDispatcher(
+            group=get_tp_group().device_group,
+            router_topk=moe_runner_config.top_k,
+            num_experts=moe_runner_config.num_experts,
+            num_local_experts=moe_runner_config.num_local_experts,
+            hidden_size=moe_runner_config.hidden_size,
+            params_dtype=moe_runner_config.params_dtype,
+        )
     if a2a_backend.is_none() and is_npu():
         return AscendTPDispatcher(moe_runner_config)
     elif (
