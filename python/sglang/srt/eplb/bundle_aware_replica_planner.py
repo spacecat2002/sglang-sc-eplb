@@ -182,20 +182,28 @@ class BundleAwareReplicaPlanner:
 
         return ReplicaPlan(placement, actions, baseline, current)
 
+    def evaluate_baseline(self, routed_tokens: Iterable[RoutedToken]) -> PlanMetrics:
+        """Replay home placement only, without considering replica actions."""
+        tokens = list(routed_tokens)
+        if not tokens:
+            raise ValueError("routed_tokens must not be empty")
+        self._validate_tokens(tokens)
+        return self._evaluate(tokens, self._baseline_placement())
+
     def plan_fast(
         self,
         routed_tokens: Iterable[RoutedToken],
         *,
         max_candidates: int = 64,
     ) -> ReplicaPlan:
-        """Choose one bounded-cost replica action from a recent route window.
+        """Choose one bounded-cost replica action for each destination rank.
 
         Unlike :meth:`plan`, this method never replays every bundle for every
         candidate.  It scans the route window once, retains only the hottest
         closure/singleton candidates, and scores their load deltas.  The result
-        is deliberately approximate: it is intended for a runtime control loop
-        that applies at most one action per window, while ``plan`` remains the
-        exact offline oracle.
+        is deliberately approximate: it independently chooses at most one
+        action for each destination rank, while ``plan`` remains the exact
+        offline oracle.
         """
         if max_candidates < 1:
             raise ValueError("max_candidates must be positive")
@@ -211,70 +219,106 @@ class BundleAwareReplicaPlanner:
         )
         baseline = self._with_objective(baseline, normalization)
 
-        # Keep a small, bounded candidate set.  Closure potential is the
-        # actual weighted DeepEP transfer it can eliminate; singleton demand
-        # is its possible compute-offload benefit.
-        closure_limit = max_candidates // 2
-        top_closures = heapq.nlargest(
-            closure_limit,
-            closure_counts.items(),
-            key=lambda item: item[1]
-            * _link_cost(item[0][0], item[0][1], self.ranks_per_node, self.rdma_cost),
+        candidates_by_rank = self._fast_candidates_by_destination(
+            closure_counts, local_demands, placement, max_candidates
         )
-        top_singles = heapq.nlargest(
-            max_candidates - closure_limit,
-            local_demands.items(),
-            key=lambda item: item[1],
-        )
+        proposals: List[Tuple[ReplicaAction, int, int]] = []
+        for candidates in candidates_by_rank.values():
+            best: Optional[
+                Tuple[Tuple[float, float, float, int], ReplicaAction, int, int]
+            ] = None
+            for action, remote, closure_count in candidates.values():
+                if self._apply_action(placement, action) is None:
+                    continue
+                candidate_metrics = self._fast_candidate_metrics(
+                    baseline,
+                    action,
+                    remote,
+                    closure_count,
+                    local_demands,
+                    normalization,
+                )
+                score = self._score(candidate_metrics)
+                if score < self._score(baseline) and (best is None or score < best[0]):
+                    best = (score, action, remote, closure_count)
+            if best is not None:
+                _, action, remote, closure_count = best
+                proposals.append((action, remote, closure_count))
 
-        candidates: Dict[
-            Tuple[int, Tuple[int, ...]], Tuple[ReplicaAction, int, int]
-        ] = {}
-        for (source, remote, experts), count in top_closures:
-            missing = tuple(
-                expert for expert in experts if expert not in placement[source]
-            )
-            if not missing or (
-                self.max_bundle_size is not None and len(missing) > self.max_bundle_size
-            ):
+        final_placement = placement
+        final_metrics = baseline
+        actions: List[ReplicaAction] = []
+        for action, remote, closure_count in sorted(
+            proposals, key=lambda item: item[0].destination_rank
+        ):
+            next_placement = self._apply_action(final_placement, action)
+            if next_placement is None:
                 continue
-            action = ReplicaAction(source, missing, "bundle-closure")
-            candidates[(source, missing)] = (action, remote, count)
-        for (source, expert), _ in top_singles:
-            if expert in placement[source]:
-                continue
-            key = (source, (expert,))
-            # Prefer a closure if a singleton is sufficient to remove a rank.
-            candidates.setdefault(
-                key, (ReplicaAction(source, (expert,), "single"), -1, 0)
-            )
-
-        best_action: Optional[ReplicaAction] = None
-        best_metrics: Optional[PlanMetrics] = None
-        for action, remote, closure_count in candidates.values():
-            candidate_placement = self._apply_action(placement, action)
-            if candidate_placement is None:
-                continue
-            candidate_metrics = self._fast_candidate_metrics(
-                baseline,
+            final_placement = next_placement
+            final_metrics = self._fast_candidate_metrics(
+                final_metrics,
                 action,
                 remote,
                 closure_count,
                 local_demands,
                 normalization,
             )
-            if self._score(candidate_metrics) < self._score(baseline) and (
-                best_metrics is None
-                or self._score(candidate_metrics) < self._score(best_metrics)
-            ):
-                best_action = action
-                best_metrics = candidate_metrics
+            actions.append(action)
+        return ReplicaPlan(final_placement, actions, baseline, final_metrics)
 
-        if best_action is None or best_metrics is None:
-            return ReplicaPlan(placement, [], baseline, baseline)
-        final_placement = self._apply_action(placement, best_action)
-        assert final_placement is not None
-        return ReplicaPlan(final_placement, [best_action], baseline, best_metrics)
+    def _fast_candidates_by_destination(
+        self,
+        closure_counts: Mapping[Tuple[int, int, Tuple[int, ...]], int],
+        local_demands: Mapping[Tuple[int, int], int],
+        placement: Mapping[int, Set[int]],
+        max_candidates: int,
+    ) -> Dict[int, Dict[Tuple[int, ...], Tuple[ReplicaAction, int, int]]]:
+        """Keep a fixed hot-candidate budget separately for each rank."""
+        closures_by_source: Dict[int, List[Tuple[Tuple[int, Tuple[int, ...]], int]]] = (
+            defaultdict(list)
+        )
+        for (source, remote, experts), count in closure_counts.items():
+            closures_by_source[source].append(((remote, experts), count))
+        singles_by_source: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
+        for (source, expert), count in local_demands.items():
+            singles_by_source[source].append((expert, count))
+
+        closure_limit = max_candidates // 2
+        result: Dict[int, Dict[Tuple[int, ...], Tuple[ReplicaAction, int, int]]] = {}
+        for source in range(self.num_ranks):
+            candidates: Dict[Tuple[int, ...], Tuple[ReplicaAction, int, int]] = {}
+            for (remote, experts), count in heapq.nlargest(
+                closure_limit,
+                closures_by_source[source],
+                key=lambda item: item[1]
+                * _link_cost(source, item[0][0], self.ranks_per_node, self.rdma_cost),
+            ):
+                missing = tuple(
+                    expert for expert in experts if expert not in placement[source]
+                )
+                if not missing or (
+                    self.max_bundle_size is not None
+                    and len(missing) > self.max_bundle_size
+                ):
+                    continue
+                candidates[missing] = (
+                    ReplicaAction(source, missing, "bundle-closure"),
+                    remote,
+                    count,
+                )
+            for expert, _ in heapq.nlargest(
+                max_candidates - closure_limit,
+                singles_by_source[source],
+                key=lambda item: item[1],
+            ):
+                if expert not in placement[source]:
+                    candidates.setdefault(
+                        (expert,),
+                        (ReplicaAction(source, (expert,), "single"), -1, 0),
+                    )
+            if candidates:
+                result[source] = candidates
+        return result
 
     @staticmethod
     def _score(metrics: PlanMetrics) -> Tuple[float, float, float, int]:

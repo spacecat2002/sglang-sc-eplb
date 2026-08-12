@@ -58,6 +58,31 @@ def test_fast_planner_chooses_the_hot_bundle_closure():
     assert plan.final.unique_remote_rank_copies == 0
 
 
+def test_fast_planner_selects_one_action_per_destination_rank():
+    planner = BundleAwareReplicaPlanner(
+        num_ranks=2,
+        baseline_rank_by_expert={0: 1, 1: 0},
+        replica_slots_per_rank=1,
+        compute_weight=0.0,
+        communication_weight=1.0,
+    )
+    plan = planner.plan_fast(
+        [RoutedToken(0, (0,), count=100), RoutedToken(1, (1,), count=100)],
+        max_candidates=4,
+    )
+
+    assert {action.destination_rank for action in plan.actions} == {0, 1}
+    assert plan.final.unique_remote_rank_copies == 0
+
+
+def test_baseline_evaluation_does_not_add_replicas():
+    planner = _planner()
+    metrics = planner.evaluate_baseline([RoutedToken(0, (0, 1), count=100)])
+
+    assert metrics.compute_load == [0, 200]
+    assert metrics.unique_remote_rank_copies == 100
+
+
 def test_high_compute_weight_can_choose_single_helper_copy():
     planner = BundleAwareReplicaPlanner(
         num_ranks=2,

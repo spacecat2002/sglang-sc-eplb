@@ -174,11 +174,27 @@ def _layer_result(
         max_bundle_size=args.max_bundle_size,
     )
     solve_start = time.perf_counter()
-    if args.planner == "fast":
+    if args.metrics_only:
+        baseline = planner.evaluate_baseline(routed_tokens)
+        plan = None
+    elif args.planner == "fast":
         plan = planner.plan_fast(routed_tokens, max_candidates=args.fast_max_candidates)
     else:
         plan = planner.plan(routed_tokens, max_actions=args.max_actions)
     solve_seconds = time.perf_counter() - solve_start
+    if plan is None:
+        baseline_dict = _metrics_dict(baseline)
+        return {
+            "gate": gate_name,
+            "tokens": sum(token.count for token in routed_tokens),
+            "bundles": len(routed_tokens),
+            "solve_seconds": solve_seconds,
+            "homes": homes,
+            "actions": [],
+            "baseline": baseline_dict,
+            "planned": baseline_dict,
+            "replicas_by_rank": {},
+        }
     return {
         "gate": gate_name,
         "tokens": sum(token.count for token in routed_tokens),
@@ -347,11 +363,17 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 or batch_index == total_batches
                 or batch_index % args.log_interval == 0
             ):
-                bundle_count = sum(len(bundles) for bundles in bundles_by_gate.values())
+                bundles_per_layer = [
+                    len(bundles) for bundles in bundles_by_gate.values()
+                ]
+                bundle_count = sum(bundles_per_layer)
                 print(
                     f"[capture] batch={batch_index}/{total_batches} "
                     f"tokens={valid_token_count} total_tokens={captured_tokens} "
-                    f"bundles={bundle_count} elapsed={time.perf_counter() - batch_start:.1f}s",
+                    f"layer_bundles=sum={bundle_count} "
+                    f"range={min(bundles_per_layer, default=0)}-"
+                    f"{max(bundles_per_layer, default=0)} "
+                    f"elapsed={time.perf_counter() - batch_start:.1f}s",
                     flush=True,
                 )
     finally:
@@ -389,7 +411,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         "top_k": args.top_k,
         "num_ranks": args.num_ranks,
         "source_rank_mode": args.source_rank_mode,
-        "planner": args.planner,
+        "planner": "metrics-only" if args.metrics_only else args.planner,
         "fast_max_candidates": args.fast_max_candidates,
         "total_solve_seconds": total_solve_seconds,
         "layers": layers,
@@ -442,6 +464,11 @@ def main() -> None:
     parser.add_argument("--rdma-cost", type=float, default=4.0)
     parser.add_argument("--replica-slots-per-rank", type=int, required=True)
     parser.add_argument("--max-actions", type=int, default=None)
+    parser.add_argument(
+        "--metrics-only",
+        action="store_true",
+        help="replay baseline placement only; skip replica planning",
+    )
     parser.add_argument(
         "--planner",
         choices=["exact", "fast"],
