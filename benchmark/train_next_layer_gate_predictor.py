@@ -60,43 +60,10 @@ class LowRankGateResidual(nn.Module):
         return self.up(F.silu(self.down(x)))
 
 
-class RouterAwareGateResidual(nn.Module):
-    """Residual predictor conditioned on activation and the current router logits."""
-
-    def __init__(
-        self,
-        hidden_size: int,
-        router_size: int,
-        num_experts: int,
-        rank: int,
-        eps: float,
-    ):
-        super().__init__()
-        self.eps = eps
-        self.activation_down = nn.Linear(hidden_size, rank, bias=False)
-        self.router_down = nn.Linear(router_size, rank, bias=False)
-        self.up = nn.Linear(rank, num_experts, bias=False)
-        nn.init.kaiming_uniform_(self.activation_down.weight, a=5**0.5)
-        nn.init.kaiming_uniform_(self.router_down.weight, a=5**0.5)
-        nn.init.zeros_(self.up.weight)
-
-    def forward(
-        self, hidden_states: torch.Tensor, current_router_logits: torch.Tensor
-    ) -> torch.Tensor:
-        activation = hidden_states.float()
-        activation = activation * torch.rsqrt(
-            activation.square().mean(dim=-1, keepdim=True) + self.eps
-        )
-        router = current_router_logits.float()
-        router = router * torch.rsqrt(router.square().mean(dim=-1, keepdim=True) + self.eps)
-        return self.up(F.silu(self.activation_down(activation) + self.router_down(router)))
-
-
 @dataclass
 class PairBatch:
     index: int
     previous: torch.Tensor
-    current_router_logits: torch.Tensor
     teacher_logits: torch.Tensor
 
 
@@ -110,23 +77,18 @@ def _valid_pair_batches(
     for index, ((name0, _), (name1, _)) in enumerate(zip(gates, gates[1:])):
         if pair_indices is not None and index not in pair_indices:
             continue
-        if name0 not in activations or name0 not in logits or name1 not in logits:
+        if name0 not in activations or name1 not in logits:
             continue
         previous = activations[name0]
-        current_router_logits = logits[name0]
         teacher_logits = logits[name1]
-        token_count = min(
-            previous.shape[0], current_router_logits.shape[0], teacher_logits.shape[0]
-        )
+        token_count = min(previous.shape[0], teacher_logits.shape[0])
         previous = previous[:token_count]
-        current_router_logits = current_router_logits[:token_count]
         teacher_logits = teacher_logits[:token_count]
         if valid_tokens.numel() == token_count:
             previous = previous[valid_tokens]
-            current_router_logits = current_router_logits[valid_tokens]
             teacher_logits = teacher_logits[valid_tokens]
         if previous.numel():
-            yield PairBatch(index, previous, current_router_logits, teacher_logits)
+            yield PairBatch(index, previous, teacher_logits)
 
 
 def _capture_hooks(
@@ -166,22 +128,12 @@ def _build_predictors(
 ) -> nn.ModuleDict:
     predictors = nn.ModuleDict()
     for pair in pair_batches:
-        if args.trainer == "activation":
-            predictor: nn.Module = LowRankGateResidual(
-                pair.previous.shape[-1],
-                pair.teacher_logits.shape[-1],
-                args.rank,
-                args.rms_norm_eps,
-            )
-        else:
-            predictor = RouterAwareGateResidual(
-                pair.previous.shape[-1],
-                pair.current_router_logits.shape[-1],
-                pair.teacher_logits.shape[-1],
-                args.rank,
-                args.rms_norm_eps,
-            )
-        predictors[str(pair.index)] = predictor.to(args.device)
+        predictors[str(pair.index)] = LowRankGateResidual(
+            pair.previous.shape[-1],
+            pair.teacher_logits.shape[-1],
+            args.rank,
+            args.rms_norm_eps,
+        ).to(args.device)
     if not predictors:
         raise RuntimeError("no usable adjacent gate pairs were captured")
     return predictors
@@ -244,17 +196,13 @@ def _warmup_factor(step: int, warmup_steps: int) -> float:
 
 
 def _predict_logits(
-    gate: nn.Module, predictor: nn.Module, pair: PairBatch, trainer: str
+    gate: nn.Module, predictor: nn.Module, pair: PairBatch
 ) -> torch.Tensor:
     with torch.no_grad():
         base_logits = _first_tensor(gate(pair.previous))
     if base_logits is None:
         raise RuntimeError("could not extract logits from a gate output")
-    if trainer == "activation":
-        residual = predictor(pair.previous)
-    else:
-        residual = predictor(pair.previous, pair.current_router_logits)
-    return _flatten_activation(base_logits).float() + residual
+    return _flatten_activation(base_logits).float() + predictor(pair.previous)
 
 
 def _split_texts(texts: List[str], validation_ratio: float, seed: int) -> Tuple[List[str], List[str]]:
@@ -328,7 +276,7 @@ def _evaluate(
                 predicted = _flatten_activation(predicted).float()
             else:
                 predicted = _predict_logits(
-                    gates[pair.index + 1][1], predictors[str(pair.index)], pair, args.trainer
+                    gates[pair.index + 1][1], predictors[str(pair.index)], pair
                 )
             actual = pair.teacher_logits.topk(top_k, dim=-1).indices
             candidate = predicted.topk(min(args.top_m, predicted.shape[-1]), dim=-1).indices
@@ -377,7 +325,7 @@ def run(args: argparse.Namespace) -> None:
     if not train_texts:
         raise ValueError("no training prompts remain after the validation split")
     print(
-        f"[setup] trainer={args.trainer} gates={len(gates)} pairs={len(gates) - 1} "
+        f"[setup] gates={len(gates)} pairs={len(gates) - 1} "
         f"train_prompts={len(train_texts)} validation_prompts={len(validation_texts)} "
         f"batch_size={args.batch_size}",
         flush=True,
@@ -439,7 +387,7 @@ def run(args: argparse.Namespace) -> None:
                 for pair in pairs:
                     predictor = predictors.get_submodule(str(pair.index))
                     predicted = _predict_logits(
-                        gates[pair.index + 1][1], predictor, pair, args.trainer
+                        gates[pair.index + 1][1], predictor, pair
                     )
                     loss, terms = _losses(predicted, pair.teacher_logits, top_k, args.top_m, args)
                     batch_loss = loss if batch_loss is None else batch_loss + loss
@@ -510,7 +458,6 @@ def run(args: argparse.Namespace) -> None:
     checkpoint = {
         "format_version": 1,
         "model": args.model,
-        "trainer": args.trainer,
         "gate_pattern": args.gate_pattern,
         "top_k": top_k,
         "top_m": args.top_m,
@@ -547,12 +494,6 @@ def main() -> None:
     parser.add_argument("--dtype", choices=["auto", "bf16", "fp16", "fp32"], default="auto")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--gate-pattern", default=r"(?:^|\.)(?:gate|router)$")
-    parser.add_argument(
-        "--trainer",
-        choices=["activation", "router-aware"],
-        default="activation",
-        help="activation: h[l] only; router-aware: h[l] plus the current router logits",
-    )
     parser.add_argument("--top-k", type=int, default=None)
     parser.add_argument("--top-m", type=int, required=True, help="deployment prefetch candidate size M")
     parser.add_argument("--train-pairs", type=int, nargs="+", default=None, help="e.g. 0 1 trains L0->L1 and L1->L2")
