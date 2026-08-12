@@ -150,9 +150,16 @@ def _losses(
     teacher_topk = teacher_logits.topk(top_k, dim=-1).indices
     positive_logits = predicted_logits.gather(1, teacher_topk)
 
-    # The (M+1)-th score is the boundary an actual Top-K expert must cross.
+    # A true Top-K expert is safely inside Top-M when no more than M-K
+    # non-target experts rank above it.  Do not detach this boundary: lowering
+    # the hard-negative score is as valid as increasing the target score.
     if top_m < num_experts:
-        boundary = predicted_logits.topk(top_m + 1, dim=-1).values[:, -1].detach()
+        target_mask = torch.zeros_like(predicted_logits, dtype=torch.bool)
+        target_mask.scatter_(1, teacher_topk, True)
+        negative_logits = predicted_logits.masked_fill(target_mask, float("-inf"))
+        allowed_negatives = top_m - top_k
+        boundary_rank = min(allowed_negatives + 1, num_experts - top_k)
+        boundary = negative_logits.topk(boundary_rank, dim=-1).values[:, -1]
         rank_loss = F.softplus(boundary.unsqueeze(-1) + args.margin - positive_logits).mean()
     else:
         rank_loss = predicted_logits.new_zeros(())
@@ -180,6 +187,12 @@ def _losses(
         "distill": distill_loss.detach().item(),
         "load": load_loss.detach().item(),
     }
+
+
+def _warmup_factor(step: int, warmup_steps: int) -> float:
+    if warmup_steps <= 0:
+        return 1.0
+    return min(1.0, step / warmup_steps)
 
 
 def _predict_logits(
@@ -315,6 +328,8 @@ def run(args: argparse.Namespace) -> None:
     handles = _capture_hooks(gates, activations, logits, capture_enabled)
     predictors: Optional[nn.ModuleDict] = None
     optimizer: Optional[torch.optim.Optimizer] = None
+    scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None
+    ema_loss: Optional[float] = None
     try:
         for epoch in range(1, args.epochs + 1):
             epoch_start = time.perf_counter()
@@ -334,6 +349,10 @@ def run(args: argparse.Namespace) -> None:
                     optimizer = torch.optim.AdamW(
                         predictors.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
                     )
+                    scheduler = torch.optim.lr_scheduler.LambdaLR(
+                        optimizer,
+                        lr_lambda=lambda step: _warmup_factor(step + 1, args.warmup_steps),
+                    )
                 assert optimizer is not None
                 optimizer.zero_grad(set_to_none=True)
                 batch_loss: Optional[torch.Tensor] = None
@@ -349,16 +368,27 @@ def run(args: argparse.Namespace) -> None:
                     continue
                 batch_loss = batch_loss / len(pairs)
                 batch_loss.backward()
-                torch.nn.utils.clip_grad_norm_(predictors.parameters(), args.max_grad_norm)
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    predictors.parameters(), args.max_grad_norm
+                )
                 optimizer.step()
+                assert scheduler is not None
+                scheduler.step()
                 epoch_losses["loss"] += batch_loss.detach().item()
                 for name, value in batch_terms.items():
                     epoch_losses[name] += value / len(pairs)
                 updates += 1
+                current_loss = batch_loss.detach().item()
+                ema_loss = (
+                    current_loss
+                    if ema_loss is None
+                    else args.loss_ema_beta * ema_loss + (1 - args.loss_ema_beta) * current_loss
+                )
                 if batch_index == 1 or batch_index % args.log_interval == 0:
                     print(
                         f"[train] epoch={epoch} batch={batch_index}/{total_batches} "
-                        f"loss={batch_loss.detach().item():.5f} "
+                        f"loss={current_loss:.5f} ema={ema_loss:.5f} "
+                        f"lr={scheduler.get_last_lr()[0]:.2e} grad_norm={grad_norm.item():.3f} "
                         f"elapsed={time.perf_counter() - epoch_start:.1f}s",
                         flush=True,
                     )
@@ -441,7 +471,13 @@ def main() -> None:
     parser.add_argument("--rank", type=int, default=64)
     parser.add_argument("--rms-norm-eps", type=float, default=1e-6)
     parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=50,
+        help="linearly ramp the learning rate over this many updates",
+    )
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument(
@@ -450,10 +486,16 @@ def main() -> None:
         default=10,
         help="emit training progress every N batches",
     )
+    parser.add_argument(
+        "--loss-ema-beta",
+        type=float,
+        default=0.9,
+        help="smoothing factor for the logged batch loss",
+    )
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--margin", type=float, default=0.1)
-    parser.add_argument("--rank-loss-weight", type=float, default=1.0)
-    parser.add_argument("--distill-loss-weight", type=float, default=0.25)
+    parser.add_argument("--rank-loss-weight", type=float, default=0.25)
+    parser.add_argument("--distill-loss-weight", type=float, default=1.0)
     parser.add_argument("--load-loss-weight", type=float, default=0.1)
     parser.add_argument("--checkpoint-out", required=True)
     args = parser.parse_args()
