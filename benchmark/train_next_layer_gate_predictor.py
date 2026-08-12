@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import random
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -285,6 +286,7 @@ def _print_evaluation(
 def run(args: argparse.Namespace) -> None:
     torch.manual_seed(args.seed)
     model, tokenizer = _load_model(args.model, args.revision, args.dtype, args.device)
+    print("[setup] freezing base-model parameters", flush=True)
     for parameter in model.parameters():
         parameter.requires_grad_(False)
     if tokenizer.pad_token_id is None:
@@ -295,10 +297,17 @@ def run(args: argparse.Namespace) -> None:
     pair_indices = set(args.train_pairs) if args.train_pairs else None
     if pair_indices is not None and (min(pair_indices) < 0 or max(pair_indices) >= len(gates) - 1):
         raise ValueError(f"--train-pairs must be between 0 and {len(gates) - 2}")
+    print("[data] loading prompts", flush=True)
     texts = _read_texts(args)
     train_texts, validation_texts = _split_texts(texts, args.validation_ratio, args.seed)
     if not train_texts:
         raise ValueError("no training prompts remain after the validation split")
+    print(
+        f"[setup] gates={len(gates)} pairs={len(gates) - 1} "
+        f"train_prompts={len(train_texts)} validation_prompts={len(validation_texts)} "
+        f"batch_size={args.batch_size}",
+        flush=True,
+    )
 
     activations: Dict[str, torch.Tensor] = {}
     logits: Dict[str, torch.Tensor] = {}
@@ -308,9 +317,12 @@ def run(args: argparse.Namespace) -> None:
     optimizer: Optional[torch.optim.Optimizer] = None
     try:
         for epoch in range(1, args.epochs + 1):
+            epoch_start = time.perf_counter()
             epoch_losses = {"loss": 0.0, "rank": 0.0, "distill": 0.0, "load": 0.0}
             updates = 0
-            for text_batch in _batches(train_texts, args.batch_size):
+            total_batches = (len(train_texts) + args.batch_size - 1) // args.batch_size
+            print(f"[train] epoch {epoch}/{args.epochs} ({total_batches} batches)", flush=True)
+            for batch_index, text_batch in enumerate(_batches(train_texts, args.batch_size), start=1):
                 valid_tokens = _run_teacher(
                     model, tokenizer, text_batch, args, activations, logits, capture_enabled
                 )
@@ -343,13 +355,22 @@ def run(args: argparse.Namespace) -> None:
                 for name, value in batch_terms.items():
                     epoch_losses[name] += value / len(pairs)
                 updates += 1
+                if batch_index == 1 or batch_index % args.log_interval == 0:
+                    print(
+                        f"[train] epoch={epoch} batch={batch_index}/{total_batches} "
+                        f"loss={batch_loss.detach().item():.5f} "
+                        f"elapsed={time.perf_counter() - epoch_start:.1f}s",
+                        flush=True,
+                    )
             if not updates:
                 raise RuntimeError("no predictor updates were made")
             print(
                 f"epoch={epoch} loss={epoch_losses['loss'] / updates:.5f} "
                 f"rank={epoch_losses['rank'] / updates:.5f} "
                 f"kl={epoch_losses['distill'] / updates:.5f} "
-                f"load={epoch_losses['load'] / updates:.5f}"
+                f"load={epoch_losses['load'] / updates:.5f} "
+                f"elapsed={time.perf_counter() - epoch_start:.1f}s",
+                flush=True,
             )
             if validation_texts and predictors is not None:
                 _print_evaluation(
@@ -423,6 +444,12 @@ def main() -> None:
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument(
+        "--log-interval",
+        type=int,
+        default=10,
+        help="emit training progress every N batches",
+    )
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--margin", type=float, default=0.1)
     parser.add_argument("--rank-loss-weight", type=float, default=1.0)

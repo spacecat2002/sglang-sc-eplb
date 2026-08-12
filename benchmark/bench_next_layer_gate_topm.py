@@ -35,6 +35,7 @@ import argparse
 import json
 import random
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -261,15 +262,22 @@ def _load_model(model_name: str, revision: Optional[str], dtype: str, device: st
     except ImportError as exc:
         raise SystemExit("transformers is required: pip install transformers") from exc
 
+    start = time.perf_counter()
+    print(f"[load] tokenizer: {model_name}", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(model_name, revision=revision)
     torch_dtype = {"auto": "auto", "bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[dtype]
+    print(f"[load] model weights into CPU memory (dtype={dtype})", flush=True)
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         revision=revision,
         torch_dtype=torch_dtype,
         low_cpu_mem_usage=True,
     )
+    print(f"[load] moving model to {device}", flush=True)
     model.eval().to(device)
+    if device.startswith("cuda"):
+        torch.cuda.synchronize()
+    print(f"[load] ready in {time.perf_counter() - start:.1f}s", flush=True)
     return model, tokenizer
 
 
