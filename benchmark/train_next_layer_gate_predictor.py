@@ -251,7 +251,7 @@ def _evaluate(
     model: nn.Module,
     tokenizer: Any,
     gates: Sequence[Tuple[str, nn.Module]],
-    predictors: nn.ModuleDict,
+    predictors: Optional[nn.ModuleDict],
     texts: List[str],
     top_k: int,
     args: argparse.Namespace,
@@ -266,9 +266,18 @@ def _evaluate(
             model, tokenizer, text_batch, args, activations, logits, capture_enabled
         )
         for pair in _valid_pair_batches(gates, activations, logits, valid_tokens, pair_indices):
-            if str(pair.index) not in predictors:
+            if predictors is not None and str(pair.index) not in predictors:
                 continue
-            predicted = _predict_logits(gates[pair.index + 1][1], predictors[str(pair.index)], pair.previous)
+            if predictors is None:
+                with torch.no_grad():
+                    predicted = _first_tensor(gates[pair.index + 1][1](pair.previous))
+                if predicted is None:
+                    raise RuntimeError("could not extract logits from a gate output")
+                predicted = _flatten_activation(predicted).float()
+            else:
+                predicted = _predict_logits(
+                    gates[pair.index + 1][1], predictors[str(pair.index)], pair.previous
+                )
             actual = pair.teacher_logits.topk(top_k, dim=-1).indices
             candidate = predicted.topk(min(args.top_m, predicted.shape[-1]), dim=-1).indices
             matched = (actual.unsqueeze(-1) == candidate.unsqueeze(-2)).any(dim=-1)
@@ -284,9 +293,9 @@ def _evaluate(
 
 
 def _print_evaluation(
-    stats: Dict[int, Dict[str, float]], gates: Sequence[Tuple[str, nn.Module]], top_m: int
+    stats: Dict[int, Dict[str, float]], label: str, top_m: int
 ) -> None:
-    print(f"Validation Top-{top_m} coverage")
+    print(f"{label} validation Top-{top_m} coverage")
     print("pair       tokens  recall  full")
     print("---------  ------  ------  ------")
     for index, entry in stats.items():
@@ -331,6 +340,24 @@ def run(args: argparse.Namespace) -> None:
     scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None
     ema_loss: Optional[float] = None
     try:
+        if validation_texts:
+            _print_evaluation(
+                _evaluate(
+                    model,
+                    tokenizer,
+                    gates,
+                    None,
+                    validation_texts,
+                    top_k,
+                    args,
+                    activations,
+                    logits,
+                    capture_enabled,
+                    pair_indices,
+                ),
+                "Frozen baseline",
+                args.top_m,
+            )
         for epoch in range(1, args.epochs + 1):
             epoch_start = time.perf_counter()
             epoch_losses = {"loss": 0.0, "rank": 0.0, "distill": 0.0, "load": 0.0}
@@ -417,7 +444,7 @@ def run(args: argparse.Namespace) -> None:
                         capture_enabled,
                         pair_indices,
                     ),
-                    gates,
+                    "Residual predictor",
                     args.top_m,
                 )
     finally:
