@@ -20,9 +20,7 @@ Example:
 
 To reproduce PROBE's lookahead predictor (Eq. 7), use ``--trainer probe``.
 It freezes the target-layer router, adds ``W2 * SiLU(W1 * h[l])`` with W2
-zero-initialized, and uses only router-distribution distillation.  The
-``probe-topk`` variant has the same predictor but distils the routed Top-K
-experts and their renormalized weights instead of the full softmax tail.
+zero-initialized, and uses only router-distribution distillation.
 """
 
 from __future__ import annotations
@@ -149,7 +147,7 @@ def _build_predictors(
 ) -> nn.ModuleDict:
     predictors = nn.ModuleDict()
     for pair in pair_batches:
-        if args.trainer in {"probe", "probe-topk"}:
+        if args.trainer == "probe":
             predictor: nn.Module = ProbeGateResidual(
                 pair.previous.shape[-1],
                 pair.teacher_logits.shape[-1],
@@ -192,25 +190,6 @@ def _losses(
             "distill": cross_entropy.detach().item(),
             "load": 0.0,
         }
-    if args.trainer == "probe-topk":
-        # For the Qwen3-MoE router, this reproduces the dispatched logical
-        # Top-K experts and their renormalized softmax weights. It avoids
-        # spending predictor capacity on the full softmax tail.
-        teacher_topk_logits, teacher_topk_ids = teacher_logits.topk(top_k, dim=-1)
-        teacher_topk_weights = F.softmax(teacher_topk_logits / temperature, dim=-1)
-        predicted_log_probability = F.log_softmax(
-            predicted_logits / temperature, dim=-1
-        )
-        cross_entropy = -(
-            teacher_topk_weights
-            * predicted_log_probability.gather(1, teacher_topk_ids)
-        ).sum(dim=-1).mean()
-        return cross_entropy, {
-            "rank": 0.0,
-            "distill": cross_entropy.detach().item(),
-            "load": 0.0,
-        }
-
     num_experts = predicted_logits.shape[-1]
     teacher_topk = teacher_logits.topk(top_k, dim=-1).indices
     positive_logits = predicted_logits.gather(1, teacher_topk)
@@ -367,7 +346,6 @@ def _trainer_label(trainer: str) -> str:
     return {
         "residual": "Residual predictor",
         "probe": "PROBE dense-distillation predictor",
-        "probe-topk": "PROBE routed-Top-K predictor",
     }[trainer]
 
 
@@ -564,12 +542,9 @@ def main() -> None:
     parser.add_argument("--gate-pattern", default=r"(?:^|\.)(?:gate|router)$")
     parser.add_argument(
         "--trainer",
-        choices=["residual", "probe", "probe-topk"],
+        choices=["residual", "probe"],
         default="residual",
-        help=(
-            "residual: RMSNorm low-rank predictor; probe: paper Eq. 7 with dense CE; "
-            "probe-topk: Eq. 7 with routed Top-K CE"
-        ),
+        help="residual: RMSNorm low-rank predictor; probe: paper Eq. 7 with dense CE",
     )
     parser.add_argument("--top-k", type=int, default=None)
     parser.add_argument("--top-m", type=int, required=True, help="deployment prefetch candidate size M")
