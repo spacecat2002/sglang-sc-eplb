@@ -192,6 +192,69 @@ def _batches(items: List[str], batch_size: int):
         yield items[start : start + batch_size]
 
 
+def _layer_label(name: str) -> str:
+    """Prefer the transformer layer index, while retaining nonstandard gate names."""
+    match = re.search(r"(?:layers|h)\.(\d+)\.", name)
+    return f"L{match.group(1)}" if match else name
+
+
+def _format_terminal_result(result: Dict[str, Any]) -> str:
+    """Render the per-layer metrics without requiring a JSON viewer."""
+    lines = [
+        "Next-layer gate Top-M prediction",
+        (
+            f"model={result['model']}  dataset={result['dataset']}  "
+            f"prompts={result['num_prompts']}  K={result['top_k']}"
+        ),
+        "R: Top-K expert recall; Full: tokens whose entire real Top-K is in Top-M",
+    ]
+    headers = ["layers", "tokens"]
+    for top_m in result["top_m"]:
+        headers.extend([f"M={top_m} R", "Full"])
+    rows = []
+    totals = {top_m: {"recall": 0.0, "full": 0.0} for top_m in result["top_m"]}
+    total_tokens = 0
+    for layer in result["layers"]:
+        metric_by_m = {metric["top_m"]: metric for metric in layer["metrics"]}
+        row = [
+            f"{_layer_label(layer['from_gate'])}->{_layer_label(layer['to_gate'])}",
+            str(layer["tokens"]),
+        ]
+        for top_m in result["top_m"]:
+            metric = metric_by_m[top_m]
+            row.extend(
+                [
+                    f"{metric['token_recall']:.2%}",
+                    f"{metric['token_full_topk_coverage']:.2%}",
+                ]
+            )
+            totals[top_m]["recall"] += metric["token_recall"] * layer["tokens"]
+            totals[top_m]["full"] += metric["token_full_topk_coverage"] * layer["tokens"]
+        total_tokens += layer["tokens"]
+        rows.append(row)
+
+    summary = ["weighted avg", str(total_tokens)]
+    for top_m in result["top_m"]:
+        summary.extend(
+            [
+                f"{totals[top_m]['recall'] / max(total_tokens, 1):.2%}",
+                f"{totals[top_m]['full'] / max(total_tokens, 1):.2%}",
+            ]
+        )
+    rows.append(summary)
+    widths = [
+        max(len(header), *(len(row[column]) for row in rows))
+        for column, header in enumerate(headers)
+    ]
+    lines.append("  ".join(header.ljust(widths[index]) for index, header in enumerate(headers)))
+    lines.append("  ".join("-" * width for width in widths))
+    lines.extend(
+        "  ".join(value.ljust(widths[index]) for index, value in enumerate(row))
+        for row in rows
+    )
+    return "\n".join(lines)
+
+
 def _load_model(model_name: str, revision: Optional[str], dtype: str, device: str):
     try:
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -410,11 +473,12 @@ def main() -> None:
     parser.add_argument("--dtype", choices=["auto", "bf16", "fp16", "fp32"], default="auto")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--gate-pattern", default=r"(?:^|\.)(?:gate|router)$")
-    parser.add_argument("--output", default=None, help="write JSON results to this path")
+    parser.add_argument("--output", default=None, help="write complete JSON results to this path")
+    parser.add_argument("--json", action="store_true", help="print JSON instead of the terminal table")
     args = parser.parse_args()
     result = run(args)
     output = json.dumps(result, indent=2)
-    print(output)
+    print(output if args.json else _format_terminal_result(result))
     if args.output:
         Path(args.output).write_text(output + "\n")
 

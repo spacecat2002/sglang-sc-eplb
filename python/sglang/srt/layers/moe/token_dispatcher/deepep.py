@@ -328,11 +328,32 @@ class DeepEPConfig(BaseDispatcherConfig):
             config_dispatch = config_parsed["normal_dispatch"]
             config_combine = config_parsed["normal_combine"]
 
-            self.normal_dispatch_config = Config(**config_dispatch)
-            self.normal_combine_config = Config(**config_combine)
-
             assert config_dispatch["num_sms"] == config_combine["num_sms"]
             self.num_sms = config_dispatch["num_sms"]
+            Buffer.set_num_sms(self.num_sms)
+
+            # DeepEP accepts a global SM override without requiring the
+            # EP-size-specific chunk parameters. This is useful on NVL72,
+            # where the defaults remain valid but communication must reserve
+            # a customized number of SMs.
+            dispatch_has_chunk_params = any(
+                key != "num_sms" for key in config_dispatch
+            )
+            combine_has_chunk_params = any(key != "num_sms" for key in config_combine)
+            self.normal_dispatch_config = (
+                Config(**config_dispatch) if dispatch_has_chunk_params else None
+            )
+            self.normal_combine_config = (
+                Config(**config_combine) if combine_has_chunk_params else None
+            )
+
+            if (
+                not dispatch_has_chunk_params or not combine_has_chunk_params
+            ) and torch.distributed.get_rank() == 0:
+                logger.info(
+                    "DeepEP config only specifies num_sms; chunk token parameters "
+                    "will use EP-size-specific defaults."
+                )
         else:
             self.normal_dispatch_config = None
             self.normal_combine_config = None
@@ -379,7 +400,10 @@ class _DeepEPDispatcherImplBase:
         )
         # DeepEP internode_ll dispatch uses FINISHED_SUM_TAG=1024
         # and the logic requires num-tokens-sent-from-one-rank-to-another-rank less than it
-        assert self.num_max_dispatch_tokens_per_rank <= 1024
+        assert (
+            self.deepep_mode is DeepEPMode.NORMAL
+            or self.num_max_dispatch_tokens_per_rank <= 1024
+        )
 
         self.handle = None
 
