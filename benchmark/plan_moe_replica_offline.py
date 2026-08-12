@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Sequence, Tuple
@@ -172,11 +173,14 @@ def _layer_result(
         communication_weight=args.communication_weight,
         max_bundle_size=args.max_bundle_size,
     )
+    solve_start = time.perf_counter()
     plan = planner.plan(routed_tokens, max_actions=args.max_actions)
+    solve_seconds = time.perf_counter() - solve_start
     return {
         "gate": gate_name,
         "tokens": sum(token.count for token in routed_tokens),
         "bundles": len(routed_tokens),
+        "solve_seconds": solve_seconds,
         "homes": homes,
         "actions": [
             {
@@ -215,6 +219,7 @@ def _format_result(result: Mapping[str, Any], show_actions: bool) -> str:
                 str(layer["tokens"]),
                 str(layer["bundles"]),
                 str(len(layer["actions"])),
+                f"{layer['solve_seconds']:.3f}s",
                 f"{baseline['unique_remote_rank_copies']}->{planned['unique_remote_rank_copies']} "
                 f"({_percent_change(baseline['unique_remote_rank_copies'], planned['unique_remote_rank_copies'])})",
                 f"{baseline['weighted_communication']:.0f}->{planned['weighted_communication']:.0f}",
@@ -230,6 +235,7 @@ def _format_result(result: Mapping[str, Any], show_actions: bool) -> str:
                 "tokens",
                 "bundles",
                 "copies",
+                "solve",
                 "remote",
                 "weighted",
                 "comp",
@@ -257,6 +263,11 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     if args.top_k is None:
         args.top_k = _infer_top_k(model)
     gates = _discover_gates(model, args.gate_pattern)
+    print(
+        f"[setup] found {len(gates)} router gates; Top-K={args.top_k}; "
+        f"simulated_ep={args.num_ranks}",
+        flush=True,
+    )
     captured: Dict[str, torch.Tensor] = {}
     capture_enabled = [True]
     handles = []
@@ -271,9 +282,16 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
 
         handles.append(gate.register_forward_hook(post_hook))
 
+    print("[data] loading prompts", flush=True)
     texts = _read_texts(args)
     if not texts:
         raise ValueError("the selected dataset did not contain any usable prompts")
+    total_batches = (len(texts) + args.batch_size - 1) // args.batch_size
+    print(
+        f"[data] ready: prompts={len(texts)} batches={total_batches} "
+        f"batch_size={args.batch_size} max_length={args.max_length}",
+        flush=True,
+    )
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     bundles_by_gate: Dict[str, Counter[Tuple[int, Tuple[int, ...]]]] = {
@@ -281,9 +299,13 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     }
     home_placements = _load_home_placements(args.home_placement_json)
     shard_offset = 0
+    captured_tokens = 0
     try:
-        for text_batch in _batches(texts, args.batch_size):
+        for batch_index, text_batch in enumerate(
+            _batches(texts, args.batch_size), start=1
+        ):
             captured.clear()
+            batch_start = time.perf_counter()
             encoded = tokenizer(
                 text_batch,
                 return_tensors="pt",
@@ -291,6 +313,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 truncation=True,
                 max_length=args.max_length,
             )
+            valid_token_count = int(encoded["attention_mask"].sum().item())
             source_ranks = _source_ranks(
                 encoded["attention_mask"],
                 args.num_ranks,
@@ -304,6 +327,8 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             )
             encoded = {key: value.to(args.device) for key, value in encoded.items()}
             model(**encoded, use_cache=False)
+            if args.device.startswith("cuda"):
+                torch.cuda.synchronize()
             for name, logits in captured.items():
                 if logits.shape[0] != source_ranks.numel():
                     raise RuntimeError(
@@ -313,15 +338,46 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 topk = logits.float().topk(args.top_k, dim=-1).indices.cpu().tolist()
                 for source_rank, experts in zip(source_ranks.cpu().tolist(), topk):
                     bundles_by_gate[name][(source_rank, tuple(sorted(experts)))] += 1
+            captured_tokens += valid_token_count
+            if (
+                batch_index == 1
+                or batch_index == total_batches
+                or batch_index % args.log_interval == 0
+            ):
+                bundle_count = sum(len(bundles) for bundles in bundles_by_gate.values())
+                print(
+                    f"[capture] batch={batch_index}/{total_batches} "
+                    f"tokens={valid_token_count} total_tokens={captured_tokens} "
+                    f"bundles={bundle_count} elapsed={time.perf_counter() - batch_start:.1f}s",
+                    flush=True,
+                )
     finally:
         for handle in handles:
             handle.remove()
 
-    layers = [
-        _layer_result(name, bundles, args, home_placements)
-        for name, bundles in bundles_by_gate.items()
-        if bundles
+    nonempty_layers = [
+        (name, bundles) for name, bundles in bundles_by_gate.items() if bundles
     ]
+    print(f"[plan] replaying {len(nonempty_layers)} router layers", flush=True)
+    layers = []
+    for layer_index, (name, bundles) in enumerate(nonempty_layers, start=1):
+        plan_start = time.perf_counter()
+        print(
+            f"[plan] layer={layer_index}/{len(nonempty_layers)} gate={name} "
+            f"bundles={len(bundles)}",
+            flush=True,
+        )
+        layer = _layer_result(name, bundles, args, home_placements)
+        layers.append(layer)
+        print(
+            f"[plan] layer={layer_index}/{len(nonempty_layers)} actions={len(layer['actions'])} "
+            f"objective={layer['baseline']['objective']:.3f}->{layer['planned']['objective']:.3f} "
+            f"solve={layer['solve_seconds']:.3f}s "
+            f"elapsed={time.perf_counter() - plan_start:.3f}s",
+            flush=True,
+        )
+    total_solve_seconds = sum(layer["solve_seconds"] for layer in layers)
+    print(f"[plan] total solver time={total_solve_seconds:.3f}s", flush=True)
     return {
         "model": args.model,
         "dataset": args.dataset or "text",
@@ -330,6 +386,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         "top_k": args.top_k,
         "num_ranks": args.num_ranks,
         "source_rank_mode": args.source_rank_mode,
+        "total_solve_seconds": total_solve_seconds,
         "layers": layers,
     }
 
@@ -360,6 +417,12 @@ def main() -> None:
     parser.add_argument("--num-samples", type=int, default=128)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--log-interval",
+        type=int,
+        default=1,
+        help="print capture progress every N batches (default: 1)",
+    )
     parser.add_argument("--max-length", type=int, default=2048)
     parser.add_argument("--top-k", type=int, default=None)
     parser.add_argument(
@@ -398,6 +461,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.num_ranks < 1:
         parser.error("--num-ranks must be positive")
+    if args.log_interval < 1:
+        parser.error("--log-interval must be positive")
     result = run(args)
     output = json.dumps(result, indent=2)
     print(output if args.json else _format_result(result, args.show_actions))
