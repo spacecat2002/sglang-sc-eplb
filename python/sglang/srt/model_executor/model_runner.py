@@ -79,6 +79,7 @@ from sglang.srt.layers.cp.utils import (
     is_cp_v2_active,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.expert_load_logger import expert_load_forward_context
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
@@ -1419,6 +1420,7 @@ class ModelRunner:
         with (
             canary_ctx,
             step_span_ctx,
+            expert_load_forward_context(forward_batch),
             get_global_expert_distribution_recorder().with_forward_pass(
                 self.forward_pass_id,
                 forward_batch,

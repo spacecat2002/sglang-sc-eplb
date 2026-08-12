@@ -9,6 +9,8 @@ from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.dp_attention import (
+    get_attention_dp_rank,
+    get_dp_global_num_tokens,
     get_is_extend_in_batch,
     set_is_extend_in_batch,
 )
@@ -58,6 +60,61 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 
 logger = logging.getLogger(__name__)
+_expert_load_logging_enabled = get_bool_env_var("SGLANG_ENABLE_EXPERT_LOAD_LOGGING")
+
+
+def _maybe_log_expert_load(moe_layer, dispatch_output) -> None:
+    if not _expert_load_logging_enabled:
+        return
+    from sglang.srt.layers.moe.expert_load_logger import ExpertLoadLogger
+    from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
+
+    if not DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
+        return
+
+    load_logger = ExpertLoadLogger.get()
+    load_logger.init_metadata(
+        num_local_experts=moe_layer.num_local_experts,
+        ep_rank=moe_layer.moe_ep_rank,
+        ep_size=moe_layer.moe_ep_size,
+        global_rank=(
+            torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        ),
+    )
+    load_logger.record(
+        layer_id=moe_layer.layer_id,
+        counts=dispatch_output.num_recv_tokens_per_expert,
+    )
+
+
+def _build_force_balanced_topk_ids(
+    template_topk_ids: torch.Tensor,
+    *,
+    num_experts: int,
+    ep_size: int,
+    global_token_start: int,
+) -> torch.Tensor:
+    """Build a deterministic rank-first routing pattern for profiling."""
+    num_tokens, top_k = template_topk_ids.shape
+    if num_tokens == 0 or top_k == 0:
+        return torch.empty_like(template_topk_ids)
+
+    local_experts_per_rank = num_experts // ep_size
+    rows = torch.arange(
+        global_token_start,
+        global_token_start + num_tokens,
+        device=template_topk_ids.device,
+        dtype=torch.int64,
+    )
+    slots = torch.arange(top_k, device=template_topk_ids.device, dtype=torch.int64)
+    assignment = rows.unsqueeze(1).mul(top_k).add(slots)
+    destination_rank = assignment.remainder(ep_size)
+    local_expert = assignment.div(ep_size, rounding_mode="floor").remainder(
+        local_experts_per_rank
+    )
+    balanced = destination_rank.mul(local_experts_per_rank).add(local_expert)
+    balanced = balanced.to(dtype=template_topk_ids.dtype)
+    return balanced.masked_fill(template_topk_ids[:, :1] < 0, -1)
 
 
 class DeepEPMoE(FusedMoE):
@@ -67,6 +124,8 @@ class DeepEPMoE(FusedMoE):
     """
 
     _has_printed = False
+    _has_logged_router_force_balance = False
+    _has_logged_router_force_balance_unsupported = False
 
     def __init__(
         self,
@@ -97,6 +156,25 @@ class DeepEPMoE(FusedMoE):
             routed_scaling_factor=routed_scaling_factor,
             **kwargs,
         )
+        self.router_force_balance_enabled = get_bool_env_var(
+            "SGLANG_ROUTER_FORCE_BALANCE"
+        )
+        if self.router_force_balance_enabled and self.num_fused_shared_experts > 0:
+            logger.warning(
+                "SGLANG_ROUTER_FORCE_BALANCE does not support fused shared experts; "
+                "disabling it for layer %s.",
+                self.layer_id,
+            )
+            self.router_force_balance_enabled = False
+        if (
+            self.router_force_balance_enabled
+            and not DeepEPMoE._has_logged_router_force_balance
+        ):
+            logger.warning(
+                "SGLANG_ROUTER_FORCE_BALANCE is enabled. Prefill routed expert IDs "
+                "will be replaced with a deterministic balanced pattern."
+            )
+            DeepEPMoE._has_logged_router_force_balance = True
         is_humming = (
             get_moe_runner_backend().is_humming()
             or get_moe_runner_backend().is_auto()
@@ -253,6 +331,7 @@ class DeepEPMoE(FusedMoE):
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
     ):
+        topk_output = self._maybe_force_balance_topk(topk_output)
 
         if self.deprecate_flag:
             return super().forward_impl(
@@ -265,6 +344,45 @@ class DeepEPMoE(FusedMoE):
         )
         combine_input = self.run_moe_core(dispatch_output)
         return self.dispatcher.combine(combine_input=combine_input)
+
+    def _maybe_force_balance_topk(self, topk_output: TopKOutput) -> TopKOutput:
+        if not self.router_force_balance_enabled or not get_is_extend_in_batch():
+            return topk_output
+        if not isinstance(topk_output, StandardTopKOutput):
+            if not DeepEPMoE._has_logged_router_force_balance_unsupported:
+                logger.warning(
+                    "SGLANG_ROUTER_FORCE_BALANCE only supports standard top-k "
+                    "outputs; keeping the original routing."
+                )
+                DeepEPMoE._has_logged_router_force_balance_unsupported = True
+            return topk_output
+
+        routed_num_experts = self.num_experts - self.num_fused_shared_experts
+        if routed_num_experts <= 0 or routed_num_experts % self.moe_ep_size != 0:
+            if not DeepEPMoE._has_logged_router_force_balance_unsupported:
+                logger.warning(
+                    "SGLANG_ROUTER_FORCE_BALANCE requires routed experts to be "
+                    "divisible by EP size; keeping the original routing."
+                )
+                DeepEPMoE._has_logged_router_force_balance_unsupported = True
+            return topk_output
+
+        global_num_tokens = get_dp_global_num_tokens()
+        global_token_start = 0
+        if global_num_tokens:
+            dp_rank = get_attention_dp_rank()
+            global_token_start = sum(global_num_tokens[:dp_rank])
+
+        return StandardTopKOutput(
+            topk_weights=topk_output.topk_weights,
+            topk_ids=_build_force_balanced_topk_ids(
+                topk_output.topk_ids,
+                num_experts=routed_num_experts,
+                ep_size=self.moe_ep_size,
+                global_token_start=global_token_start,
+            ),
+            router_logits=topk_output.router_logits,
+        )
 
     def dispatch(
         self,
@@ -280,6 +398,7 @@ class DeepEPMoE(FusedMoE):
         self,
         dispatch_output: DispatchOutput,
     ):
+        _maybe_log_expert_load(self, dispatch_output)
 
         if self.deprecate_flag:
             return super().run_moe_core(dispatch_output)
