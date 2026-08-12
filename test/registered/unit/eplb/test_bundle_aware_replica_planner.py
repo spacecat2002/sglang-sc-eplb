@@ -49,6 +49,15 @@ def test_bundle_closure_removes_deepep_transfer_and_is_planned():
     assert plan.actions[0].experts == (0, 1)
 
 
+def test_fast_planner_chooses_the_hot_bundle_closure():
+    plan = _planner().plan_fast([RoutedToken(0, (0, 1), count=100)], max_candidates=4)
+
+    assert len(plan.actions) == 1
+    assert plan.actions[0].kind == "bundle-closure"
+    assert plan.actions[0].experts == (0, 1)
+    assert plan.final.unique_remote_rank_copies == 0
+
+
 def test_high_compute_weight_can_choose_single_helper_copy():
     planner = BundleAwareReplicaPlanner(
         num_ranks=2,

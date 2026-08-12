@@ -174,7 +174,10 @@ def _layer_result(
         max_bundle_size=args.max_bundle_size,
     )
     solve_start = time.perf_counter()
-    plan = planner.plan(routed_tokens, max_actions=args.max_actions)
+    if args.planner == "fast":
+        plan = planner.plan_fast(routed_tokens, max_candidates=args.fast_max_candidates)
+    else:
+        plan = planner.plan(routed_tokens, max_actions=args.max_actions)
     solve_seconds = time.perf_counter() - solve_start
     return {
         "gate": gate_name,
@@ -205,7 +208,7 @@ def _format_result(result: Mapping[str, Any], show_actions: bool) -> str:
         (
             f"model={result['model']}  dataset={result['dataset']}  prompts={result['num_prompts']}  "
             f"K={result['top_k']}  simulated_ep={result['num_ranks']}  "
-            f"source={result['source_rank_mode']}"
+            f"source={result['source_rank_mode']}  planner={result['planner']}"
         ),
         "remote: token-to-remote-rank copies; comp/comm: max-to-average rank load.",
     ]
@@ -386,6 +389,8 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         "top_k": args.top_k,
         "num_ranks": args.num_ranks,
         "source_rank_mode": args.source_rank_mode,
+        "planner": args.planner,
+        "fast_max_candidates": args.fast_max_candidates,
         "total_solve_seconds": total_solve_seconds,
         "layers": layers,
     }
@@ -437,6 +442,18 @@ def main() -> None:
     parser.add_argument("--rdma-cost", type=float, default=4.0)
     parser.add_argument("--replica-slots-per-rank", type=int, required=True)
     parser.add_argument("--max-actions", type=int, default=None)
+    parser.add_argument(
+        "--planner",
+        choices=["exact", "fast"],
+        default="exact",
+        help="exact offline oracle or one-action bounded fast approximation",
+    )
+    parser.add_argument(
+        "--fast-max-candidates",
+        type=int,
+        default=32,
+        help="maximum closure/singleton candidates scored by --planner fast",
+    )
     parser.add_argument("--max-bundle-size", type=int, default=None)
     parser.add_argument("--compute-weight", type=float, default=1.0)
     parser.add_argument("--communication-weight", type=float, default=1.0)
@@ -463,6 +480,8 @@ def main() -> None:
         parser.error("--num-ranks must be positive")
     if args.log_interval < 1:
         parser.error("--log-interval must be positive")
+    if args.fast_max_candidates < 1:
+        parser.error("--fast-max-candidates must be positive")
     result = run(args)
     output = json.dumps(result, indent=2)
     print(output if args.json else _format_result(result, args.show_actions))

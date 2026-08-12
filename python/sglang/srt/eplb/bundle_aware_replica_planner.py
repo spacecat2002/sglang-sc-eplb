@@ -14,6 +14,7 @@ physical ids are a runtime implementation detail.
 
 from __future__ import annotations
 
+import heapq
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
@@ -181,6 +182,100 @@ class BundleAwareReplicaPlanner:
 
         return ReplicaPlan(placement, actions, baseline, current)
 
+    def plan_fast(
+        self,
+        routed_tokens: Iterable[RoutedToken],
+        *,
+        max_candidates: int = 64,
+    ) -> ReplicaPlan:
+        """Choose one bounded-cost replica action from a recent route window.
+
+        Unlike :meth:`plan`, this method never replays every bundle for every
+        candidate.  It scans the route window once, retains only the hottest
+        closure/singleton candidates, and scores their load deltas.  The result
+        is deliberately approximate: it is intended for a runtime control loop
+        that applies at most one action per window, while ``plan`` remains the
+        exact offline oracle.
+        """
+        if max_candidates < 1:
+            raise ValueError("max_candidates must be positive")
+        tokens = list(routed_tokens)
+        if not tokens:
+            raise ValueError("routed_tokens must not be empty")
+        self._validate_tokens(tokens)
+        placement = self._baseline_placement()
+        baseline, closure_counts, local_demands = self._fast_baseline(tokens)
+        normalization = (
+            max(sum(baseline.compute_load) / self.num_ranks, 1.0),
+            max(sum(baseline.communication_load) / self.num_ranks, 1.0),
+        )
+        baseline = self._with_objective(baseline, normalization)
+
+        # Keep a small, bounded candidate set.  Closure potential is the
+        # actual weighted DeepEP transfer it can eliminate; singleton demand
+        # is its possible compute-offload benefit.
+        closure_limit = max_candidates // 2
+        top_closures = heapq.nlargest(
+            closure_limit,
+            closure_counts.items(),
+            key=lambda item: item[1]
+            * _link_cost(item[0][0], item[0][1], self.ranks_per_node, self.rdma_cost),
+        )
+        top_singles = heapq.nlargest(
+            max_candidates - closure_limit,
+            local_demands.items(),
+            key=lambda item: item[1],
+        )
+
+        candidates: Dict[
+            Tuple[int, Tuple[int, ...]], Tuple[ReplicaAction, int, int]
+        ] = {}
+        for (source, remote, experts), count in top_closures:
+            missing = tuple(
+                expert for expert in experts if expert not in placement[source]
+            )
+            if not missing or (
+                self.max_bundle_size is not None and len(missing) > self.max_bundle_size
+            ):
+                continue
+            action = ReplicaAction(source, missing, "bundle-closure")
+            candidates[(source, missing)] = (action, remote, count)
+        for (source, expert), _ in top_singles:
+            if expert in placement[source]:
+                continue
+            key = (source, (expert,))
+            # Prefer a closure if a singleton is sufficient to remove a rank.
+            candidates.setdefault(
+                key, (ReplicaAction(source, (expert,), "single"), -1, 0)
+            )
+
+        best_action: Optional[ReplicaAction] = None
+        best_metrics: Optional[PlanMetrics] = None
+        for action, remote, closure_count in candidates.values():
+            candidate_placement = self._apply_action(placement, action)
+            if candidate_placement is None:
+                continue
+            candidate_metrics = self._fast_candidate_metrics(
+                baseline,
+                action,
+                remote,
+                closure_count,
+                local_demands,
+                normalization,
+            )
+            if self._score(candidate_metrics) < self._score(baseline) and (
+                best_metrics is None
+                or self._score(candidate_metrics) < self._score(best_metrics)
+            ):
+                best_action = action
+                best_metrics = candidate_metrics
+
+        if best_action is None or best_metrics is None:
+            return ReplicaPlan(placement, [], baseline, baseline)
+        final_placement = self._apply_action(placement, best_action)
+        assert final_placement is not None
+        return ReplicaPlan(final_placement, [best_action], baseline, best_metrics)
+
     @staticmethod
     def _score(metrics: PlanMetrics) -> Tuple[float, float, float, int]:
         """Order candidates by critical path, then aggregate traffic."""
@@ -190,6 +285,124 @@ class BundleAwareReplicaPlanner:
             round(metrics.weighted_communication, 12),
             max(metrics.compute_load, default=0),
         )
+
+    def _fast_baseline(
+        self, tokens: Sequence[RoutedToken]
+    ) -> Tuple[
+        PlanMetrics,
+        Dict[Tuple[int, int, Tuple[int, ...]], int],
+        Dict[Tuple[int, int], int],
+    ]:
+        """Build home-placement loads and bounded fast-planner statistics."""
+        compute = [0] * self.num_ranks
+        send = [0.0] * self.num_ranks
+        recv = [0.0] * self.num_ranks
+        closure_counts: Dict[Tuple[int, int, Tuple[int, ...]], int] = defaultdict(int)
+        local_demands: Dict[Tuple[int, int], int] = defaultdict(int)
+        unique_remote_rank_copies = 0
+        nvl_traffic = 0
+        rdma_traffic = 0
+        for token in tokens:
+            grouped: Dict[int, List[int]] = defaultdict(list)
+            for expert in token.topk_experts:
+                home = self.baseline_rank_by_expert[expert]
+                compute[home] += token.count
+                local_demands[(token.source_rank, expert)] += token.count
+                grouped[home].append(expert)
+            for destination, experts in grouped.items():
+                if destination == token.source_rank:
+                    continue
+                cost = _link_cost(
+                    token.source_rank, destination, self.ranks_per_node, self.rdma_cost
+                )
+                send[token.source_rank] += token.count * cost
+                recv[destination] += token.count * cost
+                unique_remote_rank_copies += token.count
+                closure_counts[
+                    (token.source_rank, destination, tuple(sorted(experts)))
+                ] += token.count
+                if _node_of(token.source_rank, self.ranks_per_node) == _node_of(
+                    destination, self.ranks_per_node
+                ):
+                    nvl_traffic += token.count
+                else:
+                    rdma_traffic += token.count
+        comm = [max(outbound, inbound) for outbound, inbound in zip(send, recv)]
+        return (
+            PlanMetrics(
+                compute,
+                send,
+                recv,
+                comm,
+                sum(send),
+                unique_remote_rank_copies,
+                nvl_traffic,
+                rdma_traffic,
+                0.0,
+            ),
+            closure_counts,
+            local_demands,
+        )
+
+    def _fast_candidate_metrics(
+        self,
+        baseline: PlanMetrics,
+        action: ReplicaAction,
+        remote: int,
+        closure_count: int,
+        local_demands: Mapping[Tuple[int, int], int],
+        normalization: Tuple[float, float],
+    ) -> PlanMetrics:
+        """Apply a local load delta without rerouting the entire window."""
+        compute = list(baseline.compute_load)
+        send = list(baseline.send_load)
+        recv = list(baseline.recv_load)
+        for expert in action.experts:
+            demand = local_demands.get((action.destination_rank, expert), 0)
+            home = self.baseline_rank_by_expert[expert]
+            if home != action.destination_rank:
+                compute[home] -= demand
+                compute[action.destination_rank] += demand
+
+        nvl_traffic = baseline.nvl_traffic
+        rdma_traffic = baseline.rdma_traffic
+        if closure_count:
+            cost = _link_cost(
+                action.destination_rank, remote, self.ranks_per_node, self.rdma_cost
+            )
+            delta = closure_count * cost
+            send[action.destination_rank] -= delta
+            recv[remote] -= delta
+            if _node_of(action.destination_rank, self.ranks_per_node) == _node_of(
+                remote, self.ranks_per_node
+            ):
+                nvl_traffic -= closure_count
+            else:
+                rdma_traffic -= closure_count
+        comm = [max(outbound, inbound) for outbound, inbound in zip(send, recv)]
+        metrics = PlanMetrics(
+            compute,
+            send,
+            recv,
+            comm,
+            sum(send),
+            baseline.unique_remote_rank_copies - closure_count,
+            nvl_traffic,
+            rdma_traffic,
+            0.0,
+        )
+        return self._with_objective(metrics, normalization)
+
+    def _with_objective(
+        self, metrics: PlanMetrics, normalization: Tuple[float, float]
+    ) -> PlanMetrics:
+        avg_compute, avg_comm = normalization
+        metrics.objective = max(
+            self.compute_weight * load / avg_compute
+            + self.communication_weight * traffic / avg_comm
+            for load, traffic in zip(metrics.compute_load, metrics.communication_load)
+        )
+        return metrics
 
     def _validate_tokens(self, tokens: Sequence[RoutedToken]) -> None:
         for token in tokens:
