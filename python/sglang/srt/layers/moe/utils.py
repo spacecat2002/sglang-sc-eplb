@@ -26,7 +26,6 @@ logger = logging.getLogger(__name__)
 
 
 class MoeA2ABackend(Enum):
-
     NONE = "none"
     DEEPEP = "deepep"
     HYBRIDEP = "hybridep"
@@ -97,7 +96,6 @@ class MoeA2ABackend(Enum):
 
 
 class MoeRunnerBackend(Enum):
-
     AUTO = "auto"
     DEEP_GEMM = "deep_gemm"
     TRITON = "triton"
@@ -180,7 +178,6 @@ class MoeRunnerBackend(Enum):
 
 
 class DeepEPMode(Enum):
-
     NORMAL = "normal"
     LOW_LATENCY = "low_latency"
     AUTO = "auto"

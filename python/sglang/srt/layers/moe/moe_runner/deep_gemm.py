@@ -44,6 +44,10 @@ from sglang.srt.utils import (
 from sglang.srt.utils.offloader import get_offloader
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.token_dispatcher.legacy_experimental.hybridep import (
+        HybridEPCombineInput,
+        HybridEPDispatchOutput,
+    )
     from sglang.srt.layers.moe.token_dispatcher.deepep import (
         DeepEPLLCombineInput,
         DeepEPLLDispatchOutput,
@@ -159,9 +163,9 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
                 1,
                 32,
             ], f"MXFP8 requires block_shape [1, 32], got {self.block_shape}"
-            assert (
-                deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-            ), "MXFP8 requires DEEPGEMM_SCALE_UE8M0=True"
+            assert deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0, (
+                "MXFP8 requires DEEPGEMM_SCALE_UE8M0=True"
+            )
 
 
 class DeepGemmRunnerCore(MoeRunnerCore):
@@ -406,7 +410,6 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         quant_info: DeepGemmMoeQuantInfo,
         running_state: dict,
     ) -> torch.Tensor:
-
         hidden_states = runner_input.hidden_states
         all_tokens = running_state["all_tokens"]
         hidden_states_device = running_state["hidden_states_device"]
@@ -515,9 +518,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
             if hidden_states_scale.dtype != torch.int:
                 b, s_mn, s_k = hidden_states_scale.shape
-                assert (
-                    s_mn % 4 == 0 and s_k % 4 == 0
-                ), f"scales must be aligned to 4, but got ({b}, {s_mn}, {s_k})"
+                assert s_mn % 4 == 0 and s_k % 4 == 0, (
+                    f"scales must be aligned to 4, but got ({b}, {s_mn}, {s_k})"
+                )
                 hidden_states_scale = _cast_to_e8m0_with_rounding_up(
                     hidden_states_scale
                 )
@@ -557,9 +560,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         swiglu_limit_arg: Optional[float] = None
         if self.swiglu_limit is not None:
             # DeepSeek V4: clamped swiglu requires the DSV4 JIT EP activation.
-            assert (
-                envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
-            ), "DeepSeek V4 requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
+            assert envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get(), (
+                "DeepSeek V4 requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
+            )
 
             if envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get():
                 swiglu_limit_arg = self.swiglu_limit
@@ -984,6 +987,64 @@ def post_permute_deep_gemm_to_standard(
     )
 
 
+@register_pre_permute("hybridep", "deep_gemm")
+def pre_permute_hybridep_to_deep_gemm(
+    dispatch_output: HybridEPDispatchOutput,
+    quant_info: DeepGemmMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> DeepGemmRunnerInput:
+    """Adapt HybridEP's already expert-grouped BF16 rows to modern DeepGEMM."""
+    if quant_info.w13_weight.dtype != torch.bfloat16:
+        raise ValueError("Legacy/experimental HybridEP only supports BF16 weights.")
+
+    hidden_states = dispatch_output.hidden_states
+    tokens_per_expert = dispatch_output.tokens_per_expert.to(torch.int64)
+    m_indices = torch.repeat_interleave(
+        torch.arange(
+            runner_config.num_local_experts,
+            device=hidden_states.device,
+            dtype=torch.int32,
+        ),
+        tokens_per_expert,
+    )
+    if m_indices.numel() != hidden_states.shape[0]:
+        raise RuntimeError(
+            "HybridEP returned inconsistent expert counts: "
+            f"{m_indices.numel()} assignments for {hidden_states.shape[0]} rows."
+        )
+
+    running_state["all_tokens"] = hidden_states.shape[0]
+    running_state["hidden_states_shape"] = hidden_states.shape
+    running_state["hidden_states_dtype"] = hidden_states.dtype
+    running_state["hidden_states_device"] = hidden_states.device
+    running_state["hybridep_routing_weights"] = dispatch_output.routing_weights
+    return DeepGemmRunnerInput(
+        hidden_states=hidden_states,
+        hidden_states_scale=None,
+        use_masked_gemm=False,
+        m_indices=m_indices,
+    )
+
+
+@register_post_permute("deep_gemm", "hybridep")
+def post_permute_deep_gemm_to_hybridep(
+    runner_output: DeepGemmRunnerOutput,
+    quant_info: DeepGemmMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> HybridEPCombineInput:
+    from sglang.srt.layers.moe.token_dispatcher.legacy_experimental.hybridep import (
+        HybridEPCombineInput,
+    )
+
+    output = runner_output.hidden_states
+    routing_weights = running_state["hybridep_routing_weights"]
+    if routing_weights is not None:
+        output.mul_(routing_weights.to(output.dtype).unsqueeze(-1))
+    return HybridEPCombineInput(hidden_states=output)
+
+
 @register_pre_permute("deepep_ll", "deep_gemm")
 def pre_permute_deepep_ll_to_deep_gemm(
     dispatch_output: DeepEPLLDispatchOutput,
@@ -1229,9 +1290,9 @@ def _varlen_deep_gemm_silu_mul_quant(
     # int32 UE8M0 (no follow-up transform; needs G % 4 == 0 and the
     # num_real_tokens grid bound) when eligible, row-major fp32 otherwise.
     if gemm1_alpha is not None:
-        assert (
-            swiglu_limit is None
-        ), "swiglu_limit and gemm1_alpha are mutually exclusive"
+        assert swiglu_limit is None, (
+            "swiglu_limit and gemm1_alpha are mutually exclusive"
+        )
         assert not swizzle, "swizzle is not supported with gemm1_alpha"
         from sglang.kernels.ops.moe.ep_moe_kernels import (
             silu_and_mul_masked_post_quant_fwd,
@@ -1270,9 +1331,9 @@ def _varlen_deep_gemm_silu_mul_quant(
     # DSV4-specific activations (clamped swiglu, swizzled gate|up layout) stay
     # on the DSV4 JIT kernel; it is the only implementation carrying them.
     if swiglu_limit is not None or swizzle:
-        assert (
-            envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
-        ), "swiglu_limit / swizzle require SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
+        assert envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get(), (
+            "swiglu_limit / swizzle require SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
+        )
         assert N % 4 == 0 and G % 4 == 0 and D // 8 >= E, (
             "DSV4 JIT activation requires N % 4 == 0, G % 4 == 0 and "
             f"D // 8 >= num_experts, got N={N} G={G} D={D} E={E}"
