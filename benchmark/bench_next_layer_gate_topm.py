@@ -126,6 +126,11 @@ def _load_records(
         if suffix not in {".json", ".jsonl"}:
             raise ValueError("--dataset-path must point to a .json or .jsonl file")
         dataset = load_dataset("json", data_files=args.dataset_path, split="train")
+    elif args.dataset == "sharegpt":
+        # ShareGPT is a dataset repository containing a raw JSON asset rather
+        # than a datasets-compatible builder, so load_dataset(repo_id) fails.
+        sharegpt_path = _download_sharegpt()
+        dataset = load_dataset("json", data_files=sharegpt_path, split="train")
     else:
         if not default_dataset:
             raise ValueError("pass --dataset for a Hugging Face dataset or --dataset-path for local JSON")
@@ -136,6 +141,24 @@ def _load_records(
             revision=args.dataset_revision,
         )
     return [dict(record) for record in dataset]
+
+
+def _download_sharegpt() -> str:
+    repo_id = "anon8231489123/ShareGPT_Vicuna_unfiltered"
+    filename = "ShareGPT_V3_unfiltered_cleaned_split.json"
+    try:
+        from sglang.benchmark.utils import download_and_cache_hf_file
+
+        return download_and_cache_hf_file(repo_id=repo_id, filename=filename)
+    except ImportError:
+        try:
+            from huggingface_hub import hf_hub_download
+        except ImportError as exc:
+            raise SystemExit(
+                "ShareGPT download requires sglang or huggingface_hub; "
+                "alternatively pass --dataset-path to a local JSON file"
+            ) from exc
+        return hf_hub_download(repo_id=repo_id, filename=filename, repo_type="dataset")
 
 
 def _record_prompt(record: Dict[str, Any], fields: List[str]) -> str:
