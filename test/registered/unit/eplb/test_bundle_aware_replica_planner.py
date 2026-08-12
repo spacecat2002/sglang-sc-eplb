@@ -9,6 +9,19 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
+def test_reshard_trace_evenly_splits_source_rank_bundles():
+    from benchmark.plan_moe_replica_offline import _reshard_tokens
+
+    tokens = _reshard_tokens([RoutedToken(1, (4, 8), count=10)], 2, 8)
+
+    assert [(token.source_rank, token.count) for token in tokens] == [
+        (4, 3),
+        (5, 3),
+        (6, 2),
+        (7, 2),
+    ]
+
+
 def _planner(**kwargs):
     defaults = dict(
         num_ranks=2,
@@ -81,6 +94,21 @@ def test_baseline_evaluation_does_not_add_replicas():
 
     assert metrics.compute_load == [0, 200]
     assert metrics.unique_remote_rank_copies == 100
+
+
+def test_explicit_placement_replay_measures_fast_plan_exactly():
+    planner = BundleAwareReplicaPlanner(
+        num_ranks=2,
+        baseline_rank_by_expert={0: 1, 1: 0},
+        replica_slots_per_rank=1,
+        compute_weight=0.0,
+        communication_weight=1.0,
+    )
+    tokens = [RoutedToken(0, (0,), count=100), RoutedToken(1, (1,), count=100)]
+    plan = planner.plan_fast(tokens, max_candidates=4)
+
+    replayed = planner.evaluate_placement(tokens, plan.replicas_by_rank)
+    assert replayed.unique_remote_rank_copies == 0
 
 
 def test_high_compute_weight_can_choose_single_helper_copy():

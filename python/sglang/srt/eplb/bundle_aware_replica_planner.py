@@ -190,6 +190,23 @@ class BundleAwareReplicaPlanner:
         self._validate_tokens(tokens)
         return self._evaluate(tokens, self._baseline_placement())
 
+    def evaluate_placement(
+        self,
+        routed_tokens: Iterable[RoutedToken],
+        replicas_by_rank: Mapping[int, Set[int]],
+    ) -> PlanMetrics:
+        """Replay an explicit placement, including selected replica actions."""
+        tokens = list(routed_tokens)
+        if not tokens:
+            raise ValueError("routed_tokens must not be empty")
+        self._validate_tokens(tokens)
+        if set(replicas_by_rank) != set(range(self.num_ranks)):
+            raise ValueError("replicas_by_rank must contain every rank")
+        for expert, home_rank in self.baseline_rank_by_expert.items():
+            if expert not in replicas_by_rank[home_rank]:
+                raise ValueError(f"placement removed home expert {expert}")
+        return self._evaluate(tokens, replicas_by_rank)
+
     def plan_fast(
         self,
         routed_tokens: Iterable[RoutedToken],
