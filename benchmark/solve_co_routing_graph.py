@@ -36,6 +36,7 @@ from sglang.srt.eplb.co_routing_graph_solver import (
     CoRoutingGraphSolver,
     build_co_routing_graph,
     evaluate_primary_remote,
+    refine_hypergraph_placement,
 )
 from sglang.srt.eplb.moe_bundle_trace import (
     compact_layer_from_records,
@@ -147,6 +148,7 @@ def _cuda_fast_planner_ops():
         from sglang.srt.eplb.cuda_fast_co_routing_planner import (
             build_co_routing_graph_cuda,
             plan_communication_replicas_cuda,
+            refine_hypergraph_placement_cuda,
             solve_co_routing_graph_cuda,
         )
     except ImportError as exc:
@@ -157,6 +159,7 @@ def _cuda_fast_planner_ops():
         build_co_routing_graph_cuda,
         solve_co_routing_graph_cuda,
         plan_communication_replicas_cuda,
+        refine_hypergraph_placement_cuda,
     )
 
 
@@ -378,6 +381,23 @@ def _tokens_from_compact_layer(
         for src, experts, weight in zip(source, topk, count)
     ]
     return _reshard_tokens(tokens, source_ep, target_ep)
+
+
+def _materialize_layer_tokens(
+    name: str,
+    entries: Any,
+    *,
+    compact_input: bool,
+    source_ep: int,
+    target_ep: int,
+) -> list[RoutedToken]:
+    if compact_input:
+        return _tokens_from_compact_layer(name, entries, source_ep, target_ep)
+    return _reshard_tokens(
+        _tokens_from_entries(name, entries),
+        source_ep,
+        target_ep,
+    )
 
 
 def _prefetched_layers(
@@ -624,6 +644,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     trace_ep = int(trace_ep)
     if trace_ep < 1:
         raise ValueError("source EP must be positive")
+    round_limit = None if args.until_convergence else args.max_rounds
     output_layers = []
     prepared_layers = _prefetched_layers(
         layers,
@@ -672,7 +693,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         cuda_graph = None
         if tensor_trace is not None:
             if cuda_fast_ops is not None:
-                build_cuda_graph, _, _ = cuda_fast_ops
+                build_cuda_graph, _, _, _ = cuda_fast_ops
                 cuda_graph = build_cuda_graph(
                     tensor_trace.topk_experts, tensor_trace.count
                 )
@@ -697,17 +718,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         solver = CoRoutingGraphSolver(
             num_ranks=args.num_ranks,
             slots_per_rank=capacity,
-            max_rounds=args.max_rounds,
+            max_rounds=round_limit,
             balance_weight=args.balance_weight,
         )
         graph_start = time.perf_counter()
         if cuda_graph is not None:
-            _, solve_cuda_graph, _ = cuda_fast_ops
+            _, solve_cuda_graph, _, _ = cuda_fast_ops
             placement = solve_cuda_graph(
                 cuda_graph,
                 num_ranks=args.num_ranks,
                 slots_per_rank=capacity,
-                max_rounds=args.max_rounds,
+                max_rounds=round_limit,
                 balance_weight=args.balance_weight,
             )
         else:
@@ -731,7 +752,54 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             baseline_remote = evaluate_primary_remote(tokens, baseline_homes)
             graph_remote = evaluate_primary_remote(tokens, placement.rank_by_expert)
         primary_replay_seconds = time.perf_counter() - primary_replay_start
-        planned_remote = graph_remote
+        hypergraph_limit = (
+            None if args.hypergraph_until_convergence else args.hypergraph_rounds
+        )
+        hypergraph_enabled = hypergraph_limit is None or hypergraph_limit > 0
+        final_placement = placement
+        hypergraph_remote = graph_remote
+        hypergraph_iterations = 0
+        hypergraph_solve_seconds = 0.0
+        if hypergraph_enabled:
+            if cuda_fast_ops is not None:
+                _, _, _, refine_cuda_hypergraph = cuda_fast_ops
+                hypergraph_placement = refine_cuda_hypergraph(
+                    tensor_trace.source_rank,
+                    tensor_trace.topk_experts,
+                    tensor_trace.count,
+                    placement.rank_by_expert,
+                    num_ranks=args.num_ranks,
+                    max_rounds=hypergraph_limit,
+                )
+                hypergraph_solve_seconds = hypergraph_placement.solve_seconds
+            else:
+                if tokens is None:
+                    tokens = _materialize_layer_tokens(
+                        name,
+                        entries,
+                        compact_input=compact_input,
+                        source_ep=trace_ep,
+                        target_ep=args.num_ranks,
+                    )
+                hypergraph_start = time.perf_counter()
+                hypergraph_placement = refine_hypergraph_placement(
+                    tokens,
+                    placement.rank_by_expert,
+                    num_ranks=args.num_ranks,
+                    max_rounds=hypergraph_limit,
+                )
+                hypergraph_solve_seconds = time.perf_counter() - hypergraph_start
+            if hypergraph_placement.initial_remote != graph_remote:
+                raise RuntimeError(
+                    "hypergraph refinement initial replay disagrees with graph replay"
+                )
+            final_placement = hypergraph_placement
+            hypergraph_remote = hypergraph_placement.final_remote
+            hypergraph_iterations = hypergraph_placement.iterations
+        hypergraph_compute_load = _compute_loads(
+            graph_demand, final_placement.rank_by_expert, args.num_ranks
+        )
+        planned_remote = hypergraph_remote
         action_count = 0
         replica_action_details = []
         replica_materialize_seconds = 0.0
@@ -739,12 +807,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         replica_replay_seconds = 0.0
         if args.replica_slots_per_rank:
             if cuda_fast_ops is not None:
-                _, _, plan_cuda_replicas = cuda_fast_ops
+                _, _, plan_cuda_replicas, _ = cuda_fast_ops
                 replica_plan = plan_cuda_replicas(
                     tensor_trace.source_rank,
                     tensor_trace.topk_experts,
                     tensor_trace.count,
-                    placement.rank_by_expert,
+                    final_placement.rank_by_expert,
                     num_ranks=args.num_ranks,
                     replica_slots_per_rank=args.replica_slots_per_rank,
                     max_candidates=args.fast_max_candidates,
@@ -767,14 +835,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 replica_replay_seconds = replica_plan.replay_seconds
             elif tokens is None:
                 materialize_start = time.perf_counter()
-                tokens = _reshard_tokens(
-                    _tokens_from_entries(name, entries), trace_ep, args.num_ranks
+                tokens = _materialize_layer_tokens(
+                    name,
+                    entries,
+                    compact_input=compact_input,
+                    source_ep=trace_ep,
+                    target_ep=args.num_ranks,
                 )
                 replica_materialize_seconds = time.perf_counter() - materialize_start
             if cuda_fast_ops is None:
                 replica_planner = BundleAwareReplicaPlanner(
                     num_ranks=args.num_ranks,
-                    baseline_rank_by_expert=placement.rank_by_expert,
+                    baseline_rank_by_expert=final_placement.rank_by_expert,
                     replica_slots_per_rank=args.replica_slots_per_rank,
                     ranks_per_node=args.ranks_per_node,
                     rdma_cost=args.rdma_cost,
@@ -822,13 +894,24 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "edges": graph_edge_count,
                 "baseline_remote": baseline_remote,
                 "graph_remote": graph_remote,
+                "hypergraph_remote": hypergraph_remote,
                 "planned_remote": planned_remote,
                 "baseline_compute_load": baseline_compute_load,
                 "graph_compute_load": graph_compute_load,
+                "hypergraph_compute_load": hypergraph_compute_load,
                 "baseline_compute_imbalance": _max_over_average(baseline_compute_load),
                 "graph_compute_imbalance": _max_over_average(graph_compute_load),
+                "hypergraph_compute_imbalance": _max_over_average(
+                    hypergraph_compute_load
+                ),
                 "graph_delta": (graph_remote / baseline_remote - 1.0)
                 if baseline_remote
+                else 0.0,
+                "hypergraph_delta": (hypergraph_remote / baseline_remote - 1.0)
+                if baseline_remote
+                else 0.0,
+                "hypergraph_gain": (hypergraph_remote / graph_remote - 1.0)
+                if graph_remote
                 else 0.0,
                 "planned_delta": (planned_remote / baseline_remote - 1.0)
                 if baseline_remote
@@ -842,6 +925,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "primary_replay_seconds": primary_replay_seconds,
                 "layer_seconds": time.perf_counter() - layer_start,
                 "graph_solve_seconds": graph_solve_seconds,
+                "hypergraph_iterations": hypergraph_iterations,
+                "hypergraph_solve_seconds": hypergraph_solve_seconds,
                 "replica_actions": action_count,
                 "replica_action_details": replica_action_details,
                 "replica_materialize_seconds": replica_materialize_seconds,
@@ -849,7 +934,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "replica_replay_seconds": replica_replay_seconds,
                 "experts_by_rank": {
                     str(rank): list(experts)
-                    for rank, experts in placement.experts_by_rank.items()
+                    for rank, experts in final_placement.experts_by_rank.items()
                 },
             }
         )
@@ -859,6 +944,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "baseline": args.baseline,
         "planner": args.planner,
         "device": args.device,
+        "round_limit": round_limit,
+        "hypergraph_round_limit": (
+            None if args.hypergraph_until_convergence else args.hypergraph_rounds
+        ),
         "input_format": "compact" if compact_input else "json",
         "input_load_seconds": input_load_seconds,
         "total_wall_seconds": time.perf_counter() - run_start,
@@ -887,7 +976,33 @@ def main() -> None:
         help="source EP of the trace; defaults to trace JSON num_ranks",
     )
     parser.add_argument("--slots-per-rank", type=int, default=None)
-    parser.add_argument("--max-rounds", type=int, default=8)
+    round_group = parser.add_mutually_exclusive_group()
+    round_group.add_argument(
+        "--max-rounds",
+        type=int,
+        default=8,
+        help="maximum swap rounds per layer (default: 8)",
+    )
+    round_group.add_argument(
+        "--until-convergence",
+        action="store_true",
+        help="ignore the round limit and stop only when no improving swap remains",
+    )
+    hypergraph_group = parser.add_mutually_exclusive_group()
+    hypergraph_group.add_argument(
+        "--hypergraph-rounds",
+        type=int,
+        default=0,
+        help=(
+            "refine graph placement for this many rounds using exact Top-K "
+            "remote-rank traffic (default: disabled)"
+        ),
+    )
+    hypergraph_group.add_argument(
+        "--hypergraph-until-convergence",
+        action="store_true",
+        help="refine exact Top-K traffic until no improving swap remains",
+    )
     parser.add_argument("--balance-weight", type=float, default=0.0)
     parser.add_argument(
         "--device",
@@ -945,6 +1060,10 @@ def main() -> None:
         parser.error("--fast-max-candidates must be positive")
     if args.tensor_chunk_size < 1:
         parser.error("--tensor-chunk-size must be positive")
+    if args.max_rounds < 0:
+        parser.error("--max-rounds must be non-negative")
+    if args.hypergraph_rounds < 0:
+        parser.error("--hypergraph-rounds must be non-negative")
     result = run(args)
     if args.json:
         print(json.dumps(result, indent=2))
@@ -957,18 +1076,23 @@ def main() -> None:
             "edges",
             "baseline",
             "graph",
+            "hypergraph",
             "planned",
             "graph_delta",
+            "hyper_delta",
+            "hyper_gain",
             "planned_delta",
             "cut",
             "comp",
             "rounds",
+            "hyper_rounds",
             "tensorize",
             "graph_build",
             "primary_replay",
             "layer_total",
             "actions",
             "graph_solve",
+            "hyper_solve",
             "replica_input",
             "replica_solve",
             "replica_replay",
@@ -983,27 +1107,46 @@ def main() -> None:
                 str(layer["edges"]),
                 str(layer["baseline_remote"]),
                 str(layer["graph_remote"]),
+                str(layer["hypergraph_remote"]),
                 str(layer["planned_remote"]),
                 f"{layer['graph_delta']:+.1%}",
+                f"{layer['hypergraph_delta']:+.1%}",
+                f"{layer['hypergraph_gain']:+.1%}",
                 f"{layer['planned_delta']:+.1%}",
                 f"{layer['initial_cut']}->{layer['final_cut']}",
                 f"{layer['baseline_compute_imbalance']:.2f}->"
-                f"{layer['graph_compute_imbalance']:.2f}",
+                f"{layer['graph_compute_imbalance']:.2f}->"
+                f"{layer['hypergraph_compute_imbalance']:.2f}",
                 str(layer["iterations"]),
+                str(layer["hypergraph_iterations"]),
                 f"{layer['tensorize_seconds']:.3f}s",
                 f"{layer['graph_build_seconds']:.3f}s",
                 f"{layer['primary_replay_seconds']:.3f}s",
                 f"{layer['layer_seconds']:.3f}s",
                 str(layer["replica_actions"]),
                 f"{layer['graph_solve_seconds']:.3f}s",
+                f"{layer['hypergraph_solve_seconds']:.3f}s",
                 f"{layer['replica_materialize_seconds']:.3f}s",
                 f"{layer['replica_solve_seconds']:.3f}s",
                 f"{layer['replica_replay_seconds']:.3f}s",
             ]
         )
     print("Co-routing graph placement replay")
+    round_mode = (
+        "until-convergence"
+        if result["round_limit"] is None
+        else f"max-{result['round_limit']}"
+    )
+    hypergraph_limit = result["hypergraph_round_limit"]
+    hypergraph_mode = (
+        "until-convergence"
+        if hypergraph_limit is None
+        else ("disabled" if hypergraph_limit == 0 else f"max-{hypergraph_limit}")
+    )
     print(
         f"device={result['device']} planner={result['planner']} "
+        f"rounds={round_mode} "
+        f"hypergraph={hypergraph_mode} "
         f"input={result['input_format']} "
         f"input_load={result['input_load_seconds']:.3f}s"
     )
@@ -1017,6 +1160,8 @@ def main() -> None:
         f"{sum(layer['primary_replay_seconds'] for layer in result['layers']):.3f}s "
         "graph_solve="
         f"{sum(layer['graph_solve_seconds'] for layer in result['layers']):.3f}s "
+        "hypergraph_solve="
+        f"{sum(layer['hypergraph_solve_seconds'] for layer in result['layers']):.3f}s "
         "replica_input="
         f"{sum(layer['replica_materialize_seconds'] for layer in result['layers']):.3f}s "
         "replica_solve="

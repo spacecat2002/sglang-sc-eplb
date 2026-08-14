@@ -16,6 +16,7 @@ from sglang.srt.eplb.cuda_fast_co_routing_planner import (  # noqa: E402
     build_co_routing_graph_cuda,
     evaluate_replica_remote_cuda,
     plan_communication_replicas_cuda,
+    refine_hypergraph_placement_cuda,
     solve_co_routing_graph_cuda,
 )
 
@@ -98,3 +99,22 @@ def test_cuda_fast_planner_selects_communication_closing_replica():
     )
     assert plan.actions == [ReplicaAction(0, (2,), "cuda-bundle-closure")]
     assert plan.unique_remote_rank_copies == 0
+
+
+def test_cuda_hypergraph_refinement_uses_exact_bundle_objective():
+    source = torch.tensor([0, 1], device="cuda", dtype=torch.int64)
+    topk = torch.tensor([[0, 1], [2, 3]], device="cuda", dtype=torch.int64)
+    count = torch.tensor([10, 10], device="cuda", dtype=torch.int64)
+
+    placement = refine_hypergraph_placement_cuda(
+        source,
+        topk,
+        count,
+        {0: 0, 1: 1, 2: 0, 3: 1},
+        num_ranks=2,
+        max_rounds=None,
+    )
+
+    assert placement.initial_remote == 20
+    assert placement.final_remote == 0
+    assert placement.iterations == 1

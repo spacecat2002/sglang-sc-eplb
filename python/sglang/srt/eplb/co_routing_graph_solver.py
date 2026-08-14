@@ -56,6 +56,17 @@ class GraphPlacement:
     iterations: int
 
 
+@dataclass(frozen=True)
+class HypergraphPlacement:
+    """A placement refined against exact Top-K bundle remote-rank counts."""
+
+    rank_by_expert: Dict[int, int]
+    experts_by_rank: Dict[int, Tuple[int, ...]]
+    initial_remote: int
+    final_remote: int
+    iterations: int
+
+
 def build_co_routing_graph(
     routed_tokens: Iterable[RoutedToken],
     *,
@@ -84,13 +95,107 @@ def build_co_routing_graph(
     ordered_experts = tuple(sorted(observed))
     for expert in ordered_experts:
         demand.setdefault(expert, 0)
-    adjacency: Dict[int, Dict[int, int]] = {
-        expert: {} for expert in ordered_experts
-    }
+    adjacency: Dict[int, Dict[int, int]] = {expert: {} for expert in ordered_experts}
     for (left, right), weight in edges.items():
         adjacency[left][right] = weight
         adjacency[right][left] = weight
     return CoRoutingGraph(ordered_experts, dict(demand), dict(edges), adjacency)
+
+
+def refine_hypergraph_placement(
+    routed_tokens: Iterable[RoutedToken],
+    initial_rank_by_expert: Mapping[int, int],
+    *,
+    num_ranks: int,
+    max_rounds: Optional[int] = 8,
+) -> HypergraphPlacement:
+    """Refine a placement using the exact distinct-remote-rank objective.
+
+    Swapping two experts preserves the number of primary experts on every
+    rank. Only bundles containing exactly one of the swapped experts can
+    change their destination-rank cardinality.
+    """
+
+    if num_ranks < 1:
+        raise ValueError("num_ranks must be positive")
+    if max_rounds is not None and max_rounds < 0:
+        raise ValueError("max_rounds must be non-negative")
+    tokens = list(routed_tokens)
+    rank_by_expert = dict(initial_rank_by_expert)
+    if any(rank < 0 or rank >= num_ranks for rank in rank_by_expert.values()):
+        raise ValueError("initial placement contains an invalid rank")
+    observed = {expert for token in tokens for expert in token.topk_experts}
+    missing = observed - rank_by_expert.keys()
+    if missing:
+        raise ValueError(f"initial placement is missing experts: {sorted(missing)}")
+
+    incidence: Dict[int, Set[int]] = {expert: set() for expert in rank_by_expert}
+    for bundle_index, token in enumerate(tokens):
+        for expert in token.topk_experts:
+            incidence[expert].add(bundle_index)
+
+    initial_remote = evaluate_primary_remote(tokens, rank_by_expert)
+    rounds = 0
+    while max_rounds is None or rounds < max_rounds:
+        rank_counts = []
+        for token in tokens:
+            counts: Dict[int, int] = defaultdict(int)
+            for expert in token.topk_experts:
+                counts[rank_by_expert[expert]] += 1
+            rank_counts.append(counts)
+
+        best: Optional[Tuple[int, int, int]] = None
+        experts = sorted(rank_by_expert)
+        for left_index, left in enumerate(experts):
+            left_rank = rank_by_expert[left]
+            for right in experts[left_index + 1 :]:
+                right_rank = rank_by_expert[right]
+                if left_rank == right_rank:
+                    continue
+                delta = 0
+                affected = incidence[left] ^ incidence[right]
+                for bundle_index in affected:
+                    token = tokens[bundle_index]
+                    counts = rank_counts[bundle_index]
+                    if bundle_index in incidence[left]:
+                        old_rank, new_rank = left_rank, right_rank
+                    else:
+                        old_rank, new_rank = right_rank, left_rank
+                    removed = old_rank != token.source_rank and counts[old_rank] == 1
+                    added = (
+                        new_rank != token.source_rank and counts.get(new_rank, 0) == 0
+                    )
+                    delta += token.count * (int(added) - int(removed))
+                candidate = (delta, left, right)
+                if delta < 0 and (best is None or candidate < best):
+                    best = candidate
+        if best is None:
+            break
+        _, left, right = best
+        rank_by_expert[left], rank_by_expert[right] = (
+            rank_by_expert[right],
+            rank_by_expert[left],
+        )
+        rounds += 1
+
+    final_remote = evaluate_primary_remote(tokens, rank_by_expert)
+    experts_by_rank = {
+        rank: tuple(
+            sorted(
+                expert
+                for expert, expert_rank in rank_by_expert.items()
+                if expert_rank == rank
+            )
+        )
+        for rank in range(num_ranks)
+    }
+    return HypergraphPlacement(
+        rank_by_expert,
+        experts_by_rank,
+        initial_remote,
+        final_remote,
+        rounds,
+    )
 
 
 class CoRoutingGraphSolver:
@@ -107,12 +212,12 @@ class CoRoutingGraphSolver:
         *,
         num_ranks: int,
         slots_per_rank: int | Sequence[int],
-        max_rounds: int = 8,
+        max_rounds: Optional[int] = 8,
         balance_weight: float = 0.0,
     ):
         if num_ranks < 1:
             raise ValueError("num_ranks must be positive")
-        if max_rounds < 0:
+        if max_rounds is not None and max_rounds < 0:
             raise ValueError("max_rounds must be non-negative")
         if balance_weight < 0:
             raise ValueError("balance_weight must be non-negative")
@@ -139,7 +244,7 @@ class CoRoutingGraphSolver:
             sum(graph.demand[expert] for expert in experts) for experts in assignment
         ]
         rounds = 0
-        while rounds < self.max_rounds:
+        while self.max_rounds is None or rounds < self.max_rounds:
             # Compute all one-expert move gains once per round. A candidate
             # swap is then scored in O(1), instead of rescanning neighbors
             # and rank sets for every pair.

@@ -67,6 +67,62 @@ def _edge_kernel(
 
 
 @triton.jit
+def _hypergraph_swap_delta_kernel(
+    topk_ptr,
+    source_ptr,
+    count_ptr,
+    rank_by_expert_ptr,
+    delta_ptr,
+    num_values,
+    num_experts,
+    TOPK: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < num_values
+    candidate = offsets % num_experts
+    incidence = offsets // num_experts
+    bundle = incidence // TOPK
+    slot = incidence % TOPK
+    expert = tl.load(topk_ptr + bundle * TOPK + slot, mask=mask, other=0)
+    expert_rank = tl.load(rank_by_expert_ptr + expert, mask=mask, other=-1)
+    candidate_rank = tl.load(rank_by_expert_ptr + candidate, mask=mask, other=-1)
+    source = tl.load(source_ptr + bundle, mask=mask, other=0)
+
+    contains_candidate = tl.zeros((BLOCK,), dtype=tl.int1)
+    old_rank_count = tl.zeros((BLOCK,), dtype=tl.int32)
+    new_rank_count = tl.zeros((BLOCK,), dtype=tl.int32)
+    for other_slot in tl.static_range(0, TOPK):
+        other = tl.load(
+            topk_ptr + bundle * TOPK + other_slot,
+            mask=mask,
+            other=0,
+        )
+        other_rank = tl.load(rank_by_expert_ptr + other, mask=mask, other=-1)
+        contains_candidate |= other == candidate
+        old_rank_count += (other_rank == expert_rank).to(tl.int32)
+        new_rank_count += (other_rank == candidate_rank).to(tl.int32)
+
+    valid = (
+        mask
+        & (candidate_rank >= 0)
+        & (expert_rank != candidate_rank)
+        & ~contains_candidate
+    )
+    removed = (expert_rank != source) & (old_rank_count == 1)
+    added = (candidate_rank != source) & (new_rank_count == 0)
+    weight = tl.load(count_ptr + bundle, mask=mask, other=0).to(tl.int64)
+    delta = (added.to(tl.int64) - removed.to(tl.int64)) * weight
+    low = tl.minimum(expert, candidate)
+    high = tl.maximum(expert, candidate)
+    tl.atomic_add(
+        delta_ptr + low * num_experts + high,
+        delta,
+        mask=valid,
+    )
+
+
+@triton.jit
 def _replica_replay_kernel(
     ordered_topk_ptr,
     source_ptr,
@@ -160,6 +216,16 @@ class CudaFastReplicaPlan:
     replay_seconds: float
 
 
+@dataclass(frozen=True)
+class CudaHypergraphPlacement:
+    rank_by_expert: Dict[int, int]
+    experts_by_rank: Dict[int, Tuple[int, ...]]
+    initial_remote: int
+    final_remote: int
+    iterations: int
+    solve_seconds: float
+
+
 def build_co_routing_graph_cuda(
     topk_experts: torch.Tensor,
     count: torch.Tensor,
@@ -240,7 +306,7 @@ def solve_co_routing_graph_cuda(
     *,
     num_ranks: int,
     slots_per_rank: int | Sequence[int],
-    max_rounds: int = 8,
+    max_rounds: Optional[int] = 8,
     balance_weight: float = 0.0,
 ) -> GraphPlacement:
     """Refine a capacity-constrained placement with GPU swap scoring."""
@@ -251,6 +317,8 @@ def solve_co_routing_graph_cuda(
         capacities = list(slots_per_rank)
     if len(capacities) != num_ranks or any(capacity < 0 for capacity in capacities):
         raise ValueError("slots_per_rank must contain non-negative capacities")
+    if max_rounds is not None and max_rounds < 0:
+        raise ValueError("max_rounds must be non-negative")
     edge_cpu = graph.edge_weights.cpu().numpy()
     demand_cpu = graph.demand.cpu().numpy()
     experts = [expert for expert, demand in enumerate(demand_cpu) if demand > 0]
@@ -301,7 +369,7 @@ def solve_co_routing_graph_cuda(
     observed_pair = observed[:, None] & observed[None, :]
     expert_index = torch.arange(graph.num_experts, device=graph.demand.device)
     rounds = 0
-    while rounds < max_rounds:
+    while max_rounds is None or rounds < max_rounds:
         weight_to_rank = torch.zeros(
             (graph.num_experts, num_ranks),
             dtype=torch.int64,
@@ -397,6 +465,141 @@ def solve_co_routing_graph_cuda(
         initial_cut,
         _placement_objective(graph, rank_by_expert, num_ranks, balance_weight),
         rounds,
+    )
+
+
+def _evaluate_primary_remote_cuda(
+    source_rank: torch.Tensor,
+    topk_experts: torch.Tensor,
+    count: torch.Tensor,
+    rank_by_expert: torch.Tensor,
+) -> int:
+    destinations = rank_by_expert[topk_experts].sort(dim=1).values
+    is_new = torch.ones_like(destinations, dtype=torch.bool)
+    is_new[:, 1:] = destinations[:, 1:] != destinations[:, :-1]
+    remote = is_new & (destinations != source_rank[:, None])
+    return int((remote.sum(dim=1).to(torch.int64) * count).sum().item())
+
+
+def refine_hypergraph_placement_cuda(
+    source_rank: torch.Tensor,
+    topk_experts: torch.Tensor,
+    count: torch.Tensor,
+    initial_rank_by_expert: Mapping[int, int],
+    *,
+    num_ranks: int,
+    max_rounds: Optional[int] = 8,
+) -> CudaHypergraphPlacement:
+    """Refine placement against exact Top-K distinct-remote-rank traffic."""
+
+    if not source_rank.is_cuda or not topk_experts.is_cuda or not count.is_cuda:
+        raise ValueError("CUDA hypergraph refinement requires CUDA tensors")
+    if source_rank.device != topk_experts.device or count.device != topk_experts.device:
+        raise ValueError("all hypergraph tensors must use the same CUDA device")
+    if (
+        topk_experts.ndim != 2
+        or source_rank.ndim != 1
+        or source_rank.shape != count.shape
+    ):
+        raise ValueError("expected source/count [bundles] and topk [bundles, K]")
+    if count.shape[0] != topk_experts.shape[0]:
+        raise ValueError("bundle tensor lengths disagree")
+    if any(
+        tensor.dtype != torch.int64 for tensor in (source_rank, topk_experts, count)
+    ):
+        raise ValueError("source, topk, and count must use int64")
+    if max_rounds is not None and max_rounds < 0:
+        raise ValueError("max_rounds must be non-negative")
+    if num_ranks < 1:
+        raise ValueError("num_ranks must be positive")
+    if not initial_rank_by_expert:
+        raise ValueError("initial placement must not be empty")
+
+    num_experts = max(max(initial_rank_by_expert), int(topk_experts.max().item())) + 1
+    rank_by_expert = torch.full(
+        (num_experts,), -1, dtype=torch.int64, device=topk_experts.device
+    )
+    expert_ids = torch.tensor(
+        list(initial_rank_by_expert), dtype=torch.int64, device=topk_experts.device
+    )
+    initial_ranks = torch.tensor(
+        list(initial_rank_by_expert.values()),
+        dtype=torch.int64,
+        device=topk_experts.device,
+    )
+    if bool(((initial_ranks < 0) | (initial_ranks >= num_ranks)).any().item()):
+        raise ValueError("initial placement contains an invalid rank")
+    rank_by_expert[expert_ids] = initial_ranks
+    if bool((rank_by_expert[topk_experts] < 0).any().item()):
+        raise ValueError("initial placement is missing an observed expert")
+
+    initial_remote = _evaluate_primary_remote_cuda(
+        source_rank, topk_experts, count, rank_by_expert
+    )
+    torch.cuda.current_stream(topk_experts.device).synchronize()
+    solve_start = time.perf_counter()
+    rounds = 0
+    block = 256
+    num_values = topk_experts.numel() * num_experts
+    expert_index = torch.arange(num_experts, device=topk_experts.device)
+    observed = rank_by_expert >= 0
+    valid_pair = (
+        observed[:, None]
+        & observed[None, :]
+        & (expert_index[:, None] < expert_index[None, :])
+    )
+    while max_rounds is None or rounds < max_rounds:
+        deltas = torch.zeros(
+            (num_experts, num_experts),
+            dtype=torch.int64,
+            device=topk_experts.device,
+        )
+        _hypergraph_swap_delta_kernel[(triton.cdiv(num_values, block),)](
+            topk_experts,
+            source_rank,
+            count,
+            rank_by_expert,
+            deltas,
+            num_values,
+            num_experts,
+            TOPK=topk_experts.shape[1],
+            BLOCK=block,
+        )
+        cross_rank = rank_by_expert[:, None] != rank_by_expert[None, :]
+        candidates = torch.where(
+            valid_pair & cross_rank,
+            deltas,
+            torch.iinfo(torch.int64).max,
+        )
+        flat_index = int(torch.argmin(candidates).item())
+        best_delta = int(candidates.flatten()[flat_index].item())
+        if best_delta >= 0:
+            break
+        left = flat_index // num_experts
+        right = flat_index % num_experts
+        left_rank = rank_by_expert[left].clone()
+        rank_by_expert[left] = rank_by_expert[right]
+        rank_by_expert[right] = left_rank
+        rounds += 1
+
+    final_remote = _evaluate_primary_remote_cuda(
+        source_rank, topk_experts, count, rank_by_expert
+    )
+    solve_seconds = time.perf_counter() - solve_start
+    ranks_cpu = rank_by_expert[expert_ids].cpu().tolist()
+    experts_cpu = expert_ids.cpu().tolist()
+    rank_map = dict(zip(experts_cpu, ranks_cpu))
+    experts_by_rank = {
+        rank: tuple(sorted(expert for expert, home in rank_map.items() if home == rank))
+        for rank in range(num_ranks)
+    }
+    return CudaHypergraphPlacement(
+        rank_map,
+        experts_by_rank,
+        initial_remote,
+        final_remote,
+        rounds,
+        solve_seconds,
     )
 
 
