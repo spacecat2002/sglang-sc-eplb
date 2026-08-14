@@ -133,22 +133,39 @@ class CoRoutingGraphSolver:
         if len(graph.experts) > sum(self.capacities):
             raise ValueError("expert count exceeds total rank capacity")
         assignment = self._initial_assignment(graph)
-        initial_cut = self._objective(graph, assignment)
+        rank_by_expert = self._assignment_rank_map(assignment)
+        initial_cut = self._objective(graph, assignment, rank_by_expert)
+        rank_load = [
+            sum(graph.demand[expert] for expert in experts) for experts in assignment
+        ]
         rounds = 0
         while rounds < self.max_rounds:
+            # Compute all one-expert move gains once per round. A candidate
+            # swap is then scored in O(1), instead of rescanning neighbors
+            # and rank sets for every pair.
+            move_gains = self._move_gains(graph, rank_by_expert)
             best: Optional[Tuple[float, int, int, int, int]] = None
             for left_rank in range(self.num_ranks):
                 for right_rank in range(left_rank + 1, self.num_ranks):
                     for left_expert in assignment[left_rank]:
                         for right_expert in assignment[right_rank]:
-                            delta = self._swap_delta(
-                                graph,
-                                assignment,
-                                left_expert,
-                                right_expert,
-                                left_rank,
-                                right_rank,
+                            edge_weight = graph.adjacency.get(left_expert, {}).get(
+                                right_expert, 0
                             )
+                            delta = (
+                                move_gains[left_expert][right_rank]
+                                + move_gains[right_expert][left_rank]
+                                + 2 * edge_weight
+                            )
+                            if self.balance_weight:
+                                delta += self._balance_delta(
+                                    graph,
+                                    rank_load,
+                                    left_expert,
+                                    right_expert,
+                                    left_rank,
+                                    right_rank,
+                                )
                             candidate = (
                                 delta,
                                 left_rank,
@@ -165,17 +182,20 @@ class CoRoutingGraphSolver:
             assignment[left_rank].add(right_expert)
             assignment[right_rank].remove(right_expert)
             assignment[right_rank].add(left_expert)
+            rank_by_expert[left_expert] = right_rank
+            rank_by_expert[right_expert] = left_rank
+            rank_load[left_rank] += (
+                graph.demand[right_expert] - graph.demand[left_expert]
+            )
+            rank_load[right_rank] += (
+                graph.demand[left_expert] - graph.demand[right_expert]
+            )
             rounds += 1
 
-        rank_by_expert = {
-            expert: rank
-            for rank, experts in enumerate(assignment)
-            for expert in experts
-        }
         experts_by_rank = {
             rank: tuple(sorted(experts)) for rank, experts in enumerate(assignment)
         }
-        final_cut = self._objective(graph, assignment)
+        final_cut = self._objective(graph, assignment, rank_by_expert)
         return GraphPlacement(
             rank_by_expert, experts_by_rank, initial_cut, final_cut, rounds
         )
@@ -184,10 +204,11 @@ class CoRoutingGraphSolver:
         assignment = [set() for _ in range(self.num_ranks)]
         rank_load = [0] * self.num_ranks
         # High-degree vertices carry the graph structure; demand breaks ties.
+        weighted_degree = graph.weighted_degree
         order = sorted(
             graph.experts,
             key=lambda expert: (
-                -graph.weighted_degree[expert],
+                -weighted_degree[expert],
                 -graph.demand[expert],
                 expert,
             ),
@@ -215,12 +236,16 @@ class CoRoutingGraphSolver:
         return assignment
 
     def _objective(
-        self, graph: CoRoutingGraph, assignment: Sequence[Set[int]]
+        self,
+        graph: CoRoutingGraph,
+        assignment: Sequence[Set[int]],
+        rank_by_expert: Optional[Mapping[int, int]] = None,
     ) -> float:
+        rank_by_expert = rank_by_expert or self._assignment_rank_map(assignment)
         cut = sum(
             weight
             for (left, right), weight in graph.edges.items()
-            if self._rank_of(assignment, left) != self._rank_of(assignment, right)
+            if rank_by_expert[left] != rank_by_expert[right]
         )
         if self.balance_weight == 0:
             return float(cut)
@@ -231,47 +256,57 @@ class CoRoutingGraphSolver:
         imbalance = sum((load - average) ** 2 for load in loads) / max(average, 1.0)
         return cut + self.balance_weight * imbalance
 
-    def _swap_delta(
+    def _move_gains(
+        self, graph: CoRoutingGraph, rank_by_expert: Mapping[int, int]
+    ) -> Dict[int, List[float]]:
+        gains: Dict[int, List[float]] = {}
+        for expert in graph.experts:
+            weight_to_rank = [0] * self.num_ranks
+            total_weight = 0
+            for neighbor, weight in graph.adjacency.get(expert, {}).items():
+                weight_to_rank[rank_by_expert[neighbor]] += weight
+                total_weight += weight
+            home = rank_by_expert[expert]
+            old_cut = total_weight - weight_to_rank[home]
+            gains[expert] = [
+                float(total_weight - weight_to_rank[rank] - old_cut)
+                for rank in range(self.num_ranks)
+            ]
+        return gains
+
+    def _balance_delta(
         self,
         graph: CoRoutingGraph,
-        assignment: Sequence[Set[int]],
+        rank_load: Sequence[int],
         left_expert: int,
         right_expert: int,
         left_rank: int,
         right_rank: int,
     ) -> float:
-        affected: Set[Edge] = set()
-        for other in graph.adjacency.get(left_expert, {}):
-            affected.add(tuple(sorted((left_expert, other))))
-        for other in graph.adjacency.get(right_expert, {}):
-            affected.add(tuple(sorted((right_expert, other))))
+        average = sum(rank_load) / self.num_ranks
+        before = (rank_load[left_rank] - average) ** 2 + (
+            rank_load[right_rank] - average
+        ) ** 2
+        left_after = (
+            rank_load[left_rank]
+            + graph.demand[right_expert]
+            - graph.demand[left_expert]
+        )
+        right_after = (
+            rank_load[right_rank]
+            + graph.demand[left_expert]
+            - graph.demand[right_expert]
+        )
+        after = (left_after - average) ** 2 + (right_after - average) ** 2
+        return self.balance_weight * (after - before) / max(average, 1.0)
 
-        def rank_after(expert: int) -> int:
-            if expert == left_expert:
-                return right_rank
-            if expert == right_expert:
-                return left_rank
-            return self._rank_of(assignment, expert)
-
-        delta = 0
-        for edge in affected:
-            left, right = edge
-            weight = graph.edges[edge]
-            before = self._rank_of(assignment, left) != self._rank_of(assignment, right)
-            after = rank_after(left) != rank_after(right)
-            delta += weight * (int(after) - int(before))
-
-        if self.balance_weight:
-            # Swaps preserve the number of experts per rank, but not demand;
-            # include the optional soft compute-balance term exactly.
-            before_obj = self._objective(graph, assignment)
-            temporary = [set(experts) for experts in assignment]
-            temporary[left_rank].remove(left_expert)
-            temporary[left_rank].add(right_expert)
-            temporary[right_rank].remove(right_expert)
-            temporary[right_rank].add(left_expert)
-            delta += self._objective(graph, temporary) - before_obj - delta
-        return float(delta)
+    @staticmethod
+    def _assignment_rank_map(assignment: Sequence[Set[int]]) -> Dict[int, int]:
+        return {
+            expert: rank
+            for rank, experts in enumerate(assignment)
+            for expert in experts
+        }
 
     @staticmethod
     def _rank_of(assignment: Sequence[Set[int]], expert: int) -> int:

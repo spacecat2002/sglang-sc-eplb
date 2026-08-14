@@ -137,7 +137,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             max_rounds=args.max_rounds,
             balance_weight=args.balance_weight,
         )
+        graph_start = time.perf_counter()
         placement = solver.solve(graph)
+        graph_solve_seconds = time.perf_counter() - graph_start
         baseline_homes = _baseline_homes(graph.experts, args.num_ranks, args.baseline)
         baseline_remote = evaluate_primary_remote(tokens, baseline_homes)
         graph_remote = evaluate_primary_remote(tokens, placement.rank_by_expert)
@@ -189,6 +191,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "initial_cut": placement.initial_cut,
                 "final_cut": placement.final_cut,
                 "iterations": placement.iterations,
+                "graph_solve_seconds": graph_solve_seconds,
                 "replica_actions": action_count,
                 "replica_solve_seconds": replica_solve_seconds,
                 "experts_by_rank": {
@@ -265,6 +268,7 @@ def main() -> None:
             "cut",
             "rounds",
             "actions",
+            "graph_solve",
             "replica_solve",
         ]
     ]
@@ -282,6 +286,7 @@ def main() -> None:
                 f"{layer['planned_delta']:+.1%}",
                 f"{layer['initial_cut']}->{layer['final_cut']}",
                 str(layer["iterations"]),
+                f"{layer['graph_solve_seconds']:.3f}s",
                 str(layer["replica_actions"]),
                 f"{layer['replica_solve_seconds']:.3f}s",
             ]

@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
-"""Replay real MoE routes from offline inference and plan expert replicas.
+"""Collect real MoE routing metrics from offline inference.
 
 The script runs a Hugging Face MoE model, captures each router's real Top-K
-experts, aggregates identical ``(source_rank, Top-K)`` bundles, and replays
-them through :class:`BundleAwareReplicaPlanner`.  It models DeepEP normal
-mode: a token is transferred once for every *destination rank*, even if
-multiple selected experts live on that rank.
+experts and aggregates identical ``(source_rank, Top-K)`` bundles. It models
+DeepEP normal mode: a token is transferred once for every *destination rank*,
+even if multiple selected experts live on that rank. No replica planner is
+run; this script only measures compute/communication imbalance and remote
+rank copies.
 
 It is an offline what-if tool.  ``--num-ranks`` and ``--source-rank-mode``
 simulate how input tokens are sharded across EP ranks; they do not turn a
 single-GPU Transformers forward pass into a distributed DeepEP measurement.
 
 Example:
-  python benchmark/plan_moe_replica_offline.py \
+  python benchmark/benchmark_ep_trace.py \
       --model Qwen/Qwen3-30B-A3B --dataset sharegpt \
       --num-samples 128 --max-length 1024 --batch-size 2 \
-      --num-ranks 8 --ranks-per-node 8 --replica-slots-per-rank 8 \
-      --max-actions 32 --compute-weight 1 --communication-weight 1
+      --num-ranks 8 --ranks-per-node 8 --replica-slots-per-rank 0 \
+      --bundles-output /tmp/moe_bundles.json
 """
 
 from __future__ import annotations
@@ -39,11 +40,7 @@ from bench_next_layer_gate_topm import (
     _load_model,
     _read_texts,
 )
-from sglang.srt.eplb.bundle_aware_replica_planner import (
-    BundleAwareReplicaPlanner,
-    PlanMetrics,
-    RoutedToken,
-)
+from sglang.srt.eplb.bundle_aware_replica_planner import RoutedToken
 
 
 def _home_rank(expert: int, num_experts: int, num_ranks: int, mode: str) -> int:
@@ -113,17 +110,66 @@ def _source_ranks(
     return flattened[attention_mask.reshape(-1).bool()]
 
 
-def _metrics_dict(metrics: PlanMetrics) -> Dict[str, Any]:
+def _node_of(rank: int, ranks_per_node: int | None) -> int:
+    return rank if ranks_per_node is None else rank // ranks_per_node
+
+
+def _link_cost(
+    source_rank: int, destination_rank: int, args: argparse.Namespace
+) -> float:
+    if _node_of(source_rank, args.ranks_per_node) == _node_of(
+        destination_rank, args.ranks_per_node
+    ):
+        return 1.0
+    return args.rdma_cost
+
+
+def _route_metrics(
+    routed_tokens: Sequence[RoutedToken],
+    homes: Mapping[int, int],
+    args: argparse.Namespace,
+) -> Dict[str, Any]:
+    """Compute rank-set traffic directly, without constructing a planner."""
+    compute = [0] * args.num_ranks
+    send = [0.0] * args.num_ranks
+    recv = [0.0] * args.num_ranks
+    remote_copies = 0
+    nvl_traffic = 0
+    rdma_traffic = 0
+    for token in routed_tokens:
+        for expert in token.topk_experts:
+            compute[homes[expert]] += token.count
+        destinations = {homes[expert] for expert in token.topk_experts}
+        remote_destinations = {
+            destination
+            for destination in destinations
+            if destination != token.source_rank
+        }
+        remote_copies += token.count * len(remote_destinations)
+        for destination in remote_destinations:
+            cost = _link_cost(token.source_rank, destination, args)
+            send[token.source_rank] += token.count * cost
+            recv[destination] += token.count * cost
+            if _node_of(token.source_rank, args.ranks_per_node) == _node_of(
+                destination, args.ranks_per_node
+            ):
+                nvl_traffic += token.count
+            else:
+                rdma_traffic += token.count
+    communication = [
+        max(outbound, inbound) for outbound, inbound in zip(send, recv)
+    ]
     return {
-        "compute_load": metrics.compute_load,
-        "send_load": metrics.send_load,
-        "recv_load": metrics.recv_load,
-        "communication_load": metrics.communication_load,
-        "weighted_communication": metrics.weighted_communication,
-        "unique_remote_rank_copies": metrics.unique_remote_rank_copies,
-        "nvl_traffic": metrics.nvl_traffic,
-        "rdma_traffic": metrics.rdma_traffic,
-        "objective": metrics.objective,
+        "compute_load": compute,
+        "send_load": send,
+        "recv_load": recv,
+        "communication_load": communication,
+        "weighted_communication": sum(send),
+        "unique_remote_rank_copies": remote_copies,
+        "nvl_traffic": nvl_traffic,
+        "rdma_traffic": rdma_traffic,
+        "compute_imbalance": _max_over_avg(compute),
+        "communication_imbalance": _max_over_avg(communication),
     }
 
 
@@ -168,61 +214,17 @@ def _layer_result(
     homes = _homes_for_gate(
         gate_name, observed_experts, args, home_placements, args.num_ranks
     )
-    planner = BundleAwareReplicaPlanner(
-        num_ranks=args.num_ranks,
-        baseline_rank_by_expert=homes,
-        replica_slots_per_rank=args.replica_slots_per_rank,
-        ranks_per_node=args.ranks_per_node,
-        rdma_cost=args.rdma_cost,
-        compute_weight=args.compute_weight,
-        communication_weight=args.communication_weight,
-        max_bundle_size=args.max_bundle_size,
-    )
-    solve_start = time.perf_counter()
-    if args.metrics_only:
-        baseline = planner.evaluate_baseline(routed_tokens)
-        plan = None
-    elif args.planner == "fast":
-        plan = planner.plan_fast(routed_tokens, max_candidates=args.fast_max_candidates)
-    else:
-        plan = planner.plan(routed_tokens, max_actions=args.max_actions)
-    solve_seconds = time.perf_counter() - solve_start
-    if plan is None:
-        baseline_dict = _metrics_dict(baseline)
-        return {
-            "gate": gate_name,
-            "tokens": sum(token.count for token in routed_tokens),
-            "bundles": len(routed_tokens),
-            "solve_seconds": solve_seconds,
-            "homes": homes,
-            "actions": [],
-            "baseline": baseline_dict,
-            "planned": baseline_dict,
-            "replicas_by_rank": {},
-        }
-    # Fast planning scores local deltas for bounded latency. Replaying the
-    # chosen placement once keeps reported remote traffic exact.
-    replayed_final = planner.evaluate_placement(routed_tokens, plan.replicas_by_rank)
+    metrics_start = time.perf_counter()
+    metrics = _route_metrics(routed_tokens, homes, args)
+    metrics_seconds = time.perf_counter() - metrics_start
     return {
         "gate": gate_name,
         "tokens": sum(token.count for token in routed_tokens),
         "bundles": len(routed_tokens),
-        "solve_seconds": solve_seconds,
+        "solve_seconds": metrics_seconds,
+        "metrics_seconds": metrics_seconds,
         "homes": homes,
-        "actions": [
-            {
-                "destination_rank": action.destination_rank,
-                "experts": list(action.experts),
-                "kind": action.kind,
-            }
-            for action in plan.actions
-        ],
-        "baseline": _metrics_dict(plan.baseline),
-        "planned": _metrics_dict(replayed_final),
-        "replicas_by_rank": {
-            str(rank): sorted(experts)
-            for rank, experts in plan.replicas_by_rank.items()
-        },
+        "metrics": metrics,
     }
 
 
@@ -274,18 +276,12 @@ def _ep_comparison_result(
         home_placements,
         args.num_ranks,
     )
-    source = BundleAwareReplicaPlanner(
-        num_ranks=args.num_ranks,
-        baseline_rank_by_expert=source_homes,
-        replica_slots_per_rank=0,
-        ranks_per_node=args.ranks_per_node,
-        rdma_cost=args.rdma_cost,
-    ).evaluate_baseline(tokens)
+    source_metrics = _route_metrics(tokens, source_homes, args)
     target_tokens = _reshard_tokens(tokens, args.num_ranks, args.compare_ep)
     target_args = argparse.Namespace(**vars(args))
     target_args.num_ranks = args.compare_ep
     target_args.ranks_per_node = args.compare_ranks_per_node
-    target_args.metrics_only = False
+    target_args.metrics_only = True
     target_bundles: Counter[Tuple[int, Tuple[int, ...]]] = Counter()
     for token in target_tokens:
         target_bundles[(token.source_rank, token.topk_experts)] += token.count
@@ -294,7 +290,7 @@ def _ep_comparison_result(
         "gate": gate_name,
         "tokens": sum(token.count for token in tokens),
         "bundles": len(tokens),
-        "source": _metrics_dict(source),
+        "source": source_metrics,
         "target": target,
     }
 
@@ -303,39 +299,32 @@ def _format_ep_comparison(result: Mapping[str, Any]) -> str:
     source_ep = result["source_ep"]
     target_ep = result["target_ep"]
     lines = [
-        "MoE DeepEP EP resharding and replica-planning simulation",
+        "MoE DeepEP EP resharding metrics",
         (
             f"source_ep={source_ep} target_ep={target_ep}; single-copy expert "
-            f"homes; planner={result['planner']}; placement={result['home_placement']}; "
+            f"homes; placement={result['home_placement']}; "
             "each source-rank bundle is evenly split over its virtual target children."
         ),
     ]
     rows = []
     source_total = 0
-    target_baseline_total = 0
-    target_planned_total = 0
+    target_total = 0
     for layer in result["layers"]:
         source_remote = layer["source"]["unique_remote_rank_copies"]
-        target_baseline = layer["target"]["baseline"]
-        target_planned = layer["target"]["planned"]
-        target_baseline_remote = target_baseline["unique_remote_rank_copies"]
-        target_planned_remote = target_planned["unique_remote_rank_copies"]
+        target_metrics = layer["target"]["metrics"]
+        target_remote = target_metrics["unique_remote_rank_copies"]
         source_total += source_remote
-        target_baseline_total += target_baseline_remote
-        target_planned_total += target_planned_remote
+        target_total += target_remote
         rows.append(
             [
                 layer["gate"],
                 str(layer["tokens"]),
                 str(layer["bundles"]),
                 str(source_remote),
-                str(target_baseline_remote),
-                str(target_planned_remote),
-                _percent_change(target_baseline_remote, target_planned_remote),
-                str(len(layer["target"]["actions"])),
-                f"{layer['target']['solve_seconds']:.3f}s",
-                f"{_max_over_avg(layer['source']['communication_load']):.2f}",
-                f"{_max_over_avg(target_planned['communication_load']):.2f}",
+                str(target_remote),
+                _percent_change(source_remote, target_remote),
+                f"{target_metrics['compute_imbalance']:.2f}",
+                f"{target_metrics['communication_imbalance']:.2f}",
             ]
         )
     rows.append(
@@ -344,11 +333,8 @@ def _format_ep_comparison(result: Mapping[str, Any]) -> str:
             "-",
             "-",
             str(source_total),
-            str(target_baseline_total),
-            str(target_planned_total),
-            _percent_change(target_baseline_total, target_planned_total),
-            "-",
-            "-",
+            str(target_total),
+            _percent_change(source_total, target_total),
             "-",
             "-",
         ]
@@ -360,13 +346,10 @@ def _format_ep_comparison(result: Mapping[str, Any]) -> str:
                 "tokens",
                 "bundles",
                 f"remote@EP{source_ep}",
-                f"baseline@EP{target_ep}",
-                f"planned@EP{target_ep}",
-                "plan delta",
-                "actions",
-                "solve",
-                f"comm@EP{source_ep}",
-                f"comm@EP{target_ep}",
+                f"target@EP{target_ep}",
+                "delta",
+                "comp@target",
+                "comm@target",
             ],
             rows,
         )
@@ -376,31 +359,26 @@ def _format_ep_comparison(result: Mapping[str, Any]) -> str:
 
 def _format_result(result: Mapping[str, Any], show_actions: bool) -> str:
     lines = [
-        "MoE replica planner replay (DeepEP normal-mode rank-set dedup)",
+        "MoE offline routing metrics (DeepEP normal-mode rank-set dedup)",
         (
             f"model={result['model']}  dataset={result['dataset']}  prompts={result['num_prompts']}  "
             f"K={result['top_k']}  simulated_ep={result['num_ranks']}  "
-            f"source={result['source_rank_mode']}  planner={result['planner']}"
+            f"source={result['source_rank_mode']}"
         ),
         "remote: token-to-remote-rank copies; comp/comm: max-to-average rank load.",
     ]
     rows = []
     for layer in result["layers"]:
-        baseline = layer["baseline"]
-        planned = layer["planned"]
+        metrics = layer["metrics"]
         rows.append(
             [
                 layer["gate"],
                 str(layer["tokens"]),
                 str(layer["bundles"]),
-                str(len(layer["actions"])),
-                f"{layer['solve_seconds']:.3f}s",
-                f"{baseline['unique_remote_rank_copies']}->{planned['unique_remote_rank_copies']} "
-                f"({_percent_change(baseline['unique_remote_rank_copies'], planned['unique_remote_rank_copies'])})",
-                f"{baseline['weighted_communication']:.0f}->{planned['weighted_communication']:.0f}",
-                f"{_max_over_avg(baseline['compute_load']):.2f}->{_max_over_avg(planned['compute_load']):.2f}",
-                f"{_max_over_avg(baseline['communication_load']):.2f}->{_max_over_avg(planned['communication_load']):.2f}",
-                f"{baseline['objective']:.3f}->{planned['objective']:.3f}",
+                str(metrics["unique_remote_rank_copies"]),
+                f"{metrics['weighted_communication']:.0f}",
+                f"{metrics['compute_imbalance']:.2f}",
+                f"{metrics['communication_imbalance']:.2f}",
             ]
         )
     lines.append(
@@ -409,26 +387,14 @@ def _format_result(result: Mapping[str, Any], show_actions: bool) -> str:
                 "gate",
                 "tokens",
                 "bundles",
-                "copies",
-                "solve",
-                "remote",
+                "remote_copies",
                 "weighted",
                 "comp",
                 "comm",
-                "objective",
             ],
             rows,
         )
     )
-    if show_actions:
-        for layer in result["layers"]:
-            if not layer["actions"]:
-                continue
-            lines.append(f"\n{layer['gate']} replica actions")
-            lines.extend(
-                f"  {action['kind']}: experts={action['experts']} -> rank {action['destination_rank']}"
-                for action in layer["actions"]
-            )
     return "\n".join(lines)
 
 
@@ -566,7 +532,9 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 for name, bundles in nonempty_layers
             ],
         }
-        Path(args.bundles_output).write_text(json.dumps(trace) + "\n")
+        Path(args.bundles_output).write_text(
+            json.dumps(trace, separators=(",", ":")) + "\n"
+        )
         print(
             f"[data] saved aggregated Top-K bundles to {args.bundles_output}",
             flush=True,
@@ -574,7 +542,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     if args.compare_ep is not None:
         print(
             f"[compare] resharding EP={args.num_ranks} -> EP={args.compare_ep} "
-            f"and running planner={args.planner}",
+            "and collecting metrics",
             flush=True,
         )
         layers = [
@@ -589,29 +557,30 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             "source_ep": args.num_ranks,
             "target_ep": args.compare_ep,
             "home_placement": args.home_placement,
-            "planner": args.planner,
+            "metrics_only": True,
             "layers": layers,
         }
-    print(f"[plan] replaying {len(nonempty_layers)} router layers", flush=True)
+    print(f"[metrics] replaying {len(nonempty_layers)} router layers", flush=True)
     layers = []
     for layer_index, (name, bundles) in enumerate(nonempty_layers, start=1):
         plan_start = time.perf_counter()
         print(
-            f"[plan] layer={layer_index}/{len(nonempty_layers)} gate={name} "
+            f"[metrics] layer={layer_index}/{len(nonempty_layers)} gate={name} "
             f"bundles={len(bundles)}",
             flush=True,
         )
         layer = _layer_result(name, bundles, args, home_placements)
         layers.append(layer)
         print(
-            f"[plan] layer={layer_index}/{len(nonempty_layers)} actions={len(layer['actions'])} "
-            f"objective={layer['baseline']['objective']:.3f}->{layer['planned']['objective']:.3f} "
-            f"solve={layer['solve_seconds']:.3f}s "
+            f"[metrics] layer={layer_index}/{len(nonempty_layers)} "
+            f"remote={layer['metrics']['unique_remote_rank_copies']} "
+            f"comp={layer['metrics']['compute_imbalance']:.2f} "
+            f"comm={layer['metrics']['communication_imbalance']:.2f} "
             f"elapsed={time.perf_counter() - plan_start:.3f}s",
             flush=True,
         )
     total_solve_seconds = sum(layer["solve_seconds"] for layer in layers)
-    print(f"[plan] total solver time={total_solve_seconds:.3f}s", flush=True)
+    print(f"[metrics] total replay time={total_solve_seconds:.3f}s", flush=True)
     return {
         "model": args.model,
         "dataset": args.dataset or "text",
@@ -620,9 +589,8 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         "top_k": args.top_k,
         "num_ranks": args.num_ranks,
         "source_rank_mode": args.source_rank_mode,
-        "planner": "metrics-only" if args.metrics_only else args.planner,
-        "fast_max_candidates": args.fast_max_candidates,
-        "total_solve_seconds": total_solve_seconds,
+        "metrics_only": True,
+        "total_replay_seconds": total_solve_seconds,
         "layers": layers,
     }
 
@@ -671,13 +639,23 @@ def main() -> None:
     )
     parser.add_argument("--ranks-per-node", type=int, default=None)
     parser.add_argument("--rdma-cost", type=float, default=4.0)
-    parser.add_argument("--replica-slots-per-rank", type=int, required=True)
-    parser.add_argument("--max-actions", type=int, default=None)
+    parser.add_argument(
+        "--replica-slots-per-rank",
+        type=int,
+        default=0,
+        help="deprecated and ignored; retained for command compatibility",
+    )
+    parser.add_argument(
+        "--max-actions",
+        type=int,
+        default=None,
+        help="deprecated and ignored; this script never runs a planner",
+    )
     parser.add_argument(
         "--compare-ep",
         type=int,
         default=None,
-        help="reshard trace and run planner at this EP, compared with --num-ranks baseline",
+        help="reshard trace and compare metrics at this EP",
     )
     parser.add_argument(
         "--compare-ranks-per-node",
@@ -688,23 +666,35 @@ def main() -> None:
     parser.add_argument(
         "--metrics-only",
         action="store_true",
-        help="replay baseline placement only; skip replica planning",
+        help="deprecated no-op; this script is always metrics-only",
     )
     parser.add_argument(
         "--planner",
         choices=["exact", "fast"],
         default="exact",
-        help="exact offline oracle or one-action bounded fast approximation",
+        help="deprecated and ignored",
     )
     parser.add_argument(
         "--fast-max-candidates",
         type=int,
         default=32,
-        help="maximum closure/singleton candidates scored by --planner fast",
+        help="deprecated and ignored",
     )
-    parser.add_argument("--max-bundle-size", type=int, default=None)
-    parser.add_argument("--compute-weight", type=float, default=1.0)
-    parser.add_argument("--communication-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--max-bundle-size",
+        type=int,
+        default=None,
+        help="deprecated and ignored",
+    )
+    parser.add_argument(
+        "--compute-weight", type=float, default=1.0, help="deprecated and ignored"
+    )
+    parser.add_argument(
+        "--communication-weight",
+        type=float,
+        default=1.0,
+        help="deprecated and ignored",
+    )
     parser.add_argument(
         "--home-placement", choices=["round-robin", "contiguous"], default="round-robin"
     )
@@ -718,7 +708,9 @@ def main() -> None:
         choices=["token-round-robin", "prompt-round-robin"],
         default="prompt-round-robin",
     )
-    parser.add_argument("--show-actions", action="store_true")
+    parser.add_argument(
+        "--show-actions", action="store_true", help="deprecated and ignored"
+    )
     parser.add_argument("--json", action="store_true")
     parser.add_argument(
         "--output", default=None, help="write complete JSON results to this path"
@@ -741,8 +733,6 @@ def main() -> None:
             )
         if args.compare_ranks_per_node is None:
             args.compare_ranks_per_node = args.ranks_per_node
-        if args.metrics_only:
-            parser.error("--compare-ep runs a planner and cannot use --metrics-only")
     if args.log_interval < 1:
         parser.error("--log-interval must be positive")
     if args.fast_max_candidates < 1:
