@@ -11,6 +11,7 @@ from sglang.srt.eplb.bundle_aware_replica_planner import (  # noqa: E402
 from sglang.srt.eplb.co_routing_graph_solver import (  # noqa: E402
     CoRoutingGraphSolver,
     build_co_routing_graph,
+    refine_hypergraph_placement,
 )
 from sglang.srt.eplb.cuda_fast_co_routing_planner import (  # noqa: E402
     build_co_routing_graph_cuda,
@@ -118,3 +119,45 @@ def test_cuda_hypergraph_refinement_uses_exact_bundle_objective():
     assert placement.initial_remote == 20
     assert placement.final_remote == 0
     assert placement.iterations == 1
+
+
+def test_cuda_incremental_hypergraph_matches_cpu_across_rounds():
+    tokens = [
+        RoutedToken(1, (0, 1, 3), 3),
+        RoutedToken(2, (0, 2, 5), 17),
+        RoutedToken(0, (0, 3, 5), 14),
+        RoutedToken(2, (0, 1, 5), 19),
+        RoutedToken(2, (1, 2, 3), 5),
+        RoutedToken(2, (0, 2, 4), 18),
+        RoutedToken(0, (0, 4, 5), 7),
+        RoutedToken(1, (3, 4, 5), 11),
+    ]
+    source = torch.tensor(
+        [token.source_rank for token in tokens], device="cuda", dtype=torch.int64
+    )
+    topk = torch.tensor(
+        [token.topk_experts for token in tokens], device="cuda", dtype=torch.int64
+    )
+    count = torch.tensor(
+        [token.count for token in tokens], device="cuda", dtype=torch.int64
+    )
+    initial = {0: 0, 1: 0, 2: 1, 3: 1, 4: 2, 5: 2}
+
+    expected = refine_hypergraph_placement(
+        tokens,
+        initial,
+        num_ranks=3,
+        max_rounds=None,
+    )
+    actual = refine_hypergraph_placement_cuda(
+        source,
+        topk,
+        count,
+        initial,
+        num_ranks=3,
+        max_rounds=None,
+    )
+
+    assert actual.rank_by_expert == expected.rank_by_expert
+    assert actual.final_remote == expected.final_remote
+    assert actual.iterations == expected.iterations

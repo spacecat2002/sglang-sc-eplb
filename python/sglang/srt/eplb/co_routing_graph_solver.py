@@ -67,6 +67,91 @@ class HypergraphPlacement:
     iterations: int
 
 
+def build_hypergraph_initial_placement(
+    routed_tokens: Iterable[RoutedToken],
+    *,
+    experts: Iterable[int],
+    demand: Mapping[int, int],
+    num_ranks: int,
+    slots_per_rank: int | Sequence[int],
+) -> GraphPlacement:
+    """Greedily place experts by exact incremental hyperedge communication.
+
+    Experts with the largest demand are assigned first. For every feasible
+    destination rank, the score is the number of new non-source destination
+    ranks introduced in bundles containing that expert. Demand load and rank
+    occupancy are deterministic tie breakers.
+    """
+
+    if num_ranks < 1:
+        raise ValueError("num_ranks must be positive")
+    if isinstance(slots_per_rank, int):
+        capacities = [slots_per_rank] * num_ranks
+    else:
+        capacities = list(slots_per_rank)
+    if len(capacities) != num_ranks or any(capacity < 0 for capacity in capacities):
+        raise ValueError("slots_per_rank must contain non-negative capacities")
+
+    tokens = list(routed_tokens)
+    ordered_experts = tuple(sorted(set(experts)))
+    if len(ordered_experts) > sum(capacities):
+        raise ValueError("expert count exceeds total rank capacity")
+    missing_demand = set(ordered_experts) - demand.keys()
+    if missing_demand:
+        raise ValueError(f"demand is missing experts: {sorted(missing_demand)}")
+
+    incidence: Dict[int, list[int]] = {expert: [] for expert in ordered_experts}
+    for bundle_index, token in enumerate(tokens):
+        for expert in token.topk_experts:
+            if expert not in incidence:
+                raise ValueError(f"bundle contains unknown expert {expert}")
+            incidence[expert].append(bundle_index)
+
+    assignment: list[Set[int]] = [set() for _ in range(num_ranks)]
+    rank_load = [0] * num_ranks
+    bundle_ranks: list[Set[int]] = [set() for _ in tokens]
+    rank_by_expert: Dict[int, int] = {}
+    order = sorted(
+        ordered_experts,
+        key=lambda expert: (-demand[expert], -len(incidence[expert]), expert),
+    )
+    for expert in order:
+        candidates = [
+            rank
+            for rank in range(num_ranks)
+            if len(assignment[rank]) < capacities[rank]
+        ]
+        if not candidates:
+            raise ValueError("expert count exceeds total rank capacity")
+
+        def score(rank: int) -> Tuple[int, int, int, int]:
+            added_remote = sum(
+                tokens[bundle_index].count
+                for bundle_index in incidence[expert]
+                if rank != tokens[bundle_index].source_rank
+                and rank not in bundle_ranks[bundle_index]
+            )
+            return (
+                added_remote,
+                rank_load[rank] + demand[expert],
+                len(assignment[rank]),
+                rank,
+            )
+
+        selected_rank = min(candidates, key=score)
+        assignment[selected_rank].add(expert)
+        rank_by_expert[expert] = selected_rank
+        rank_load[selected_rank] += demand[expert]
+        for bundle_index in incidence[expert]:
+            bundle_ranks[bundle_index].add(selected_rank)
+
+    experts_by_rank = {
+        rank: tuple(sorted(assigned_experts))
+        for rank, assigned_experts in enumerate(assignment)
+    }
+    return GraphPlacement(rank_by_expert, experts_by_rank, 0.0, 0.0, 0)
+
+
 def build_co_routing_graph(
     routed_tokens: Iterable[RoutedToken],
     *,
@@ -108,6 +193,7 @@ def refine_hypergraph_placement(
     *,
     num_ranks: int,
     max_rounds: Optional[int] = 8,
+    candidate_ranks_per_expert: int = 0,
 ) -> HypergraphPlacement:
     """Refine a placement using the exact distinct-remote-rank objective.
 
@@ -120,6 +206,8 @@ def refine_hypergraph_placement(
         raise ValueError("num_ranks must be positive")
     if max_rounds is not None and max_rounds < 0:
         raise ValueError("max_rounds must be non-negative")
+    if candidate_ranks_per_expert < 0:
+        raise ValueError("candidate_ranks_per_expert must be non-negative")
     tokens = list(routed_tokens)
     rank_by_expert = dict(initial_rank_by_expert)
     if any(rank < 0 or rank >= num_ranks for rank in rank_by_expert.values()):
@@ -129,55 +217,70 @@ def refine_hypergraph_placement(
     if missing:
         raise ValueError(f"initial placement is missing experts: {sorted(missing)}")
 
+    incidence: Dict[int, Set[int]] = {expert: set() for expert in rank_by_expert}
+    for bundle_index, token in enumerate(tokens):
+        for expert in token.topk_experts:
+            incidence[expert].add(bundle_index)
+
+    move_gains: Dict[int, list[int]] = {
+        expert: [0] * num_ranks for expert in rank_by_expert
+    }
+    pair_correction: Dict[Edge, int] = defaultdict(int)
+
+    def accumulate_bundle(bundle_index: int, sign: int) -> None:
+        token = tokens[bundle_index]
+        counts: Dict[int, int] = defaultdict(int)
+        for expert in token.topk_experts:
+            counts[rank_by_expert[expert]] += 1
+        for expert in token.topk_experts:
+            old_rank = rank_by_expert[expert]
+            removed = old_rank != token.source_rank and counts[old_rank] == 1
+            for target_rank in range(num_ranks):
+                if target_rank == old_rank:
+                    continue
+                added = (
+                    target_rank != token.source_rank and counts.get(target_rank, 0) == 0
+                )
+                move_gains[expert][target_rank] += (
+                    sign * token.count * (int(added) - int(removed))
+                )
+        for left, right in combinations(sorted(token.topk_experts), 2):
+            left_rank = rank_by_expert[left]
+            right_rank = rank_by_expert[right]
+            if left_rank == right_rank:
+                continue
+            independent_delta = 0
+            if right_rank != token.source_rank and counts.get(right_rank, 0) == 0:
+                independent_delta += 1
+            if left_rank != token.source_rank and counts[left_rank] == 1:
+                independent_delta -= 1
+            if left_rank != token.source_rank and counts.get(left_rank, 0) == 0:
+                independent_delta += 1
+            if right_rank != token.source_rank and counts[right_rank] == 1:
+                independent_delta -= 1
+            pair_correction[(left, right)] -= sign * token.count * independent_delta
+
+    for bundle_index in range(len(tokens)):
+        accumulate_bundle(bundle_index, 1)
+
     initial_remote = evaluate_primary_remote(tokens, rank_by_expert)
     rounds = 0
     while max_rounds is None or rounds < max_rounds:
-        # Factor the exact swap delta into single-expert move gains plus a
-        # correction for bundles containing both swapped experts. This keeps
-        # the CPU fallback at O(B*K*R + B*K^2 + E^2) per round instead of
-        # rescanning affected bundles for every expert pair.
-        rank_counts = []
-        for token in tokens:
-            counts: Dict[int, int] = defaultdict(int)
-            for expert in token.topk_experts:
-                counts[rank_by_expert[expert]] += 1
-            rank_counts.append(counts)
-
-        move_gains: Dict[int, list[int]] = {
-            expert: [0] * num_ranks for expert in rank_by_expert
-        }
-        pair_correction: Dict[Edge, int] = defaultdict(int)
-        for bundle_index, token in enumerate(tokens):
-            counts = rank_counts[bundle_index]
-            experts_in_bundle = token.topk_experts
-            for expert in experts_in_bundle:
-                old_rank = rank_by_expert[expert]
-                for target_rank in range(num_ranks):
-                    if target_rank == old_rank:
-                        continue
-                    removed = old_rank != token.source_rank and counts[old_rank] == 1
-                    added = (
-                        target_rank != token.source_rank
-                        and counts.get(target_rank, 0) == 0
-                    )
-                    move_gains[expert][target_rank] += token.count * (
-                        int(added) - int(removed)
-                    )
-            for left, right in combinations(sorted(experts_in_bundle), 2):
-                left_rank = rank_by_expert[left]
-                right_rank = rank_by_expert[right]
-                if left_rank == right_rank:
-                    continue
-                independent_delta = 0
-                if right_rank != token.source_rank and counts.get(right_rank, 0) == 0:
-                    independent_delta += 1
-                if left_rank != token.source_rank and counts[left_rank] == 1:
-                    independent_delta -= 1
-                if left_rank != token.source_rank and counts.get(left_rank, 0) == 0:
-                    independent_delta += 1
-                if right_rank != token.source_rank and counts[right_rank] == 1:
-                    independent_delta -= 1
-                pair_correction[(left, right)] -= token.count * independent_delta
+        candidate_targets = None
+        if 0 < candidate_ranks_per_expert < num_ranks - 1:
+            candidate_targets = {
+                expert: set(
+                    sorted(
+                        (
+                            rank
+                            for rank in range(num_ranks)
+                            if rank != rank_by_expert[expert]
+                        ),
+                        key=lambda rank: (move_gains[expert][rank], rank),
+                    )[:candidate_ranks_per_expert]
+                )
+                for expert in rank_by_expert
+            }
 
         best: Optional[Tuple[int, int, int]] = None
         experts = sorted(rank_by_expert)
@@ -186,6 +289,12 @@ def refine_hypergraph_placement(
             for right in experts[left_index + 1 :]:
                 right_rank = rank_by_expert[right]
                 if left_rank == right_rank:
+                    continue
+                if (
+                    candidate_targets is not None
+                    and right_rank not in candidate_targets[left]
+                    and left_rank not in candidate_targets[right]
+                ):
                     continue
                 delta = (
                     move_gains[left][right_rank]
@@ -198,10 +307,15 @@ def refine_hypergraph_placement(
         if best is None:
             break
         _, left, right = best
+        affected = incidence[left] | incidence[right]
+        for bundle_index in affected:
+            accumulate_bundle(bundle_index, -1)
         rank_by_expert[left], rank_by_expert[right] = (
             rank_by_expert[right],
             rank_by_expert[left],
         )
+        for bundle_index in affected:
+            accumulate_bundle(bundle_index, 1)
         rounds += 1
 
     final_remote = evaluate_primary_remote(tokens, rank_by_expert)

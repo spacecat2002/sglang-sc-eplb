@@ -72,18 +72,25 @@ def _hypergraph_move_delta_kernel(
     source_ptr,
     count_ptr,
     rank_by_expert_ptr,
+    bundle_indices_ptr,
     move_delta_ptr,
     num_values,
     num_experts,
     num_ranks,
     TOPK: tl.constexpr,
+    USE_BUNDLE_INDICES: tl.constexpr,
+    SIGN: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < num_values
     target_rank = offsets % num_ranks
     incidence = offsets // num_ranks
-    bundle = incidence // TOPK
+    bundle_position = incidence // TOPK
+    if USE_BUNDLE_INDICES:
+        bundle = tl.load(bundle_indices_ptr + bundle_position, mask=mask, other=0)
+    else:
+        bundle = bundle_position
     slot = incidence % TOPK
     expert = tl.load(topk_ptr + bundle * TOPK + slot, mask=mask, other=0)
     expert_rank = tl.load(rank_by_expert_ptr + expert, mask=mask, other=-1)
@@ -105,7 +112,7 @@ def _hypergraph_move_delta_kernel(
     removed = (expert_rank != source) & (old_rank_count == 1)
     added = (target_rank != source) & (target_rank_count == 0)
     weight = tl.load(count_ptr + bundle, mask=mask, other=0).to(tl.int64)
-    delta = (added.to(tl.int64) - removed.to(tl.int64)) * weight
+    delta = SIGN * (added.to(tl.int64) - removed.to(tl.int64)) * weight
     tl.atomic_add(
         move_delta_ptr + expert * num_ranks + target_rank,
         delta,
@@ -121,16 +128,23 @@ def _hypergraph_pair_correction_kernel(
     rank_by_expert_ptr,
     pair_left_ptr,
     pair_right_ptr,
+    bundle_indices_ptr,
     correction_ptr,
     num_pair_values,
     num_experts,
     TOPK: tl.constexpr,
     NUM_PAIRS: tl.constexpr,
+    USE_BUNDLE_INDICES: tl.constexpr,
+    SIGN: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < num_pair_values
-    bundle = offsets // NUM_PAIRS
+    bundle_position = offsets // NUM_PAIRS
+    if USE_BUNDLE_INDICES:
+        bundle = tl.load(bundle_indices_ptr + bundle_position, mask=mask, other=0)
+    else:
+        bundle = bundle_position
     pair = offsets % NUM_PAIRS
     left_slot = tl.load(pair_left_ptr + pair, mask=mask, other=0)
     right_slot = tl.load(pair_right_ptr + pair, mask=mask, other=0)
@@ -169,7 +183,7 @@ def _hypergraph_pair_correction_kernel(
     high = tl.maximum(left, right)
     tl.atomic_add(
         correction_ptr + low * num_experts + high,
-        -independent_delta * weight,
+        -SIGN * independent_delta * weight,
         mask=mask & (left_rank != right_rank),
     )
 
@@ -541,6 +555,7 @@ def refine_hypergraph_placement_cuda(
     *,
     num_ranks: int,
     max_rounds: Optional[int] = 8,
+    candidate_ranks_per_expert: int = 0,
 ) -> CudaHypergraphPlacement:
     """Refine placement against exact Top-K distinct-remote-rank traffic."""
 
@@ -562,6 +577,8 @@ def refine_hypergraph_placement_cuda(
         raise ValueError("source, topk, and count must use int64")
     if max_rounds is not None and max_rounds < 0:
         raise ValueError("max_rounds must be non-negative")
+    if candidate_ranks_per_expert < 0:
+        raise ValueError("candidate_ranks_per_expert must be non-negative")
     if num_ranks < 1:
         raise ValueError("num_ranks must be positive")
     if not initial_rank_by_expert:
@@ -592,16 +609,15 @@ def refine_hypergraph_placement_cuda(
     solve_start = time.perf_counter()
     rounds = 0
     block = 256
-    num_move_values = topk_experts.numel() * num_ranks
+    topk = topk_experts.shape[1]
     pair_slots = torch.triu_indices(
-        topk_experts.shape[1],
-        topk_experts.shape[1],
+        topk,
+        topk,
         offset=1,
         device=topk_experts.device,
         dtype=torch.int32,
     )
     num_pairs = pair_slots.shape[1]
-    num_pair_values = topk_experts.shape[0] * num_pairs
     expert_index = torch.arange(num_experts, device=topk_experts.device)
     observed = rank_by_expert >= 0
     valid_pair = (
@@ -609,32 +625,60 @@ def refine_hypergraph_placement_cuda(
         & observed[None, :]
         & (expert_index[:, None] < expert_index[None, :])
     )
-    move_deltas = torch.empty(
+    flattened_experts = topk_experts.reshape(-1)
+    flattened_bundles = torch.arange(
+        topk_experts.shape[0],
+        dtype=torch.int64,
+        device=topk_experts.device,
+    ).repeat_interleave(topk)
+    incidence_order = torch.argsort(flattened_experts)
+    incidence_bundles = flattened_bundles[incidence_order]
+    incidence_counts = torch.bincount(flattened_experts, minlength=num_experts)
+    incidence_offsets = torch.zeros(
+        num_experts + 1,
+        dtype=torch.int64,
+        device=topk_experts.device,
+    )
+    incidence_offsets[1:] = incidence_counts.cumsum(dim=0)
+    incidence_offsets_cpu = incidence_offsets.cpu().tolist()
+
+    move_deltas = torch.zeros(
         (num_experts, num_ranks),
         dtype=torch.int64,
         device=topk_experts.device,
     )
-    corrections = torch.empty(
+    corrections = torch.zeros(
         (num_experts, num_experts),
         dtype=torch.int64,
         device=topk_experts.device,
     )
-    while max_rounds is None or rounds < max_rounds:
-        move_deltas.zero_()
-        corrections.zero_()
+
+    def update_bundle_deltas(bundle_indices, sign: int) -> None:
+        use_bundle_indices = bundle_indices is not None
+        num_bundles = (
+            topk_experts.shape[0] if bundle_indices is None else bundle_indices.numel()
+        )
+        if not num_bundles:
+            return
+        bundle_indices_ptr = topk_experts if bundle_indices is None else bundle_indices
+        num_move_values = num_bundles * topk * num_ranks
         _hypergraph_move_delta_kernel[(triton.cdiv(num_move_values, block),)](
             topk_experts,
             source_rank,
             count,
             rank_by_expert,
+            bundle_indices_ptr,
             move_deltas,
             num_move_values,
             num_experts,
             num_ranks,
-            TOPK=topk_experts.shape[1],
+            TOPK=topk,
+            USE_BUNDLE_INDICES=use_bundle_indices,
+            SIGN=sign,
             BLOCK=block,
         )
         if num_pairs:
+            num_pair_values = num_bundles * num_pairs
             _hypergraph_pair_correction_kernel[(triton.cdiv(num_pair_values, block),)](
                 topk_experts,
                 source_rank,
@@ -642,19 +686,48 @@ def refine_hypergraph_placement_cuda(
                 rank_by_expert,
                 pair_slots[0],
                 pair_slots[1],
+                bundle_indices_ptr,
                 corrections,
                 num_pair_values,
                 num_experts,
-                TOPK=topk_experts.shape[1],
+                TOPK=topk,
                 NUM_PAIRS=num_pairs,
+                USE_BUNDLE_INDICES=use_bundle_indices,
+                SIGN=sign,
                 BLOCK=block,
             )
-        candidate_ranks = rank_by_expert.clamp_min(0)
-        move_to_candidate = move_deltas[:, candidate_ranks]
+
+    update_bundle_deltas(None, 1)
+    while max_rounds is None or rounds < max_rounds:
+        expert_ranks = rank_by_expert.clamp_min(0)
+        move_to_candidate = move_deltas[:, expert_ranks]
         deltas = move_to_candidate + move_to_candidate.T + corrections
         cross_rank = rank_by_expert[:, None] != rank_by_expert[None, :]
+        candidate_mask = valid_pair & cross_rank
+        if 0 < candidate_ranks_per_expert < num_ranks - 1:
+            own_rank = expert_ranks[:, None]
+            rank_ids = torch.arange(num_ranks, device=topk_experts.device)[None, :]
+            pruned_move_deltas = move_deltas.masked_fill(
+                rank_ids == own_rank,
+                torch.iinfo(torch.int64).max,
+            )
+            target_ranks = torch.topk(
+                pruned_move_deltas,
+                candidate_ranks_per_expert,
+                dim=1,
+                largest=False,
+                sorted=False,
+            ).indices
+            target_allowed = torch.zeros(
+                (num_experts, num_ranks),
+                dtype=torch.bool,
+                device=topk_experts.device,
+            )
+            target_allowed.scatter_(1, target_ranks, True)
+            candidate_allowed = target_allowed[:, expert_ranks]
+            candidate_mask &= candidate_allowed | candidate_allowed.T
         candidates = torch.where(
-            valid_pair & cross_rank,
+            candidate_mask,
             deltas,
             torch.iinfo(torch.int64).max,
         )
@@ -669,9 +742,24 @@ def refine_hypergraph_placement_cuda(
             break
         left = flat_index // num_experts
         right = flat_index % num_experts
+        affected_bundles = torch.unique(
+            torch.cat(
+                (
+                    incidence_bundles[
+                        incidence_offsets_cpu[left] : incidence_offsets_cpu[left + 1]
+                    ],
+                    incidence_bundles[
+                        incidence_offsets_cpu[right] : incidence_offsets_cpu[right + 1]
+                    ],
+                )
+            ),
+            sorted=False,
+        )
+        update_bundle_deltas(affected_bundles, -1)
         left_rank = rank_by_expert[left].clone()
         rank_by_expert[left] = rank_by_expert[right]
         rank_by_expert[right] = left_rank
+        update_bundle_deltas(affected_bundles, 1)
         rounds += 1
 
     final_remote = _evaluate_primary_remote_cuda(
