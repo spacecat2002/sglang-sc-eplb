@@ -115,6 +115,7 @@ def _reshard_tokens(
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
+    run_start = time.perf_counter()
     raw = json.loads(Path(args.input).read_text())
     layers = _records(raw)
     trace_ep = args.source_ep
@@ -126,8 +127,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("source EP must be positive")
     output_layers = []
     for name, tokens in layers:
+        layer_start = time.perf_counter()
+        prepare_start = time.perf_counter()
         tokens = _reshard_tokens(tokens, trace_ep, args.num_ranks)
         graph = build_co_routing_graph(tokens)
+        prepare_seconds = time.perf_counter() - prepare_start
         capacity = args.slots_per_rank
         if capacity is None:
             capacity = (len(graph.experts) + args.num_ranks - 1) // args.num_ranks
@@ -146,6 +150,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         planned_remote = graph_remote
         action_count = 0
         replica_solve_seconds = 0.0
+        replica_replay_seconds = 0.0
         if args.replica_slots_per_rank:
             replica_planner = BundleAwareReplicaPlanner(
                 num_ranks=args.num_ranks,
@@ -167,9 +172,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     tokens, max_actions=args.max_actions
                 )
             replica_solve_seconds = time.perf_counter() - start
+            replay_start = time.perf_counter()
             replayed = replica_planner.evaluate_placement(
                 tokens, replica_plan.replicas_by_rank
             )
+            replica_replay_seconds = time.perf_counter() - replay_start
             planned_remote = replayed.unique_remote_rank_copies
             action_count = len(replica_plan.actions)
         output_layers.append(
@@ -191,9 +198,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "initial_cut": placement.initial_cut,
                 "final_cut": placement.final_cut,
                 "iterations": placement.iterations,
+                "prepare_seconds": prepare_seconds,
+                "layer_seconds": time.perf_counter() - layer_start,
                 "graph_solve_seconds": graph_solve_seconds,
                 "replica_actions": action_count,
                 "replica_solve_seconds": replica_solve_seconds,
+                "replica_replay_seconds": replica_replay_seconds,
                 "experts_by_rank": {
                     str(rank): list(experts)
                     for rank, experts in placement.experts_by_rank.items()
@@ -204,6 +214,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "source_ep": trace_ep,
         "num_ranks": args.num_ranks,
         "baseline": args.baseline,
+        "total_wall_seconds": time.perf_counter() - run_start,
         "layers": output_layers,
     }
 
@@ -272,9 +283,12 @@ def main() -> None:
             "planned_delta",
             "cut",
             "rounds",
+            "prepare",
+            "layer_total",
             "actions",
             "graph_solve",
             "replica_solve",
+            "replica_replay",
         ]
     ]
     for layer in result["layers"]:
@@ -291,9 +305,12 @@ def main() -> None:
                 f"{layer['planned_delta']:+.1%}",
                 f"{layer['initial_cut']}->{layer['final_cut']}",
                 str(layer["iterations"]),
+                f"{layer['prepare_seconds']:.3f}s",
+                f"{layer['layer_seconds']:.3f}s",
                 str(layer["replica_actions"]),
                 f"{layer['graph_solve_seconds']:.3f}s",
                 f"{layer['replica_solve_seconds']:.3f}s",
+                f"{layer['replica_replay_seconds']:.3f}s",
             ]
         )
     print("Co-routing graph placement replay")
@@ -302,7 +319,11 @@ def main() -> None:
         "total graph_solve="
         f"{sum(layer['graph_solve_seconds'] for layer in result['layers']):.3f}s "
         "replica_solve="
-        f"{sum(layer['replica_solve_seconds'] for layer in result['layers']):.3f}s",
+        f"{sum(layer['replica_solve_seconds'] for layer in result['layers']):.3f}s "
+        "replica_replay="
+        f"{sum(layer['replica_replay_seconds'] for layer in result['layers']):.3f}s "
+        "wall="
+        f"{result['total_wall_seconds']:.3f}s",
     )
     if args.show_placement:
         for layer in result["layers"]:
