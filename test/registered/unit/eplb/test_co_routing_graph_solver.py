@@ -2,7 +2,6 @@ from sglang.srt.eplb.bundle_aware_replica_planner import RoutedToken
 from sglang.srt.eplb.co_routing_graph_solver import (
     CoRoutingGraphSolver,
     build_co_routing_graph,
-    build_hypergraph_initial_placement,
     evaluate_primary_remote,
     refine_hypergraph_placement,
 )
@@ -60,24 +59,6 @@ def test_primary_remote_replays_distinct_destination_ranks():
     assert evaluate_primary_remote(tokens, {0: 0, 1: 1, 2: 2}) == 2 * 4
 
 
-def test_hypergraph_initial_placement_uses_bundle_sources_and_rank_closure():
-    tokens = [
-        RoutedToken(0, (0, 1), count=10),
-        RoutedToken(1, (2, 3), count=10),
-    ]
-
-    placement = build_hypergraph_initial_placement(
-        tokens,
-        experts=range(4),
-        demand={expert: 10 for expert in range(4)},
-        num_ranks=2,
-        slots_per_rank=2,
-    )
-
-    assert placement.experts_by_rank == {0: (0, 1), 1: (2, 3)}
-    assert evaluate_primary_remote(tokens, placement.rank_by_expert) == 0
-
-
 def test_hypergraph_refinement_optimizes_exact_bundle_remote():
     tokens = [
         RoutedToken(0, (0, 1), count=10),
@@ -130,21 +111,3 @@ def test_hypergraph_refinement_can_improve_converged_pairwise_graph():
 
     assert graph_remote == 164
     assert hypergraph_placement.final_remote == 145
-
-
-def test_hypergraph_candidate_pruning_still_verifies_exact_improvements():
-    tokens = [
-        RoutedToken(0, (0, 1), count=10),
-        RoutedToken(1, (2, 3), count=10),
-    ]
-
-    placement = refine_hypergraph_placement(
-        tokens,
-        {0: 0, 1: 1, 2: 0, 3: 1},
-        num_ranks=2,
-        max_rounds=None,
-        candidate_ranks_per_expert=1,
-    )
-
-    assert placement.initial_remote == 20
-    assert placement.final_remote == 0

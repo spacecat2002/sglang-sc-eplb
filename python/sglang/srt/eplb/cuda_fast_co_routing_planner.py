@@ -555,7 +555,6 @@ def refine_hypergraph_placement_cuda(
     *,
     num_ranks: int,
     max_rounds: Optional[int] = 8,
-    candidate_ranks_per_expert: int = 0,
 ) -> CudaHypergraphPlacement:
     """Refine placement against exact Top-K distinct-remote-rank traffic."""
 
@@ -577,8 +576,6 @@ def refine_hypergraph_placement_cuda(
         raise ValueError("source, topk, and count must use int64")
     if max_rounds is not None and max_rounds < 0:
         raise ValueError("max_rounds must be non-negative")
-    if candidate_ranks_per_expert < 0:
-        raise ValueError("candidate_ranks_per_expert must be non-negative")
     if num_ranks < 1:
         raise ValueError("num_ranks must be positive")
     if not initial_rank_by_expert:
@@ -704,28 +701,6 @@ def refine_hypergraph_placement_cuda(
         deltas = move_to_candidate + move_to_candidate.T + corrections
         cross_rank = rank_by_expert[:, None] != rank_by_expert[None, :]
         candidate_mask = valid_pair & cross_rank
-        if 0 < candidate_ranks_per_expert < num_ranks - 1:
-            own_rank = expert_ranks[:, None]
-            rank_ids = torch.arange(num_ranks, device=topk_experts.device)[None, :]
-            pruned_move_deltas = move_deltas.masked_fill(
-                rank_ids == own_rank,
-                torch.iinfo(torch.int64).max,
-            )
-            target_ranks = torch.topk(
-                pruned_move_deltas,
-                candidate_ranks_per_expert,
-                dim=1,
-                largest=False,
-                sorted=False,
-            ).indices
-            target_allowed = torch.zeros(
-                (num_experts, num_ranks),
-                dtype=torch.bool,
-                device=topk_experts.device,
-            )
-            target_allowed.scatter_(1, target_ranks, True)
-            candidate_allowed = target_allowed[:, expert_ranks]
-            candidate_mask &= candidate_allowed | candidate_allowed.T
         candidates = torch.where(
             candidate_mask,
             deltas,

@@ -38,7 +38,6 @@ from sglang.srt.eplb.co_routing_graph_solver import (
     CoRoutingGraphSolver,
     GraphPlacement,
     build_co_routing_graph,
-    build_hypergraph_initial_placement,
     evaluate_primary_remote,
     refine_hypergraph_placement,
 )
@@ -833,7 +832,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             capacity = (len(graph_experts) + args.num_ranks - 1) // args.num_ranks
 
         graph_solve_seconds = 0.0
-        hypergraph_seed_seconds = 0.0
         if pairwise_enabled:
             solver = CoRoutingGraphSolver(
                 num_ranks=args.num_ranks,
@@ -858,31 +856,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             final_cut = placement.final_cut
             graph_iterations = placement.iterations
         else:
-            seed_start = time.perf_counter()
-            if args.hypergraph_initial_placement == "aware":
-                if tokens is None:
-                    tokens = _materialize_layer_tokens(
-                        name,
-                        entries,
-                        compact_input=compact_input,
-                        source_ep=trace_ep,
-                        target_ep=args.num_ranks,
-                    )
-                placement = build_hypergraph_initial_placement(
-                    tokens,
-                    experts=graph_experts,
-                    demand=graph_demand,
-                    num_ranks=args.num_ranks,
-                    slots_per_rank=capacity,
-                )
-            else:
-                placement = _balanced_initial_placement(
-                    graph_experts,
-                    graph_demand,
-                    num_ranks=args.num_ranks,
-                    slots_per_rank=capacity,
-                )
-            hypergraph_seed_seconds = time.perf_counter() - seed_start
+            placement = _balanced_initial_placement(
+                graph_experts,
+                graph_demand,
+                num_ranks=args.num_ranks,
+                slots_per_rank=capacity,
+            )
             initial_cut = None
             final_cut = None
             graph_iterations = 0
@@ -940,7 +919,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         initial_rank_map,
                         num_ranks=args.num_ranks,
                         max_rounds=hypergraph_limit,
-                        candidate_ranks_per_expert=args.hypergraph_candidate_ranks,
                     )
                     hypergraph_solve_seconds += candidate_placement.solve_seconds
                 else:
@@ -950,7 +928,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         initial_rank_map,
                         num_ranks=args.num_ranks,
                         max_rounds=hypergraph_limit,
-                        candidate_ranks_per_expert=args.hypergraph_candidate_ranks,
                     )
                     hypergraph_solve_seconds += time.perf_counter() - hypergraph_start
                 if restart == 0 and candidate_placement.initial_remote != seed_remote:
@@ -1104,7 +1081,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "primary_replay_seconds": primary_replay_seconds,
                 "layer_seconds": time.perf_counter() - layer_start,
                 "graph_solve_seconds": graph_solve_seconds,
-                "hypergraph_seed_seconds": hypergraph_seed_seconds,
                 "hypergraph_iterations": hypergraph_iterations,
                 "hypergraph_restarts": (
                     args.hypergraph_restarts if hypergraph_enabled else 0
@@ -1132,8 +1108,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "hypergraph_round_limit": (
             None if args.hypergraph_until_convergence else args.hypergraph_rounds
         ),
-        "hypergraph_initial_placement": args.hypergraph_initial_placement,
-        "hypergraph_candidate_ranks": args.hypergraph_candidate_ranks,
         "input_format": "compact" if compact_input else "json",
         "input_load_seconds": input_load_seconds,
         "total_wall_seconds": time.perf_counter() - run_start,
@@ -1206,24 +1180,6 @@ def main() -> None:
         type=int,
         default=1,
         help="number of exact-objective starts; best result is retained (default: 1)",
-    )
-    parser.add_argument(
-        "--hypergraph-initial-placement",
-        choices=["aware", "balanced"],
-        default="aware",
-        help=(
-            "initial placement for hypergraph-only mode: exact incremental "
-            "bundle communication or demand balancing (default: aware)"
-        ),
-    )
-    parser.add_argument(
-        "--hypergraph-candidate-ranks",
-        type=int,
-        default=0,
-        help=(
-            "shortlist this many target ranks per expert before exact swap "
-            "verification; 0 searches all ranks (default: 0)"
-        ),
     )
     parser.add_argument(
         "--hypergraph-kick-swaps",
@@ -1306,8 +1262,6 @@ def main() -> None:
         parser.error("--hypergraph-restarts must be positive")
     if args.hypergraph_kick_swaps < 0:
         parser.error("--hypergraph-kick-swaps must be non-negative")
-    if args.hypergraph_candidate_ranks < 0:
-        parser.error("--hypergraph-candidate-ranks must be non-negative")
     result = run(args)
     if args.json:
         print(json.dumps(result, indent=2))
@@ -1335,7 +1289,6 @@ def main() -> None:
             "layer_total",
             "actions",
             "graph_solve",
-            "hyper_seed",
             "hyper_solve",
             "replica_input",
             "replica_solve",
@@ -1378,7 +1331,6 @@ def main() -> None:
                 f"{layer['layer_seconds']:.3f}s",
                 str(layer["replica_actions"]),
                 f"{layer['graph_solve_seconds']:.3f}s",
-                f"{layer['hypergraph_seed_seconds']:.3f}s",
                 _optional_seconds(layer["hypergraph_solve_seconds"]),
                 f"{layer['replica_materialize_seconds']:.3f}s",
                 f"{layer['replica_solve_seconds']:.3f}s",
@@ -1405,21 +1357,9 @@ def main() -> None:
             else f"max-{hypergraph_limit}"
         )
     )
-    hypergraph_seed_mode = (
-        "disabled"
-        if result["placement_mode"] == "pairwise"
-        else result["hypergraph_initial_placement"]
-    )
-    hypergraph_candidates = (
-        "disabled"
-        if result["placement_mode"] == "pairwise"
-        else str(result["hypergraph_candidate_ranks"])
-    )
     print(
         f"device={result['device']} planner={result['planner']} "
         f"placement={result['placement_mode']} "
-        f"hyper_seed={hypergraph_seed_mode} "
-        f"hyper_candidates={hypergraph_candidates} "
         f"rounds={round_mode} "
         f"hypergraph={hypergraph_mode} "
         f"input={result['input_format']} "
@@ -1435,8 +1375,6 @@ def main() -> None:
         f"{sum(layer['primary_replay_seconds'] for layer in result['layers']):.3f}s "
         "graph_solve="
         f"{sum(layer['graph_solve_seconds'] for layer in result['layers']):.3f}s "
-        "hypergraph_seed="
-        f"{sum(layer['hypergraph_seed_seconds'] for layer in result['layers']):.3f}s "
         "hypergraph_solve="
         f"{sum(layer['hypergraph_solve_seconds'] for layer in result['layers']):.3f}s "
         "replica_input="
