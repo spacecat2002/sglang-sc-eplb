@@ -161,3 +161,24 @@ def test_cuda_incremental_hypergraph_matches_cpu_across_rounds():
     assert actual.rank_by_expert == expected.rank_by_expert
     assert actual.final_remote == expected.final_remote
     assert actual.iterations == expected.iterations
+
+
+def test_cuda_hypergraph_compute_balance_preserves_remote():
+    source = torch.tensor([2, 2, 2, 2], device="cuda", dtype=torch.int64)
+    topk = torch.tensor([[0], [1], [2], [3]], device="cuda", dtype=torch.int64)
+    count = torch.tensor([100, 90, 10, 1], device="cuda", dtype=torch.int64)
+
+    placement = refine_hypergraph_placement_cuda(
+        source,
+        topk,
+        count,
+        {0: 0, 1: 0, 2: 1, 3: 1},
+        num_ranks=3,
+        max_rounds=0,
+        balance_rounds=None,
+    )
+
+    assert placement.initial_remote == 201
+    assert placement.final_remote == 201
+    assert placement.balance_iterations == 1
+    assert placement.experts_by_rank == {0: (1, 2), 1: (0, 3), 2: ()}

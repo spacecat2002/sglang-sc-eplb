@@ -111,3 +111,26 @@ def test_hypergraph_refinement_can_improve_converged_pairwise_graph():
 
     assert graph_remote == 164
     assert hypergraph_placement.final_remote == 145
+
+
+def test_hypergraph_compute_balance_preserves_exact_remote():
+    tokens = [
+        RoutedToken(2, (0,), 100),
+        RoutedToken(2, (1,), 90),
+        RoutedToken(2, (2,), 10),
+        RoutedToken(2, (3,), 1),
+    ]
+    initial = {0: 0, 1: 0, 2: 1, 3: 1}
+
+    placement = refine_hypergraph_placement(
+        tokens,
+        initial,
+        num_ranks=3,
+        max_rounds=0,
+        balance_rounds=None,
+    )
+
+    assert placement.initial_remote == 201
+    assert placement.final_remote == 201
+    assert placement.balance_iterations == 1
+    assert placement.experts_by_rank == {0: (1, 2), 1: (0, 3), 2: ()}

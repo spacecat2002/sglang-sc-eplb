@@ -65,6 +65,7 @@ class HypergraphPlacement:
     initial_remote: int
     final_remote: int
     iterations: int
+    balance_iterations: int = 0
 
 
 def build_co_routing_graph(
@@ -108,6 +109,7 @@ def refine_hypergraph_placement(
     *,
     num_ranks: int,
     max_rounds: Optional[int] = 8,
+    balance_rounds: Optional[int] = 0,
 ) -> HypergraphPlacement:
     """Refine a placement using the exact distinct-remote-rank objective.
 
@@ -120,6 +122,8 @@ def refine_hypergraph_placement(
         raise ValueError("num_ranks must be positive")
     if max_rounds is not None and max_rounds < 0:
         raise ValueError("max_rounds must be non-negative")
+    if balance_rounds is not None and balance_rounds < 0:
+        raise ValueError("balance_rounds must be non-negative")
     tokens = list(routed_tokens)
     rank_by_expert = dict(initial_rank_by_expert)
     if any(rank < 0 or rank >= num_ranks for rank in rank_by_expert.values()):
@@ -208,6 +212,87 @@ def refine_hypergraph_placement(
             accumulate_bundle(bundle_index, 1)
         rounds += 1
 
+    balance_iterations = 0
+    if balance_rounds is None or balance_rounds > 0:
+        expert_demand: Dict[int, int] = defaultdict(int)
+        for token in tokens:
+            for expert in token.topk_experts:
+                expert_demand[expert] += token.count
+        rank_load = [0] * num_ranks
+        for expert, rank in rank_by_expert.items():
+            rank_load[rank] += expert_demand[expert]
+
+        while balance_rounds is None or balance_iterations < balance_rounds:
+            current_max = max(rank_load, default=0)
+            max_without_pair = {
+                (left_rank, right_rank): max(
+                    (
+                        load
+                        for rank, load in enumerate(rank_load)
+                        if rank not in {left_rank, right_rank}
+                    ),
+                    default=0,
+                )
+                for left_rank in range(num_ranks)
+                for right_rank in range(left_rank + 1, num_ranks)
+            }
+            best_balance: Optional[Tuple[int, int, int, int]] = None
+            experts = sorted(rank_by_expert)
+            for left_index, left in enumerate(experts):
+                left_rank = rank_by_expert[left]
+                for right in experts[left_index + 1 :]:
+                    right_rank = rank_by_expert[right]
+                    if left_rank == right_rank:
+                        continue
+                    remote_delta = (
+                        move_gains[left][right_rank]
+                        + move_gains[right][left_rank]
+                        + pair_correction.get((left, right), 0)
+                    )
+                    if remote_delta != 0:
+                        continue
+                    left_after = (
+                        rank_load[left_rank]
+                        - expert_demand[left]
+                        + expert_demand[right]
+                    )
+                    right_after = (
+                        rank_load[right_rank]
+                        - expert_demand[right]
+                        + expert_demand[left]
+                    )
+                    low_rank, high_rank = sorted((left_rank, right_rank))
+                    new_max = max(
+                        max_without_pair[(low_rank, high_rank)],
+                        left_after,
+                        right_after,
+                    )
+                    variance_delta = (
+                        left_after * left_after
+                        + right_after * right_after
+                        - rank_load[left_rank] * rank_load[left_rank]
+                        - rank_load[right_rank] * rank_load[right_rank]
+                    )
+                    if new_max > current_max or variance_delta >= 0:
+                        continue
+                    candidate = (new_max, variance_delta, left, right)
+                    if best_balance is None or candidate < best_balance:
+                        best_balance = candidate
+            if best_balance is None:
+                break
+            _, _, left, right = best_balance
+            affected = incidence[left] | incidence[right]
+            for bundle_index in affected:
+                accumulate_bundle(bundle_index, -1)
+            left_rank = rank_by_expert[left]
+            right_rank = rank_by_expert[right]
+            rank_by_expert[left], rank_by_expert[right] = right_rank, left_rank
+            rank_load[left_rank] += expert_demand[right] - expert_demand[left]
+            rank_load[right_rank] += expert_demand[left] - expert_demand[right]
+            for bundle_index in affected:
+                accumulate_bundle(bundle_index, 1)
+            balance_iterations += 1
+
     final_remote = evaluate_primary_remote(tokens, rank_by_expert)
     experts_by_rank = {
         rank: tuple(
@@ -225,6 +310,7 @@ def refine_hypergraph_placement(
         initial_remote,
         final_remote,
         rounds,
+        balance_iterations,
     )
 
 

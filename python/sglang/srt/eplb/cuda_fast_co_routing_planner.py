@@ -290,6 +290,7 @@ class CudaHypergraphPlacement:
     final_remote: int
     iterations: int
     solve_seconds: float
+    balance_iterations: int = 0
 
 
 def build_co_routing_graph_cuda(
@@ -555,6 +556,7 @@ def refine_hypergraph_placement_cuda(
     *,
     num_ranks: int,
     max_rounds: Optional[int] = 8,
+    balance_rounds: Optional[int] = 0,
 ) -> CudaHypergraphPlacement:
     """Refine placement against exact Top-K distinct-remote-rank traffic."""
 
@@ -576,6 +578,8 @@ def refine_hypergraph_placement_cuda(
         raise ValueError("source, topk, and count must use int64")
     if max_rounds is not None and max_rounds < 0:
         raise ValueError("max_rounds must be non-negative")
+    if balance_rounds is not None and balance_rounds < 0:
+        raise ValueError("balance_rounds must be non-negative")
     if num_ranks < 1:
         raise ValueError("num_ranks must be positive")
     if not initial_rank_by_expert:
@@ -737,6 +741,125 @@ def refine_hypergraph_placement_cuda(
         update_bundle_deltas(affected_bundles, 1)
         rounds += 1
 
+    balance_iterations = 0
+    if balance_rounds is None or balance_rounds > 0:
+        expert_demand = torch.zeros(
+            num_experts,
+            dtype=torch.int64,
+            device=topk_experts.device,
+        )
+        expert_demand.scatter_add_(
+            0,
+            flattened_experts,
+            count[:, None].expand_as(topk_experts).reshape(-1),
+        )
+        rank_load = torch.zeros(
+            num_ranks,
+            dtype=torch.int64,
+            device=topk_experts.device,
+        )
+        rank_load.scatter_add_(
+            0,
+            rank_by_expert[observed],
+            expert_demand[observed],
+        )
+        rank_ids = torch.arange(num_ranks, device=topk_experts.device)
+        expert_pair_index = torch.arange(
+            num_experts * num_experts,
+            dtype=torch.int64,
+            device=topk_experts.device,
+        ).reshape(num_experts, num_experts)
+        integer_limit = torch.iinfo(torch.int64).max
+
+        while balance_rounds is None or balance_iterations < balance_rounds:
+            expert_ranks = rank_by_expert.clamp_min(0)
+            move_to_candidate = move_deltas[:, expert_ranks]
+            deltas = move_to_candidate + move_to_candidate.T + corrections
+            cross_rank = rank_by_expert[:, None] != rank_by_expert[None, :]
+            candidate_mask = valid_pair & cross_rank
+
+            left_rank = expert_ranks[:, None]
+            right_rank = expert_ranks[None, :]
+            left_load = rank_load[left_rank]
+            right_load = rank_load[right_rank]
+            left_after = left_load - expert_demand[:, None] + expert_demand[None, :]
+            right_after = right_load - expert_demand[None, :] + expert_demand[:, None]
+            variance_delta = (
+                left_after.square()
+                + right_after.square()
+                - left_load.square()
+                - right_load.square()
+            )
+
+            rank_pair_left = rank_ids[:, None, None]
+            rank_pair_right = rank_ids[None, :, None]
+            load_rank = rank_ids[None, None, :]
+            unaffected = (load_rank != rank_pair_left) & (load_rank != rank_pair_right)
+            max_without_pair = torch.where(
+                unaffected,
+                rank_load[None, None, :],
+                -1,
+            ).amax(dim=2)
+            new_max = torch.maximum(
+                max_without_pair[left_rank, right_rank],
+                torch.maximum(left_after, right_after),
+            )
+            current_max = rank_load.max()
+            eligible = (
+                candidate_mask
+                & (deltas == 0)
+                & (variance_delta < 0)
+                & (new_max <= current_max)
+            )
+
+            best_max_tensor = torch.where(eligible, new_max, integer_limit).min()
+            best_variance_tensor = torch.where(
+                eligible & (new_max == best_max_tensor),
+                variance_delta,
+                integer_limit,
+            ).min()
+            best_index_tensor = torch.where(
+                eligible
+                & (new_max == best_max_tensor)
+                & (variance_delta == best_variance_tensor),
+                expert_pair_index,
+                integer_limit,
+            ).min()
+            best_index = int(best_index_tensor.item())
+            if best_index == integer_limit:
+                break
+
+            left = best_index // num_experts
+            right = best_index % num_experts
+            affected_bundles = torch.unique(
+                torch.cat(
+                    (
+                        incidence_bundles[
+                            incidence_offsets_cpu[left] : incidence_offsets_cpu[
+                                left + 1
+                            ]
+                        ],
+                        incidence_bundles[
+                            incidence_offsets_cpu[right] : incidence_offsets_cpu[
+                                right + 1
+                            ]
+                        ],
+                    )
+                ),
+                sorted=False,
+            )
+            update_bundle_deltas(affected_bundles, -1)
+            left_rank_value = rank_by_expert[left].clone()
+            right_rank_value = rank_by_expert[right].clone()
+            left_demand = expert_demand[left].clone()
+            right_demand = expert_demand[right].clone()
+            rank_by_expert[left] = right_rank_value
+            rank_by_expert[right] = left_rank_value
+            rank_load[left_rank_value] += right_demand - left_demand
+            rank_load[right_rank_value] += left_demand - right_demand
+            update_bundle_deltas(affected_bundles, 1)
+            balance_iterations += 1
+
     final_remote = _evaluate_primary_remote_cuda(
         source_rank, topk_experts, count, rank_by_expert
     )
@@ -755,6 +878,7 @@ def refine_hypergraph_placement_cuda(
         final_remote,
         rounds,
         solve_seconds,
+        balance_iterations,
     )
 
 

@@ -742,6 +742,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     hypergraph_limit = (
         None if args.hypergraph_until_convergence else args.hypergraph_rounds
     )
+    hypergraph_balance_limit = (
+        None if args.hypergraph_balance_rounds == -1 else args.hypergraph_balance_rounds
+    )
     output_layers = []
     prepared_layers = _prefetched_layers(
         layers,
@@ -889,9 +892,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         final_placement = placement
         hypergraph_remote = None
         hypergraph_iterations = 0
+        hypergraph_balance_iterations = 0
         hypergraph_solve_seconds = 0.0
         if hypergraph_enabled:
             best_hypergraph_placement = None
+            best_hypergraph_key = None
             if cuda_fast_ops is None and tokens is None:
                 tokens = _materialize_layer_tokens(
                     name,
@@ -919,6 +924,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         initial_rank_map,
                         num_ranks=args.num_ranks,
                         max_rounds=hypergraph_limit,
+                        balance_rounds=hypergraph_balance_limit,
                     )
                     hypergraph_solve_seconds += candidate_placement.solve_seconds
                 else:
@@ -928,21 +934,30 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         initial_rank_map,
                         num_ranks=args.num_ranks,
                         max_rounds=hypergraph_limit,
+                        balance_rounds=hypergraph_balance_limit,
                     )
                     hypergraph_solve_seconds += time.perf_counter() - hypergraph_start
                 if restart == 0 and candidate_placement.initial_remote != seed_remote:
                     raise RuntimeError(
                         "hypergraph refinement initial replay disagrees with seed replay"
                     )
-                if (
-                    best_hypergraph_placement is None
-                    or candidate_placement.final_remote
-                    < best_hypergraph_placement.final_remote
-                ):
+                candidate_loads = _compute_loads(
+                    graph_demand,
+                    candidate_placement.rank_by_expert,
+                    args.num_ranks,
+                )
+                candidate_key = (
+                    candidate_placement.final_remote,
+                    max(candidate_loads),
+                    sum(load * load for load in candidate_loads),
+                )
+                if best_hypergraph_key is None or candidate_key < best_hypergraph_key:
                     best_hypergraph_placement = candidate_placement
+                    best_hypergraph_key = candidate_key
             final_placement = best_hypergraph_placement
             hypergraph_remote = best_hypergraph_placement.final_remote
             hypergraph_iterations = best_hypergraph_placement.iterations
+            hypergraph_balance_iterations = best_hypergraph_placement.balance_iterations
         hypergraph_compute_load = (
             _compute_loads(graph_demand, final_placement.rank_by_expert, args.num_ranks)
             if hypergraph_enabled
@@ -1082,6 +1097,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "layer_seconds": time.perf_counter() - layer_start,
                 "graph_solve_seconds": graph_solve_seconds,
                 "hypergraph_iterations": hypergraph_iterations,
+                "hypergraph_balance_iterations": hypergraph_balance_iterations,
                 "hypergraph_restarts": (
                     args.hypergraph_restarts if hypergraph_enabled else 0
                 ),
@@ -1108,6 +1124,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "hypergraph_round_limit": (
             None if args.hypergraph_until_convergence else args.hypergraph_rounds
         ),
+        "hypergraph_balance_round_limit": hypergraph_balance_limit,
         "input_format": "compact" if compact_input else "json",
         "input_load_seconds": input_load_seconds,
         "total_wall_seconds": time.perf_counter() - run_start,
@@ -1174,6 +1191,15 @@ def main() -> None:
         "--hypergraph-until-convergence",
         action="store_true",
         help="refine exact Top-K traffic until no improving swap remains",
+    )
+    parser.add_argument(
+        "--hypergraph-balance-rounds",
+        type=int,
+        default=0,
+        help=(
+            "communication-neutral compute-balance swap rounds after hypergraph "
+            "refinement; 0 disables and -1 runs to convergence (default: 0)"
+        ),
     )
     parser.add_argument(
         "--hypergraph-restarts",
@@ -1258,6 +1284,8 @@ def main() -> None:
         parser.error("--max-rounds must be non-negative")
     if args.hypergraph_rounds < 0:
         parser.error("--hypergraph-rounds must be non-negative")
+    if args.hypergraph_balance_rounds < -1:
+        parser.error("--hypergraph-balance-rounds must be -1 or non-negative")
     if args.hypergraph_restarts < 1:
         parser.error("--hypergraph-restarts must be positive")
     if args.hypergraph_kick_swaps < 0:
@@ -1283,6 +1311,7 @@ def main() -> None:
             "comp",
             "rounds",
             "hyper_rounds",
+            "balance_rounds",
             "tensorize",
             "graph_build",
             "primary_replay",
@@ -1325,6 +1354,7 @@ def main() -> None:
                 ),
                 str(layer["iterations"]),
                 str(layer["hypergraph_iterations"]),
+                str(layer["hypergraph_balance_iterations"]),
                 f"{layer['tensorize_seconds']:.3f}s",
                 f"{layer['graph_build_seconds']:.3f}s",
                 f"{layer['primary_replay_seconds']:.3f}s",
@@ -1357,11 +1387,22 @@ def main() -> None:
             else f"max-{hypergraph_limit}"
         )
     )
+    hypergraph_balance_limit = result["hypergraph_balance_round_limit"]
+    hypergraph_balance_mode = (
+        "disabled"
+        if result["placement_mode"] == "pairwise" or hypergraph_balance_limit == 0
+        else (
+            "until-convergence"
+            if hypergraph_balance_limit is None
+            else f"max-{hypergraph_balance_limit}"
+        )
+    )
     print(
         f"device={result['device']} planner={result['planner']} "
         f"placement={result['placement_mode']} "
         f"rounds={round_mode} "
         f"hypergraph={hypergraph_mode} "
+        f"hyper_balance={hypergraph_balance_mode} "
         f"input={result['input_format']} "
         f"input_load={result['input_load_seconds']:.3f}s"
     )
