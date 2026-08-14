@@ -537,6 +537,30 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     nonempty_layers = [
         (name, bundles) for name, bundles in bundles_by_gate.items() if bundles
     ]
+    if args.bundles_output:
+        trace = {
+            "num_ranks": args.num_ranks,
+            "top_k": args.top_k,
+            "layers": [
+                {
+                    "gate": name,
+                    "bundles": [
+                        {
+                            "source_rank": source_rank,
+                            "topk_experts": list(experts),
+                            "count": count,
+                        }
+                        for (source_rank, experts), count in sorted(bundles.items())
+                    ],
+                }
+                for name, bundles in nonempty_layers
+            ],
+        }
+        Path(args.bundles_output).write_text(json.dumps(trace) + "\n")
+        print(
+            f"[data] saved aggregated Top-K bundles to {args.bundles_output}",
+            flush=True,
+        )
     if args.compare_ep is not None:
         print(
             f"[compare] resharding EP={args.num_ranks} -> EP={args.compare_ep} "
@@ -688,6 +712,11 @@ def main() -> None:
     parser.add_argument("--json", action="store_true")
     parser.add_argument(
         "--output", default=None, help="write complete JSON results to this path"
+    )
+    parser.add_argument(
+        "--bundles-output",
+        default=None,
+        help="save aggregated (source_rank, Top-K, count) bundles for graph replay",
     )
     args = parser.parse_args()
     if args.num_ranks < 1:
