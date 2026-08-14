@@ -67,31 +67,30 @@ def _edge_kernel(
 
 
 @triton.jit
-def _hypergraph_swap_delta_kernel(
+def _hypergraph_move_delta_kernel(
     topk_ptr,
     source_ptr,
     count_ptr,
     rank_by_expert_ptr,
-    delta_ptr,
+    move_delta_ptr,
     num_values,
     num_experts,
+    num_ranks,
     TOPK: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < num_values
-    candidate = offsets % num_experts
-    incidence = offsets // num_experts
+    target_rank = offsets % num_ranks
+    incidence = offsets // num_ranks
     bundle = incidence // TOPK
     slot = incidence % TOPK
     expert = tl.load(topk_ptr + bundle * TOPK + slot, mask=mask, other=0)
     expert_rank = tl.load(rank_by_expert_ptr + expert, mask=mask, other=-1)
-    candidate_rank = tl.load(rank_by_expert_ptr + candidate, mask=mask, other=-1)
     source = tl.load(source_ptr + bundle, mask=mask, other=0)
 
-    contains_candidate = tl.zeros((BLOCK,), dtype=tl.int1)
     old_rank_count = tl.zeros((BLOCK,), dtype=tl.int32)
-    new_rank_count = tl.zeros((BLOCK,), dtype=tl.int32)
+    target_rank_count = tl.zeros((BLOCK,), dtype=tl.int32)
     for other_slot in tl.static_range(0, TOPK):
         other = tl.load(
             topk_ptr + bundle * TOPK + other_slot,
@@ -99,26 +98,79 @@ def _hypergraph_swap_delta_kernel(
             other=0,
         )
         other_rank = tl.load(rank_by_expert_ptr + other, mask=mask, other=-1)
-        contains_candidate |= other == candidate
         old_rank_count += (other_rank == expert_rank).to(tl.int32)
-        new_rank_count += (other_rank == candidate_rank).to(tl.int32)
+        target_rank_count += (other_rank == target_rank).to(tl.int32)
 
-    valid = (
-        mask
-        & (candidate_rank >= 0)
-        & (expert_rank != candidate_rank)
-        & ~contains_candidate
-    )
+    valid = mask & (expert_rank != target_rank)
     removed = (expert_rank != source) & (old_rank_count == 1)
-    added = (candidate_rank != source) & (new_rank_count == 0)
+    added = (target_rank != source) & (target_rank_count == 0)
     weight = tl.load(count_ptr + bundle, mask=mask, other=0).to(tl.int64)
     delta = (added.to(tl.int64) - removed.to(tl.int64)) * weight
-    low = tl.minimum(expert, candidate)
-    high = tl.maximum(expert, candidate)
     tl.atomic_add(
-        delta_ptr + low * num_experts + high,
+        move_delta_ptr + expert * num_ranks + target_rank,
         delta,
         mask=valid,
+    )
+
+
+@triton.jit
+def _hypergraph_pair_correction_kernel(
+    topk_ptr,
+    source_ptr,
+    count_ptr,
+    rank_by_expert_ptr,
+    pair_left_ptr,
+    pair_right_ptr,
+    correction_ptr,
+    num_pair_values,
+    num_experts,
+    TOPK: tl.constexpr,
+    NUM_PAIRS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < num_pair_values
+    bundle = offsets // NUM_PAIRS
+    pair = offsets % NUM_PAIRS
+    left_slot = tl.load(pair_left_ptr + pair, mask=mask, other=0)
+    right_slot = tl.load(pair_right_ptr + pair, mask=mask, other=0)
+    left = tl.load(topk_ptr + bundle * TOPK + left_slot, mask=mask, other=0)
+    right = tl.load(topk_ptr + bundle * TOPK + right_slot, mask=mask, other=0)
+    left_rank = tl.load(rank_by_expert_ptr + left, mask=mask, other=-1)
+    right_rank = tl.load(rank_by_expert_ptr + right, mask=mask, other=-1)
+    source = tl.load(source_ptr + bundle, mask=mask, other=0)
+
+    left_rank_count = tl.zeros((BLOCK,), dtype=tl.int32)
+    right_rank_count = tl.zeros((BLOCK,), dtype=tl.int32)
+    for other_slot in tl.static_range(0, TOPK):
+        other = tl.load(
+            topk_ptr + bundle * TOPK + other_slot,
+            mask=mask,
+            other=0,
+        )
+        other_rank = tl.load(rank_by_expert_ptr + other, mask=mask, other=-1)
+        left_rank_count += (other_rank == left_rank).to(tl.int32)
+        right_rank_count += (other_rank == right_rank).to(tl.int32)
+
+    # The two independent move gains include co-containing bundles, but
+    # swapping both experts leaves such a bundle's rank set unchanged.
+    left_removed = (left_rank != source) & (left_rank_count == 1)
+    left_added = (right_rank != source) & (right_rank_count == 0)
+    right_removed = (right_rank != source) & (right_rank_count == 1)
+    right_added = (left_rank != source) & (left_rank_count == 0)
+    independent_delta = (
+        left_added.to(tl.int64)
+        - left_removed.to(tl.int64)
+        + right_added.to(tl.int64)
+        - right_removed.to(tl.int64)
+    )
+    weight = tl.load(count_ptr + bundle, mask=mask, other=0).to(tl.int64)
+    low = tl.minimum(left, right)
+    high = tl.maximum(left, right)
+    tl.atomic_add(
+        correction_ptr + low * num_experts + high,
+        -independent_delta * weight,
+        mask=mask & (left_rank != right_rank),
     )
 
 
@@ -540,7 +592,16 @@ def refine_hypergraph_placement_cuda(
     solve_start = time.perf_counter()
     rounds = 0
     block = 256
-    num_values = topk_experts.numel() * num_experts
+    num_move_values = topk_experts.numel() * num_ranks
+    pair_slots = torch.triu_indices(
+        topk_experts.shape[1],
+        topk_experts.shape[1],
+        offset=1,
+        device=topk_experts.device,
+        dtype=torch.int32,
+    )
+    num_pairs = pair_slots.shape[1]
+    num_pair_values = topk_experts.shape[0] * num_pairs
     expert_index = torch.arange(num_experts, device=topk_experts.device)
     observed = rank_by_expert >= 0
     valid_pair = (
@@ -548,31 +609,62 @@ def refine_hypergraph_placement_cuda(
         & observed[None, :]
         & (expert_index[:, None] < expert_index[None, :])
     )
+    move_deltas = torch.empty(
+        (num_experts, num_ranks),
+        dtype=torch.int64,
+        device=topk_experts.device,
+    )
+    corrections = torch.empty(
+        (num_experts, num_experts),
+        dtype=torch.int64,
+        device=topk_experts.device,
+    )
     while max_rounds is None or rounds < max_rounds:
-        deltas = torch.zeros(
-            (num_experts, num_experts),
-            dtype=torch.int64,
-            device=topk_experts.device,
-        )
-        _hypergraph_swap_delta_kernel[(triton.cdiv(num_values, block),)](
+        move_deltas.zero_()
+        corrections.zero_()
+        _hypergraph_move_delta_kernel[(triton.cdiv(num_move_values, block),)](
             topk_experts,
             source_rank,
             count,
             rank_by_expert,
-            deltas,
-            num_values,
+            move_deltas,
+            num_move_values,
             num_experts,
+            num_ranks,
             TOPK=topk_experts.shape[1],
             BLOCK=block,
         )
+        if num_pairs:
+            _hypergraph_pair_correction_kernel[(triton.cdiv(num_pair_values, block),)](
+                topk_experts,
+                source_rank,
+                count,
+                rank_by_expert,
+                pair_slots[0],
+                pair_slots[1],
+                corrections,
+                num_pair_values,
+                num_experts,
+                TOPK=topk_experts.shape[1],
+                NUM_PAIRS=num_pairs,
+                BLOCK=block,
+            )
+        candidate_ranks = rank_by_expert.clamp_min(0)
+        move_to_candidate = move_deltas[:, candidate_ranks]
+        deltas = move_to_candidate + move_to_candidate.T + corrections
         cross_rank = rank_by_expert[:, None] != rank_by_expert[None, :]
         candidates = torch.where(
             valid_pair & cross_rank,
             deltas,
             torch.iinfo(torch.int64).max,
         )
-        flat_index = int(torch.argmin(candidates).item())
-        best_delta = int(candidates.flatten()[flat_index].item())
+        best_delta_tensor, flat_index_tensor = candidates.flatten().min(dim=0)
+        best_delta, flat_index = (
+            int(value)
+            for value in torch.stack((best_delta_tensor, flat_index_tensor))
+            .cpu()
+            .tolist()
+        )
         if best_delta >= 0:
             break
         left = flat_index // num_experts

@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
+import re
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -34,6 +36,7 @@ from sglang.srt.eplb.bundle_aware_replica_planner import (
 from sglang.srt.eplb.co_routing_graph_solver import (
     CoRoutingGraph,
     CoRoutingGraphSolver,
+    GraphPlacement,
     build_co_routing_graph,
     evaluate_primary_remote,
     refine_hypergraph_placement,
@@ -43,6 +46,9 @@ from sglang.srt.eplb.moe_bundle_trace import (
     load_compact_trace,
     save_compact_trace,
 )
+
+
+_LAYER_PATTERN = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 
 
 def _raw_layers(raw: Any) -> list[tuple[str, list[Any]]]:
@@ -577,6 +583,92 @@ def _max_over_average(values: Sequence[int]) -> float:
     return max(values, default=0) / average if average else 0.0
 
 
+def _layer_number(gate: str, fallback: int) -> int:
+    match = _LAYER_PATTERN.search(gate)
+    return int(match.group(1)) if match else fallback
+
+
+def _summarize_tokens(
+    tokens: Sequence[RoutedToken],
+) -> tuple[tuple[int, ...], dict[int, int]]:
+    demand: dict[int, int] = {}
+    for token in tokens:
+        for expert in token.topk_experts:
+            demand[expert] = demand.get(expert, 0) + token.count
+    return tuple(sorted(demand)), demand
+
+
+def _summarize_tensor_trace(
+    trace: _TensorTrace, *, chunk_size: int
+) -> tuple[tuple[int, ...], dict[int, int]]:
+    torch = _torch()
+    num_experts = int(trace.topk_experts.max().item()) + 1
+    demand = torch.zeros(
+        num_experts, dtype=torch.int64, device=trace.topk_experts.device
+    )
+    for start in range(0, trace.count.numel(), chunk_size):
+        stop = min(start + chunk_size, trace.count.numel())
+        topk = trace.topk_experts[start:stop]
+        count = trace.count[start:stop]
+        demand.scatter_add_(
+            0,
+            topk.reshape(-1),
+            count[:, None].expand_as(topk).reshape(-1),
+        )
+    demand_cpu = demand.cpu().tolist()
+    experts = tuple(expert for expert, value in enumerate(demand_cpu) if value > 0)
+    return experts, {expert: demand_cpu[expert] for expert in experts}
+
+
+def _balanced_initial_placement(
+    experts: Sequence[int],
+    demand: Mapping[int, int],
+    *,
+    num_ranks: int,
+    slots_per_rank: int,
+) -> GraphPlacement:
+    if len(experts) > num_ranks * slots_per_rank:
+        raise ValueError("expert count exceeds total rank capacity")
+    assignments = [set() for _ in range(num_ranks)]
+    loads = [0] * num_ranks
+    for expert in sorted(experts, key=lambda value: (-demand[value], value)):
+        candidates = [
+            rank for rank in range(num_ranks) if len(assignments[rank]) < slots_per_rank
+        ]
+        rank = min(
+            candidates, key=lambda value: (loads[value], len(assignments[value]), value)
+        )
+        assignments[rank].add(expert)
+        loads[rank] += demand[expert]
+    rank_by_expert = {
+        expert: rank
+        for rank, assigned_experts in enumerate(assignments)
+        for expert in assigned_experts
+    }
+    experts_by_rank = {
+        rank: tuple(sorted(assigned_experts))
+        for rank, assigned_experts in enumerate(assignments)
+    }
+    return GraphPlacement(rank_by_expert, experts_by_rank, 0.0, 0.0, 0)
+
+
+def _perturb_placement(
+    rank_by_expert: Mapping[int, int], *, seed: int, swaps: int
+) -> dict[int, int]:
+    result = dict(rank_by_expert)
+    experts = sorted(result)
+    if len(experts) < 2 or swaps <= 0:
+        return result
+    rng = random.Random(seed)
+    for _ in range(swaps):
+        for _attempt in range(32):
+            left, right = rng.sample(experts, 2)
+            if result[left] != result[right]:
+                result[left], result[right] = result[right], result[left]
+                break
+    return result
+
+
 def _reshard_tokens(
     tokens: Sequence[RoutedToken], source_ep: int, target_ep: int
 ) -> list[RoutedToken]:
@@ -645,6 +737,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if trace_ep < 1:
         raise ValueError("source EP must be positive")
     round_limit = None if args.until_convergence else args.max_rounds
+    pairwise_enabled = args.placement_mode in {"pairwise", "hybrid"}
+    hypergraph_enabled = args.placement_mode in {"hypergraph", "hybrid"}
+    hypergraph_limit = (
+        None if args.hypergraph_until_convergence else args.hypergraph_rounds
+    )
     output_layers = []
     prepared_layers = _prefetched_layers(
         layers,
@@ -653,7 +750,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         source_ep=trace_ep,
         target_ep=args.num_ranks,
     )
-    for name, entries, prefetched_trace, prefetch_wait_seconds in prepared_layers:
+    for layer_position, (
+        name,
+        entries,
+        prefetched_trace,
+        prefetch_wait_seconds,
+    ) in enumerate(prepared_layers):
         layer_start = time.perf_counter()
         prepare_start = time.perf_counter()
         tensorize_start = time.perf_counter()
@@ -691,115 +793,164 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             tensorize_seconds = time.perf_counter() - tensorize_start
         graph_build_start = time.perf_counter()
         cuda_graph = None
-        if tensor_trace is not None:
-            if cuda_fast_ops is not None:
-                build_cuda_graph, _, _, _ = cuda_fast_ops
-                cuda_graph = build_cuda_graph(
-                    tensor_trace.topk_experts, tensor_trace.count
-                )
-                graph_experts, graph_demand, graph_edge_count = cuda_graph.cpu_summary()
+        graph = None
+        if pairwise_enabled:
+            if tensor_trace is not None:
+                if cuda_fast_ops is not None:
+                    build_cuda_graph, _, _, _ = cuda_fast_ops
+                    cuda_graph = build_cuda_graph(
+                        tensor_trace.topk_experts, tensor_trace.count
+                    )
+                    graph_experts, graph_demand, graph_edge_count = (
+                        cuda_graph.cpu_summary()
+                    )
+                else:
+                    graph = _build_graph_tensor(
+                        tensor_trace, chunk_size=args.tensor_chunk_size
+                    )
+                    graph_experts = graph.experts
+                    graph_demand = graph.demand
+                    graph_edge_count = len(graph.edges)
             else:
-                graph = _build_graph_tensor(
-                    tensor_trace, chunk_size=args.tensor_chunk_size
-                )
+                graph = build_co_routing_graph(tokens)
                 graph_experts = graph.experts
                 graph_demand = graph.demand
                 graph_edge_count = len(graph.edges)
+        elif tensor_trace is not None:
+            graph_experts, graph_demand = _summarize_tensor_trace(
+                tensor_trace,
+                chunk_size=args.tensor_chunk_size,
+            )
+            graph_edge_count = None
         else:
-            graph = build_co_routing_graph(tokens)
-            graph_experts = graph.experts
-            graph_demand = graph.demand
-            graph_edge_count = len(graph.edges)
+            graph_experts, graph_demand = _summarize_tokens(tokens)
+            graph_edge_count = None
         graph_build_seconds = time.perf_counter() - graph_build_start
         prepare_seconds = time.perf_counter() - prepare_start
         capacity = args.slots_per_rank
         if capacity is None:
             capacity = (len(graph_experts) + args.num_ranks - 1) // args.num_ranks
-        solver = CoRoutingGraphSolver(
-            num_ranks=args.num_ranks,
-            slots_per_rank=capacity,
-            max_rounds=round_limit,
-            balance_weight=args.balance_weight,
-        )
-        graph_start = time.perf_counter()
-        if cuda_graph is not None:
-            _, solve_cuda_graph, _, _ = cuda_fast_ops
-            placement = solve_cuda_graph(
-                cuda_graph,
+
+        graph_solve_seconds = 0.0
+        if pairwise_enabled:
+            solver = CoRoutingGraphSolver(
                 num_ranks=args.num_ranks,
                 slots_per_rank=capacity,
                 max_rounds=round_limit,
                 balance_weight=args.balance_weight,
             )
+            graph_start = time.perf_counter()
+            if cuda_graph is not None:
+                _, solve_cuda_graph, _, _ = cuda_fast_ops
+                placement = solve_cuda_graph(
+                    cuda_graph,
+                    num_ranks=args.num_ranks,
+                    slots_per_rank=capacity,
+                    max_rounds=round_limit,
+                    balance_weight=args.balance_weight,
+                )
+            else:
+                placement = solver.solve(graph)
+            graph_solve_seconds = time.perf_counter() - graph_start
+            initial_cut = placement.initial_cut
+            final_cut = placement.final_cut
+            graph_iterations = placement.iterations
         else:
-            placement = solver.solve(graph)
-        graph_solve_seconds = time.perf_counter() - graph_start
+            placement = _balanced_initial_placement(
+                graph_experts,
+                graph_demand,
+                num_ranks=args.num_ranks,
+                slots_per_rank=capacity,
+            )
+            initial_cut = None
+            final_cut = None
+            graph_iterations = 0
+
         baseline_homes = _baseline_homes(graph_experts, args.num_ranks, args.baseline)
         baseline_compute_load = _compute_loads(
             graph_demand, baseline_homes, args.num_ranks
         )
-        graph_compute_load = _compute_loads(
+        seed_compute_load = _compute_loads(
             graph_demand, placement.rank_by_expert, args.num_ranks
         )
         primary_replay_start = time.perf_counter()
         if tensor_trace is not None:
-            baseline_remote, graph_remote = _evaluate_primary_remote_tensor(
+            baseline_remote, seed_remote = _evaluate_primary_remote_tensor(
                 tensor_trace,
                 [baseline_homes, placement.rank_by_expert],
                 chunk_size=args.tensor_chunk_size,
             )
         else:
             baseline_remote = evaluate_primary_remote(tokens, baseline_homes)
-            graph_remote = evaluate_primary_remote(tokens, placement.rank_by_expert)
+            seed_remote = evaluate_primary_remote(tokens, placement.rank_by_expert)
         primary_replay_seconds = time.perf_counter() - primary_replay_start
-        hypergraph_limit = (
-            None if args.hypergraph_until_convergence else args.hypergraph_rounds
-        )
-        hypergraph_enabled = hypergraph_limit is None or hypergraph_limit > 0
+        graph_remote = seed_remote if pairwise_enabled else None
+        graph_compute_load = seed_compute_load if pairwise_enabled else None
         final_placement = placement
-        hypergraph_remote = graph_remote
+        hypergraph_remote = None
         hypergraph_iterations = 0
         hypergraph_solve_seconds = 0.0
         if hypergraph_enabled:
-            if cuda_fast_ops is not None:
-                _, _, _, refine_cuda_hypergraph = cuda_fast_ops
-                hypergraph_placement = refine_cuda_hypergraph(
-                    tensor_trace.source_rank,
-                    tensor_trace.topk_experts,
-                    tensor_trace.count,
-                    placement.rank_by_expert,
-                    num_ranks=args.num_ranks,
-                    max_rounds=hypergraph_limit,
+            best_hypergraph_placement = None
+            if cuda_fast_ops is None and tokens is None:
+                tokens = _materialize_layer_tokens(
+                    name,
+                    entries,
+                    compact_input=compact_input,
+                    source_ep=trace_ep,
+                    target_ep=args.num_ranks,
                 )
-                hypergraph_solve_seconds = hypergraph_placement.solve_seconds
-            else:
-                if tokens is None:
-                    tokens = _materialize_layer_tokens(
-                        name,
-                        entries,
-                        compact_input=compact_input,
-                        source_ep=trace_ep,
-                        target_ep=args.num_ranks,
+            for restart in range(args.hypergraph_restarts):
+                initial_rank_map = (
+                    placement.rank_by_expert
+                    if restart == 0
+                    else _perturb_placement(
+                        placement.rank_by_expert,
+                        seed=args.hypergraph_seed + 1009 * layer_position + restart,
+                        swaps=args.hypergraph_kick_swaps,
                     )
-                hypergraph_start = time.perf_counter()
-                hypergraph_placement = refine_hypergraph_placement(
-                    tokens,
-                    placement.rank_by_expert,
-                    num_ranks=args.num_ranks,
-                    max_rounds=hypergraph_limit,
                 )
-                hypergraph_solve_seconds = time.perf_counter() - hypergraph_start
-            if hypergraph_placement.initial_remote != graph_remote:
-                raise RuntimeError(
-                    "hypergraph refinement initial replay disagrees with graph replay"
-                )
-            final_placement = hypergraph_placement
-            hypergraph_remote = hypergraph_placement.final_remote
-            hypergraph_iterations = hypergraph_placement.iterations
-        hypergraph_compute_load = _compute_loads(
-            graph_demand, final_placement.rank_by_expert, args.num_ranks
+                if cuda_fast_ops is not None:
+                    _, _, _, refine_cuda_hypergraph = cuda_fast_ops
+                    candidate_placement = refine_cuda_hypergraph(
+                        tensor_trace.source_rank,
+                        tensor_trace.topk_experts,
+                        tensor_trace.count,
+                        initial_rank_map,
+                        num_ranks=args.num_ranks,
+                        max_rounds=hypergraph_limit,
+                    )
+                    hypergraph_solve_seconds += candidate_placement.solve_seconds
+                else:
+                    hypergraph_start = time.perf_counter()
+                    candidate_placement = refine_hypergraph_placement(
+                        tokens,
+                        initial_rank_map,
+                        num_ranks=args.num_ranks,
+                        max_rounds=hypergraph_limit,
+                    )
+                    hypergraph_solve_seconds += time.perf_counter() - hypergraph_start
+                if restart == 0 and candidate_placement.initial_remote != seed_remote:
+                    raise RuntimeError(
+                        "hypergraph refinement initial replay disagrees with seed replay"
+                    )
+                if (
+                    best_hypergraph_placement is None
+                    or candidate_placement.final_remote
+                    < best_hypergraph_placement.final_remote
+                ):
+                    best_hypergraph_placement = candidate_placement
+            final_placement = best_hypergraph_placement
+            hypergraph_remote = best_hypergraph_placement.final_remote
+            hypergraph_iterations = best_hypergraph_placement.iterations
+        hypergraph_compute_load = (
+            _compute_loads(graph_demand, final_placement.rank_by_expert, args.num_ranks)
+            if hypergraph_enabled
+            else None
         )
-        planned_remote = hypergraph_remote
+        planned_remote = (
+            hypergraph_remote if hypergraph_remote is not None else seed_remote
+        )
         action_count = 0
         replica_action_details = []
         replica_materialize_seconds = 0.0
@@ -888,37 +1039,45 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         output_layers.append(
             {
                 "gate": name,
+                "layer": _layer_number(name, layer_position),
                 "tokens": token_count,
                 "bundles": bundle_count,
                 "experts": len(graph_experts),
                 "edges": graph_edge_count,
                 "baseline_remote": baseline_remote,
                 "graph_remote": graph_remote,
+                "hypergraph_seed_remote": seed_remote if hypergraph_enabled else None,
                 "hypergraph_remote": hypergraph_remote,
                 "planned_remote": planned_remote,
                 "baseline_compute_load": baseline_compute_load,
                 "graph_compute_load": graph_compute_load,
                 "hypergraph_compute_load": hypergraph_compute_load,
                 "baseline_compute_imbalance": _max_over_average(baseline_compute_load),
-                "graph_compute_imbalance": _max_over_average(graph_compute_load),
-                "hypergraph_compute_imbalance": _max_over_average(
-                    hypergraph_compute_load
+                "graph_compute_imbalance": (
+                    _max_over_average(graph_compute_load)
+                    if graph_compute_load is not None
+                    else None
+                ),
+                "hypergraph_compute_imbalance": (
+                    _max_over_average(hypergraph_compute_load)
+                    if hypergraph_compute_load is not None
+                    else None
                 ),
                 "graph_delta": (graph_remote / baseline_remote - 1.0)
-                if baseline_remote
-                else 0.0,
+                if baseline_remote and graph_remote is not None
+                else None,
                 "hypergraph_delta": (hypergraph_remote / baseline_remote - 1.0)
-                if baseline_remote
-                else 0.0,
-                "hypergraph_gain": (hypergraph_remote / graph_remote - 1.0)
-                if graph_remote
-                else 0.0,
+                if baseline_remote and hypergraph_remote is not None
+                else None,
+                "hypergraph_gain": (hypergraph_remote / seed_remote - 1.0)
+                if seed_remote and hypergraph_remote is not None
+                else None,
                 "planned_delta": (planned_remote / baseline_remote - 1.0)
                 if baseline_remote
                 else 0.0,
-                "initial_cut": placement.initial_cut,
-                "final_cut": placement.final_cut,
-                "iterations": placement.iterations,
+                "initial_cut": initial_cut,
+                "final_cut": final_cut,
+                "iterations": graph_iterations,
                 "prepare_seconds": prepare_seconds,
                 "tensorize_seconds": tensorize_seconds,
                 "graph_build_seconds": graph_build_seconds,
@@ -926,6 +1085,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "layer_seconds": time.perf_counter() - layer_start,
                 "graph_solve_seconds": graph_solve_seconds,
                 "hypergraph_iterations": hypergraph_iterations,
+                "hypergraph_restarts": (
+                    args.hypergraph_restarts if hypergraph_enabled else 0
+                ),
                 "hypergraph_solve_seconds": hypergraph_solve_seconds,
                 "replica_actions": action_count,
                 "replica_action_details": replica_action_details,
@@ -943,6 +1105,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "num_ranks": args.num_ranks,
         "baseline": args.baseline,
         "planner": args.planner,
+        "placement_mode": args.placement_mode,
         "device": args.device,
         "round_limit": round_limit,
         "hypergraph_round_limit": (
@@ -953,6 +1116,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "total_wall_seconds": time.perf_counter() - run_start,
         "layers": output_layers,
     }
+
+
+def _optional_text(value: Any) -> str:
+    return "-" if value is None else str(value)
+
+
+def _optional_percent(value: float | None) -> str:
+    return "-" if value is None else f"{value:+.1%}"
+
+
+def _optional_seconds(value: float | None) -> str:
+    return "-" if value is None else f"{value:.3f}s"
 
 
 def main() -> None:
@@ -992,10 +1167,10 @@ def main() -> None:
     hypergraph_group.add_argument(
         "--hypergraph-rounds",
         type=int,
-        default=0,
+        default=8,
         help=(
             "refine graph placement for this many rounds using exact Top-K "
-            "remote-rank traffic (default: disabled)"
+            "remote-rank traffic (default: 8)"
         ),
     )
     hypergraph_group.add_argument(
@@ -1003,6 +1178,19 @@ def main() -> None:
         action="store_true",
         help="refine exact Top-K traffic until no improving swap remains",
     )
+    parser.add_argument(
+        "--hypergraph-restarts",
+        type=int,
+        default=1,
+        help="number of exact-objective starts; best result is retained (default: 1)",
+    )
+    parser.add_argument(
+        "--hypergraph-kick-swaps",
+        type=int,
+        default=2,
+        help="cross-rank perturbation swaps before each additional start (default: 2)",
+    )
+    parser.add_argument("--hypergraph-seed", type=int, default=0)
     parser.add_argument("--balance-weight", type=float, default=0.0)
     parser.add_argument(
         "--device",
@@ -1031,6 +1219,15 @@ def main() -> None:
     parser.add_argument("--fast-max-candidates", type=int, default=32)
     parser.add_argument(
         "--planner", choices=["exact", "fast", "cuda-fast"], default="fast"
+    )
+    parser.add_argument(
+        "--placement-mode",
+        choices=["pairwise", "hypergraph", "hybrid"],
+        default="pairwise",
+        help=(
+            "pairwise only, exact Top-K hypergraph only, or pairwise followed "
+            "by hypergraph refinement (default: pairwise)"
+        ),
     )
     parser.add_argument(
         "--baseline",
@@ -1064,13 +1261,17 @@ def main() -> None:
         parser.error("--max-rounds must be non-negative")
     if args.hypergraph_rounds < 0:
         parser.error("--hypergraph-rounds must be non-negative")
+    if args.hypergraph_restarts < 1:
+        parser.error("--hypergraph-restarts must be positive")
+    if args.hypergraph_kick_swaps < 0:
+        parser.error("--hypergraph-kick-swaps must be non-negative")
     result = run(args)
     if args.json:
         print(json.dumps(result, indent=2))
         return
     rows = [
         [
-            "gate",
+            "layer",
             "tokens",
             "bundles",
             "edges",
@@ -1101,22 +1302,32 @@ def main() -> None:
     for layer in result["layers"]:
         rows.append(
             [
-                layer["gate"],
+                str(layer["layer"]),
                 str(layer["tokens"]),
                 str(layer["bundles"]),
-                str(layer["edges"]),
+                _optional_text(layer["edges"]),
                 str(layer["baseline_remote"]),
-                str(layer["graph_remote"]),
-                str(layer["hypergraph_remote"]),
+                _optional_text(layer["graph_remote"]),
+                _optional_text(layer["hypergraph_remote"]),
                 str(layer["planned_remote"]),
-                f"{layer['graph_delta']:+.1%}",
-                f"{layer['hypergraph_delta']:+.1%}",
-                f"{layer['hypergraph_gain']:+.1%}",
+                _optional_percent(layer["graph_delta"]),
+                _optional_percent(layer["hypergraph_delta"]),
+                _optional_percent(layer["hypergraph_gain"]),
                 f"{layer['planned_delta']:+.1%}",
-                f"{layer['initial_cut']}->{layer['final_cut']}",
-                f"{layer['baseline_compute_imbalance']:.2f}->"
-                f"{layer['graph_compute_imbalance']:.2f}->"
-                f"{layer['hypergraph_compute_imbalance']:.2f}",
+                (
+                    "-"
+                    if layer["initial_cut"] is None
+                    else f"{layer['initial_cut']}->{layer['final_cut']}"
+                ),
+                "->".join(
+                    f"{value:.2f}"
+                    for value in (
+                        layer["baseline_compute_imbalance"],
+                        layer["graph_compute_imbalance"],
+                        layer["hypergraph_compute_imbalance"],
+                    )
+                    if value is not None
+                ),
                 str(layer["iterations"]),
                 str(layer["hypergraph_iterations"]),
                 f"{layer['tensorize_seconds']:.3f}s",
@@ -1125,7 +1336,7 @@ def main() -> None:
                 f"{layer['layer_seconds']:.3f}s",
                 str(layer["replica_actions"]),
                 f"{layer['graph_solve_seconds']:.3f}s",
-                f"{layer['hypergraph_solve_seconds']:.3f}s",
+                _optional_seconds(layer["hypergraph_solve_seconds"]),
                 f"{layer['replica_materialize_seconds']:.3f}s",
                 f"{layer['replica_solve_seconds']:.3f}s",
                 f"{layer['replica_replay_seconds']:.3f}s",
@@ -1133,18 +1344,27 @@ def main() -> None:
         )
     print("Co-routing graph placement replay")
     round_mode = (
-        "until-convergence"
-        if result["round_limit"] is None
-        else f"max-{result['round_limit']}"
+        "disabled"
+        if result["placement_mode"] == "hypergraph"
+        else (
+            "until-convergence"
+            if result["round_limit"] is None
+            else f"max-{result['round_limit']}"
+        )
     )
     hypergraph_limit = result["hypergraph_round_limit"]
     hypergraph_mode = (
-        "until-convergence"
-        if hypergraph_limit is None
-        else ("disabled" if hypergraph_limit == 0 else f"max-{hypergraph_limit}")
+        "disabled"
+        if result["placement_mode"] == "pairwise"
+        else (
+            "until-convergence"
+            if hypergraph_limit is None
+            else f"max-{hypergraph_limit}"
+        )
     )
     print(
         f"device={result['device']} planner={result['planner']} "
+        f"placement={result['placement_mode']} "
         f"rounds={round_mode} "
         f"hypergraph={hypergraph_mode} "
         f"input={result['input_format']} "

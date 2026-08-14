@@ -129,20 +129,55 @@ def refine_hypergraph_placement(
     if missing:
         raise ValueError(f"initial placement is missing experts: {sorted(missing)}")
 
-    incidence: Dict[int, Set[int]] = {expert: set() for expert in rank_by_expert}
-    for bundle_index, token in enumerate(tokens):
-        for expert in token.topk_experts:
-            incidence[expert].add(bundle_index)
-
     initial_remote = evaluate_primary_remote(tokens, rank_by_expert)
     rounds = 0
     while max_rounds is None or rounds < max_rounds:
+        # Factor the exact swap delta into single-expert move gains plus a
+        # correction for bundles containing both swapped experts. This keeps
+        # the CPU fallback at O(B*K*R + B*K^2 + E^2) per round instead of
+        # rescanning affected bundles for every expert pair.
         rank_counts = []
         for token in tokens:
             counts: Dict[int, int] = defaultdict(int)
             for expert in token.topk_experts:
                 counts[rank_by_expert[expert]] += 1
             rank_counts.append(counts)
+
+        move_gains: Dict[int, list[int]] = {
+            expert: [0] * num_ranks for expert in rank_by_expert
+        }
+        pair_correction: Dict[Edge, int] = defaultdict(int)
+        for bundle_index, token in enumerate(tokens):
+            counts = rank_counts[bundle_index]
+            experts_in_bundle = token.topk_experts
+            for expert in experts_in_bundle:
+                old_rank = rank_by_expert[expert]
+                for target_rank in range(num_ranks):
+                    if target_rank == old_rank:
+                        continue
+                    removed = old_rank != token.source_rank and counts[old_rank] == 1
+                    added = (
+                        target_rank != token.source_rank
+                        and counts.get(target_rank, 0) == 0
+                    )
+                    move_gains[expert][target_rank] += token.count * (
+                        int(added) - int(removed)
+                    )
+            for left, right in combinations(sorted(experts_in_bundle), 2):
+                left_rank = rank_by_expert[left]
+                right_rank = rank_by_expert[right]
+                if left_rank == right_rank:
+                    continue
+                independent_delta = 0
+                if right_rank != token.source_rank and counts.get(right_rank, 0) == 0:
+                    independent_delta += 1
+                if left_rank != token.source_rank and counts[left_rank] == 1:
+                    independent_delta -= 1
+                if left_rank != token.source_rank and counts.get(left_rank, 0) == 0:
+                    independent_delta += 1
+                if right_rank != token.source_rank and counts[right_rank] == 1:
+                    independent_delta -= 1
+                pair_correction[(left, right)] -= token.count * independent_delta
 
         best: Optional[Tuple[int, int, int]] = None
         experts = sorted(rank_by_expert)
@@ -152,20 +187,11 @@ def refine_hypergraph_placement(
                 right_rank = rank_by_expert[right]
                 if left_rank == right_rank:
                     continue
-                delta = 0
-                affected = incidence[left] ^ incidence[right]
-                for bundle_index in affected:
-                    token = tokens[bundle_index]
-                    counts = rank_counts[bundle_index]
-                    if bundle_index in incidence[left]:
-                        old_rank, new_rank = left_rank, right_rank
-                    else:
-                        old_rank, new_rank = right_rank, left_rank
-                    removed = old_rank != token.source_rank and counts[old_rank] == 1
-                    added = (
-                        new_rank != token.source_rank and counts.get(new_rank, 0) == 0
-                    )
-                    delta += token.count * (int(added) - int(removed))
+                delta = (
+                    move_gains[left][right_rank]
+                    + move_gains[right][left_rank]
+                    + pair_correction.get((left, right), 0)
+                )
                 candidate = (delta, left, right)
                 if delta < 0 and (best is None or candidate < best):
                     best = candidate
