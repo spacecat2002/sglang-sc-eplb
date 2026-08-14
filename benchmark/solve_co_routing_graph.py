@@ -11,7 +11,8 @@ For the layered form, each layer may additionally contain ``gate``.
 Example::
 
     python benchmark/solve_co_routing_graph.py \
-        --input bundles.json --num-ranks 8 --slots-per-rank 32 --device cuda
+        --input bundles.json --num-ranks 8 --slots-per-rank 32 \
+        --device cuda --planner cuda-fast
 """
 
 from __future__ import annotations
@@ -92,6 +93,24 @@ def _torch():
     return torch
 
 
+def _cuda_fast_planner_ops():
+    try:
+        from sglang.srt.eplb.cuda_fast_co_routing_planner import (
+            build_co_routing_graph_cuda,
+            plan_communication_replicas_cuda,
+            solve_co_routing_graph_cuda,
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "--planner cuda-fast requires PyTorch, CUDA, and Triton"
+        ) from exc
+    return (
+        build_co_routing_graph_cuda,
+        solve_co_routing_graph_cuda,
+        plan_communication_replicas_cuda,
+    )
+
+
 def _synchronize(device: str) -> None:
     if device.startswith("cuda"):
         _torch().cuda.synchronize(device)
@@ -145,6 +164,7 @@ def _tensorize_entries(
     duplicates = (sorted_topk[:, 1:] == sorted_topk[:, :-1]).any()
     if bool(invalid.item()) or bool(duplicates.item()):
         raise ValueError(f"invalid source, count, or expert ids in {name}")
+    topk_tensor = sorted_topk
     if source_ep == target_ep:
         return _TensorTrace(source_tensor, topk_tensor, count_tensor)
     if target_ep < source_ep or target_ep % source_ep:
@@ -334,6 +354,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             raise ValueError("--device must be cpu, cuda, or cuda:<index>")
         if not torch.cuda.is_available():
             raise RuntimeError(f"CUDA is not available for --device {args.device}")
+    if args.planner == "cuda-fast" and not use_tensor_backend:
+        raise ValueError("--planner cuda-fast requires --device cuda")
+    cuda_fast_ops = _cuda_fast_planner_ops() if args.planner == "cuda-fast" else None
     input_start = time.perf_counter()
     raw = orjson.loads(Path(args.input).read_bytes())
     layers = _raw_layers(raw)
@@ -368,8 +391,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             )
         tensorize_seconds = time.perf_counter() - tensorize_start
         graph_build_start = time.perf_counter()
+        cuda_graph = None
         if tensor_trace is not None:
-            graph = _build_graph_tensor(tensor_trace, chunk_size=args.tensor_chunk_size)
+            if cuda_fast_ops is not None:
+                build_cuda_graph, _, _ = cuda_fast_ops
+                cuda_graph = build_cuda_graph(
+                    tensor_trace.topk_experts, tensor_trace.count
+                )
+                graph = cuda_graph.to_cpu_graph()
+            else:
+                graph = _build_graph_tensor(
+                    tensor_trace, chunk_size=args.tensor_chunk_size
+                )
             _synchronize(args.device)
         else:
             graph = build_co_routing_graph(tokens)
@@ -385,7 +418,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             balance_weight=args.balance_weight,
         )
         graph_start = time.perf_counter()
-        placement = solver.solve(graph)
+        if cuda_graph is not None:
+            _, solve_cuda_graph, _ = cuda_fast_ops
+            placement = solve_cuda_graph(
+                cuda_graph,
+                num_ranks=args.num_ranks,
+                slots_per_rank=capacity,
+                max_rounds=args.max_rounds,
+                balance_weight=args.balance_weight,
+                cpu_graph=graph,
+            )
+            _synchronize(args.device)
+        else:
+            placement = solver.solve(graph)
         graph_solve_seconds = time.perf_counter() - graph_start
         baseline_homes = _baseline_homes(graph.experts, args.num_ranks, args.baseline)
         baseline_compute_load = _compute_loads(
@@ -408,43 +453,80 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         primary_replay_seconds = time.perf_counter() - primary_replay_start
         planned_remote = graph_remote
         action_count = 0
+        replica_action_details = []
         replica_materialize_seconds = 0.0
         replica_solve_seconds = 0.0
         replica_replay_seconds = 0.0
         if args.replica_slots_per_rank:
-            if tokens is None:
+            if cuda_fast_ops is not None:
+                _, _, plan_cuda_replicas = cuda_fast_ops
+                replica_plan = plan_cuda_replicas(
+                    tensor_trace.source_rank,
+                    tensor_trace.topk_experts,
+                    tensor_trace.count,
+                    placement.rank_by_expert,
+                    num_ranks=args.num_ranks,
+                    replica_slots_per_rank=args.replica_slots_per_rank,
+                    max_candidates=args.fast_max_candidates,
+                    max_bundle_size=args.max_bundle_size,
+                    ranks_per_node=args.ranks_per_node,
+                    rdma_cost=args.rdma_cost,
+                    chunk_size=min(args.tensor_chunk_size, 65536),
+                )
+                planned_remote = replica_plan.unique_remote_rank_copies
+                action_count = len(replica_plan.actions)
+                replica_action_details = [
+                    {
+                        "destination_rank": action.destination_rank,
+                        "experts": list(action.experts),
+                        "kind": action.kind,
+                    }
+                    for action in replica_plan.actions
+                ]
+                replica_solve_seconds = replica_plan.solve_seconds
+                replica_replay_seconds = replica_plan.replay_seconds
+            elif tokens is None:
                 materialize_start = time.perf_counter()
                 tokens = _reshard_tokens(
                     _tokens_from_entries(name, entries), trace_ep, args.num_ranks
                 )
                 replica_materialize_seconds = time.perf_counter() - materialize_start
-            replica_planner = BundleAwareReplicaPlanner(
-                num_ranks=args.num_ranks,
-                baseline_rank_by_expert=placement.rank_by_expert,
-                replica_slots_per_rank=args.replica_slots_per_rank,
-                ranks_per_node=args.ranks_per_node,
-                rdma_cost=args.rdma_cost,
-                compute_weight=0.0,
-                communication_weight=1.0,
-                max_bundle_size=args.max_bundle_size,
-            )
-            start = time.perf_counter()
-            if args.planner == "fast":
-                replica_plan = replica_planner.plan_fast(
-                    tokens, max_candidates=args.fast_max_candidates
+            if cuda_fast_ops is None:
+                replica_planner = BundleAwareReplicaPlanner(
+                    num_ranks=args.num_ranks,
+                    baseline_rank_by_expert=placement.rank_by_expert,
+                    replica_slots_per_rank=args.replica_slots_per_rank,
+                    ranks_per_node=args.ranks_per_node,
+                    rdma_cost=args.rdma_cost,
+                    compute_weight=0.0,
+                    communication_weight=1.0,
+                    max_bundle_size=args.max_bundle_size,
                 )
-            else:
-                replica_plan = replica_planner.plan(
-                    tokens, max_actions=args.max_actions
+                start = time.perf_counter()
+                if args.planner == "fast":
+                    replica_plan = replica_planner.plan_fast(
+                        tokens, max_candidates=args.fast_max_candidates
+                    )
+                else:
+                    replica_plan = replica_planner.plan(
+                        tokens, max_actions=args.max_actions
+                    )
+                replica_solve_seconds = time.perf_counter() - start
+                replay_start = time.perf_counter()
+                replayed = replica_planner.evaluate_placement(
+                    tokens, replica_plan.replicas_by_rank
                 )
-            replica_solve_seconds = time.perf_counter() - start
-            replay_start = time.perf_counter()
-            replayed = replica_planner.evaluate_placement(
-                tokens, replica_plan.replicas_by_rank
-            )
-            replica_replay_seconds = time.perf_counter() - replay_start
-            planned_remote = replayed.unique_remote_rank_copies
-            action_count = len(replica_plan.actions)
+                replica_replay_seconds = time.perf_counter() - replay_start
+                planned_remote = replayed.unique_remote_rank_copies
+                action_count = len(replica_plan.actions)
+                replica_action_details = [
+                    {
+                        "destination_rank": action.destination_rank,
+                        "experts": list(action.experts),
+                        "kind": action.kind,
+                    }
+                    for action in replica_plan.actions
+                ]
         if tensor_trace is not None:
             token_count = int(tensor_trace.count.sum().item())
             bundle_count = tensor_trace.count.numel()
@@ -481,6 +563,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "layer_seconds": time.perf_counter() - layer_start,
                 "graph_solve_seconds": graph_solve_seconds,
                 "replica_actions": action_count,
+                "replica_action_details": replica_action_details,
                 "replica_materialize_seconds": replica_materialize_seconds,
                 "replica_solve_seconds": replica_solve_seconds,
                 "replica_replay_seconds": replica_replay_seconds,
@@ -494,6 +577,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "source_ep": trace_ep,
         "num_ranks": args.num_ranks,
         "baseline": args.baseline,
+        "planner": args.planner,
         "device": args.device,
         "input_load_seconds": input_load_seconds,
         "total_wall_seconds": time.perf_counter() - run_start,
@@ -539,7 +623,9 @@ def main() -> None:
     parser.add_argument("--max-actions", type=int, default=None)
     parser.add_argument("--max-bundle-size", type=int, default=None)
     parser.add_argument("--fast-max-candidates", type=int, default=32)
-    parser.add_argument("--planner", choices=["exact", "fast"], default="fast")
+    parser.add_argument(
+        "--planner", choices=["exact", "fast", "cuda-fast"], default="fast"
+    )
     parser.add_argument(
         "--baseline",
         choices=["round-robin", "contiguous"],
@@ -560,6 +646,10 @@ def main() -> None:
         parser.error("--slots-per-rank must be positive")
     if args.replica_slots_per_rank < 0:
         parser.error("--replica-slots-per-rank must be non-negative")
+    if args.ranks_per_node is not None and args.ranks_per_node < 1:
+        parser.error("--ranks-per-node must be positive")
+    if args.rdma_cost < 1:
+        parser.error("--rdma-cost must be at least 1")
     if args.fast_max_candidates < 1:
         parser.error("--fast-max-candidates must be positive")
     if args.tensor_chunk_size < 1:
@@ -621,7 +711,10 @@ def main() -> None:
             ]
         )
     print("Co-routing graph placement replay")
-    print(f"device={result['device']} input_load={result['input_load_seconds']:.3f}s")
+    print(
+        f"device={result['device']} planner={result['planner']} "
+        f"input_load={result['input_load_seconds']:.3f}s"
+    )
     print(_format_table(rows))
     print(
         "total tensorize="
@@ -646,6 +739,13 @@ def main() -> None:
             print(f"\n{layer['gate']} experts_by_rank")
             for rank, experts in layer["experts_by_rank"].items():
                 print(f"  rank {rank}: {experts}")
+            if layer["replica_action_details"]:
+                print(f"{layer['gate']} replica actions")
+                for action in layer["replica_action_details"]:
+                    print(
+                        f"  {action['kind']}: experts={action['experts']} "
+                        f"-> rank {action['destination_rank']}"
+                    )
 
 
 if __name__ == "__main__":
