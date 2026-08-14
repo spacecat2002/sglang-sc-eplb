@@ -239,6 +239,11 @@ def main() -> None:
         default="round-robin",
     )
     parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--show-placement",
+        action="store_true",
+        help="print expert ids assigned to every rank",
+    )
     args = parser.parse_args()
     if args.num_ranks < 1:
         parser.error("--num-ranks must be positive")
@@ -286,17 +291,24 @@ def main() -> None:
                 f"{layer['planned_delta']:+.1%}",
                 f"{layer['initial_cut']}->{layer['final_cut']}",
                 str(layer["iterations"]),
-                f"{layer['graph_solve_seconds']:.3f}s",
                 str(layer["replica_actions"]),
+                f"{layer['graph_solve_seconds']:.3f}s",
                 f"{layer['replica_solve_seconds']:.3f}s",
             ]
         )
     print("Co-routing graph placement replay")
     print(_format_table(rows))
-    for layer in result["layers"]:
-        print(f"\n{layer['gate']} experts_by_rank")
-        for rank, experts in layer["experts_by_rank"].items():
-            print(f"  rank {rank}: {experts}")
+    print(
+        "total graph_solve="
+        f"{sum(layer['graph_solve_seconds'] for layer in result['layers']):.3f}s "
+        "replica_solve="
+        f"{sum(layer['replica_solve_seconds'] for layer in result['layers']):.3f}s",
+    )
+    if args.show_placement:
+        for layer in result["layers"]:
+            print(f"\n{layer['gate']} experts_by_rank")
+            for rank, experts in layer["experts_by_rank"].items():
+                print(f"  rank {rank}: {experts}")
 
 
 if __name__ == "__main__":
