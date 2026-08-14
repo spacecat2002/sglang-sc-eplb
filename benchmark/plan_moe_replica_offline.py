@@ -104,9 +104,11 @@ def _source_ranks(
         ) % num_ranks
         flattened = ranks[:, None].expand(-1, sequence_length).reshape(-1)
     else:
-        flattened = (
-            torch.arange(batch_size * sequence_length, device=attention_mask.device)
-            + start
+        # Assign only valid tokens in the global stream. Padding positions
+        # must not consume a rank slot when batches contain variable lengths.
+        valid_count = int(attention_mask.sum().item())
+        return (
+            torch.arange(valid_count, device=attention_mask.device) + start
         ) % num_ranks
     return flattened[attention_mask.reshape(-1).bool()]
 
@@ -494,7 +496,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 shard_offset,
             )
             shard_offset += (
-                encoded["attention_mask"].numel()
+                valid_token_count
                 if args.source_rank_mode == "token-round-robin"
                 else len(text_batch)
             )
@@ -503,10 +505,18 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             if args.device.startswith("cuda"):
                 torch.cuda.synchronize()
             for name, logits in captured.items():
-                if logits.shape[0] != source_ranks.numel():
+                padded_token_count = encoded["attention_mask"].numel()
+                valid_token_count_for_gate = source_ranks.numel()
+                if logits.shape[0] == padded_token_count:
+                    # Many HF MoE routers run on the padded [B, S, H] tensor
+                    # and emit logits for padding rows as well.
+                    valid_mask = encoded["attention_mask"].reshape(-1).bool()
+                    logits = logits[valid_mask.to(logits.device)]
+                if logits.shape[0] != valid_token_count_for_gate:
                     raise RuntimeError(
-                        f"{name} emitted {logits.shape[0]} router rows for "
-                        f"{source_ranks.numel()} non-padding tokens"
+                        f"{name} emitted {logits.shape[0]} usable router rows; "
+                        f"expected {valid_token_count_for_gate} non-padding rows "
+                        f"or {padded_token_count} padded rows"
                     )
                 topk = logits.float().topk(args.top_k, dim=-1).indices.cpu().tolist()
                 for source_rank, experts in zip(source_ranks.cpu().tolist(), topk):
