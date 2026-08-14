@@ -55,7 +55,6 @@ def test_cuda_graph_and_placement_match_cpu_solver():
         num_ranks=2,
         slots_per_rank=2,
         max_rounds=4,
-        cpu_graph=cpu_graph,
     )
     assert cuda_placement == cpu_placement
 

@@ -18,7 +18,6 @@ import triton.language as tl
 from .bundle_aware_replica_planner import ReplicaAction
 from .co_routing_graph_solver import (
     CoRoutingGraph,
-    CoRoutingGraphSolver,
     GraphPlacement,
 )
 
@@ -44,19 +43,21 @@ def _demand_kernel(
 def _edge_kernel(
     topk_ptr,
     count_ptr,
+    pair_left_ptr,
+    pair_right_ptr,
     edges_ptr,
-    num_pair_slots,
+    num_pair_values,
     num_experts,
     TOPK: tl.constexpr,
+    NUM_PAIRS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < num_pair_slots
-    bundle = offsets // (TOPK * TOPK)
-    pair = offsets % (TOPK * TOPK)
-    left_slot = pair // TOPK
-    right_slot = pair % TOPK
-    mask = mask & (left_slot < right_slot)
+    mask = offsets < num_pair_values
+    bundle = offsets // NUM_PAIRS
+    pair = offsets % NUM_PAIRS
+    left_slot = tl.load(pair_left_ptr + pair, mask=mask, other=0)
+    right_slot = tl.load(pair_right_ptr + pair, mask=mask, other=0)
     left = tl.load(topk_ptr + bundle * TOPK + left_slot, mask=mask, other=0)
     right = tl.load(topk_ptr + bundle * TOPK + right_slot, mask=mask, other=0)
     count = tl.load(count_ptr + bundle, mask=mask, other=0).to(tl.int64)
@@ -138,6 +139,17 @@ class CudaCoRoutingGraph:
             adjacency[right][left] = weight
         return CoRoutingGraph(tuple(observed_cpu), demand, edges, adjacency)
 
+    def cpu_summary(self) -> Tuple[Tuple[int, ...], Dict[int, int], int]:
+        demand_cpu = self.demand.cpu().tolist()
+        experts = tuple(
+            expert for expert, demand in enumerate(demand_cpu) if demand > 0
+        )
+        demand = {expert: demand_cpu[expert] for expert in experts}
+        edge_count = int(
+            torch.count_nonzero(torch.triu(self.edge_weights, diagonal=1)).item()
+        )
+        return experts, demand, edge_count
+
 
 @dataclass(frozen=True)
 class CudaFastReplicaPlan:
@@ -178,16 +190,24 @@ def build_co_routing_graph_cuda(
         TOPK=topk,
         BLOCK=block,
     )
-    num_pair_slots = topk_experts.shape[0] * topk * topk
-    _edge_kernel[(triton.cdiv(num_pair_slots, block),)](
-        topk_experts,
-        count,
-        upper_edges,
-        num_pair_slots,
-        num_experts,
-        TOPK=topk,
-        BLOCK=block,
+    pair_slots = torch.triu_indices(
+        topk, topk, offset=1, device=topk_experts.device, dtype=torch.int32
     )
+    num_pairs = pair_slots.shape[1]
+    num_pair_values = topk_experts.shape[0] * num_pairs
+    if num_pairs:
+        _edge_kernel[(triton.cdiv(num_pair_values, block),)](
+            topk_experts,
+            count,
+            pair_slots[0],
+            pair_slots[1],
+            upper_edges,
+            num_pair_values,
+            num_experts,
+            TOPK=topk,
+            NUM_PAIRS=num_pairs,
+            BLOCK=block,
+        )
     edge_weights = upper_edges + upper_edges.T
     return CudaCoRoutingGraph(demand, edge_weights)
 
@@ -222,29 +242,61 @@ def solve_co_routing_graph_cuda(
     slots_per_rank: int | Sequence[int],
     max_rounds: int = 8,
     balance_weight: float = 0.0,
-    cpu_graph: Optional[CoRoutingGraph] = None,
 ) -> GraphPlacement:
     """Refine a capacity-constrained placement with GPU swap scoring."""
 
-    cpu_graph = cpu_graph or graph.to_cpu_graph()
-    seed = CoRoutingGraphSolver(
-        num_ranks=num_ranks,
-        slots_per_rank=slots_per_rank,
-        max_rounds=0,
-        balance_weight=balance_weight,
-    ).solve(cpu_graph)
+    if isinstance(slots_per_rank, int):
+        capacities = [slots_per_rank] * num_ranks
+    else:
+        capacities = list(slots_per_rank)
+    if len(capacities) != num_ranks or any(capacity < 0 for capacity in capacities):
+        raise ValueError("slots_per_rank must contain non-negative capacities")
+    edge_cpu = graph.edge_weights.cpu().numpy()
+    demand_cpu = graph.demand.cpu().numpy()
+    experts = [expert for expert, demand in enumerate(demand_cpu) if demand > 0]
+    if len(experts) > sum(capacities):
+        raise ValueError("expert count exceeds total rank capacity")
+    degree = edge_cpu.sum(axis=1)
+    order = sorted(
+        experts,
+        key=lambda expert: (-int(degree[expert]), -int(demand_cpu[expert]), expert),
+    )
+    assignment = [set() for _ in range(num_ranks)]
+    rank_load = [0] * num_ranks
+    for expert in order:
+        candidates = [
+            rank
+            for rank in range(num_ranks)
+            if len(assignment[rank]) < capacities[rank]
+        ]
+        rank = min(
+            candidates,
+            key=lambda candidate: (
+                -sum(int(edge_cpu[expert, other]) for other in assignment[candidate]),
+                rank_load[candidate],
+                candidate,
+            ),
+        )
+        assignment[rank].add(expert)
+        rank_load[rank] += int(demand_cpu[expert])
+    initial_rank_map = {
+        expert: rank
+        for rank, assigned_experts in enumerate(assignment)
+        for expert in assigned_experts
+    }
     rank_by_expert = torch.full(
         (graph.num_experts,), -1, dtype=torch.int64, device=graph.demand.device
     )
     expert_ids = torch.tensor(
-        list(seed.rank_by_expert), dtype=torch.int64, device=graph.demand.device
+        list(initial_rank_map), dtype=torch.int64, device=graph.demand.device
     )
     initial_ranks = torch.tensor(
-        list(seed.rank_by_expert.values()),
+        list(initial_rank_map.values()),
         dtype=torch.int64,
         device=graph.demand.device,
     )
     rank_by_expert[expert_ids] = initial_ranks
+    initial_cut = _placement_objective(graph, rank_by_expert, num_ranks, balance_weight)
     observed = rank_by_expert >= 0
     observed_pair = observed[:, None] & observed[None, :]
     expert_index = torch.arange(graph.num_experts, device=graph.demand.device)
@@ -342,7 +394,7 @@ def solve_co_routing_graph_cuda(
     return GraphPlacement(
         rank_map,
         experts_by_rank,
-        seed.initial_cut,
+        initial_cut,
         _placement_objective(graph, rank_by_expert, num_ranks, balance_weight),
         rounds,
     )
@@ -475,7 +527,10 @@ def plan_communication_replicas_cuda(
 ) -> CudaFastReplicaPlan:
     """Choose at most one communication-closing replica action per rank."""
 
-    torch.cuda.synchronize(topk_experts.device)
+    # Keep synchronization scoped to the stream used by the caller.  A
+    # device-wide barrier would also wait for unrelated work and defeat the
+    # layer-to-layer H2D prefetch in the offline driver.
+    torch.cuda.current_stream(topk_experts.device).synchronize()
     solve_start = time.perf_counter()
     if isinstance(replica_slots_per_rank, int):
         capacities = [replica_slots_per_rank] * num_ranks
@@ -585,7 +640,6 @@ def plan_communication_replicas_cuda(
             torch.tensor(experts, device=topk_experts.device), destination
         ] = True
         actions.append(ReplicaAction(destination, experts, "cuda-bundle-closure"))
-    torch.cuda.synchronize(topk_experts.device)
     solve_seconds = time.perf_counter() - solve_start
     replay_start = time.perf_counter()
     remote = evaluate_replica_remote_cuda(
@@ -596,7 +650,7 @@ def plan_communication_replicas_cuda(
         ranks_per_node=ranks_per_node,
         rdma_cost=rdma_cost,
     )
-    torch.cuda.synchronize(topk_experts.device)
+    torch.cuda.current_stream(topk_experts.device).synchronize()
     replay_seconds = time.perf_counter() - replay_start
     placement = {
         rank: set(torch.nonzero(placement_mask[:, rank]).flatten().cpu().tolist())

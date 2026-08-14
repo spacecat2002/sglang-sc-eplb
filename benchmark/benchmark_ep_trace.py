@@ -41,6 +41,10 @@ from bench_next_layer_gate_topm import (
     _read_texts,
 )
 from sglang.srt.eplb.bundle_aware_replica_planner import RoutedToken
+from sglang.srt.eplb.moe_bundle_trace import (
+    compact_layer_from_bundles,
+    save_compact_trace,
+)
 
 
 def _home_rank(expert: int, num_experts: int, num_ranks: int, mode: str) -> int:
@@ -156,9 +160,7 @@ def _route_metrics(
                 nvl_traffic += token.count
             else:
                 rdma_traffic += token.count
-    communication = [
-        max(outbound, inbound) for outbound, inbound in zip(send, recv)
-    ]
+    communication = [max(outbound, inbound) for outbound, inbound in zip(send, recv)]
     return {
         "compute_load": compute,
         "send_load": send,
@@ -514,29 +516,42 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         (name, bundles) for name, bundles in bundles_by_gate.items() if bundles
     ]
     if args.bundles_output:
-        trace = {
-            "num_ranks": args.num_ranks,
-            "top_k": args.top_k,
-            "layers": [
-                {
-                    "gate": name,
-                    "bundles": [
-                        {
-                            "source_rank": source_rank,
-                            "topk_experts": list(experts),
-                            "count": count,
-                        }
-                        for (source_rank, experts), count in sorted(bundles.items())
-                    ],
-                }
+        output_path = Path(args.bundles_output)
+        if output_path.suffix.lower() in {".pt", ".pth"}:
+            compact_layers = [
+                compact_layer_from_bundles(name, bundles)
                 for name, bundles in nonempty_layers
-            ],
-        }
-        Path(args.bundles_output).write_text(
-            json.dumps(trace, separators=(",", ":")) + "\n"
-        )
+            ]
+            save_compact_trace(
+                output_path,
+                num_ranks=args.num_ranks,
+                top_k=args.top_k,
+                layers=compact_layers,
+            )
+            output_kind = "compact tensor"
+        else:
+            trace = {
+                "num_ranks": args.num_ranks,
+                "top_k": args.top_k,
+                "layers": [
+                    {
+                        "gate": name,
+                        "bundles": [
+                            {
+                                "source_rank": source_rank,
+                                "topk_experts": list(experts),
+                                "count": count,
+                            }
+                            for (source_rank, experts), count in sorted(bundles.items())
+                        ],
+                    }
+                    for name, bundles in nonempty_layers
+                ],
+            }
+            output_path.write_text(json.dumps(trace, separators=(",", ":")) + "\n")
+            output_kind = "JSON"
         print(
-            f"[data] saved aggregated Top-K bundles to {args.bundles_output}",
+            f"[data] saved {output_kind} Top-K bundles to {args.bundles_output}",
             flush=True,
         )
     if args.compare_ep is not None:
@@ -718,7 +733,10 @@ def main() -> None:
     parser.add_argument(
         "--bundles-output",
         default=None,
-        help="save aggregated (source_rank, Top-K, count) bundles for graph replay",
+        help=(
+            "save aggregated bundles for graph replay; .pt/.pth writes the fast "
+            "compact tensor format, other suffixes write JSON"
+        ),
     )
     args = parser.parse_args()
     if args.num_ranks < 1:

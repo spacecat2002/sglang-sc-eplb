@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Solve an offline Top-K bundle trace with a co-routing graph.
 
-Input JSON can be either a list of bundle records or an object with a
-``layers`` list.  A bundle record has the following shape::
+Input can be a compact ``.pt`` trace or JSON containing either a list of
+bundle records or an object with a ``layers`` list. A record has this shape::
 
     {"source_rank": 0, "topk_experts": [3, 7, 9], "count": 128}
 
@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -35,6 +36,11 @@ from sglang.srt.eplb.co_routing_graph_solver import (
     CoRoutingGraphSolver,
     build_co_routing_graph,
     evaluate_primary_remote,
+)
+from sglang.srt.eplb.moe_bundle_trace import (
+    compact_layer_from_records,
+    load_compact_trace,
+    save_compact_trace,
 )
 
 
@@ -83,6 +89,49 @@ class _TensorTrace:
     source_rank: Any
     topk_experts: Any
     count: Any
+    ready_event: Any = None
+    host_buffers: tuple[Any, ...] = ()
+
+
+class _PinnedTracePool:
+    """Reuse two pinned host slots so H2D prefetch avoids allocator churn."""
+
+    def __init__(self, layers: Sequence[tuple[str, Any]]) -> None:
+        torch = _torch()
+        max_bundles = 0
+        topk_size = 0
+        for _, layer in layers:
+            source = layer["source_rank"]
+            topk = layer["topk_experts"]
+            count = layer["count"]
+            max_bundles = max(max_bundles, int(source.shape[0]), int(count.shape[0]))
+            topk_size = max(topk_size, int(topk.shape[1]))
+        # Two slots are enough for one layer being consumed and one being
+        # copied.  Use int64 once on the host so the CUDA path has no cast
+        # kernels after the asynchronous copy.
+        self._slots = [
+            (
+                torch.empty(max_bundles, dtype=torch.int64, pin_memory=True),
+                torch.empty(
+                    (max_bundles, topk_size), dtype=torch.int64, pin_memory=True
+                ),
+                torch.empty(max_bundles, dtype=torch.int64, pin_memory=True),
+            )
+            for _ in range(2)
+        ]
+
+    def stage(self, index: int, layer: Mapping[str, Any]) -> tuple[Any, Any, Any]:
+        source = layer["source_rank"]
+        topk = layer["topk_experts"]
+        count = layer["count"]
+        slot = self._slots[index % len(self._slots)]
+        source_dst = slot[0][: source.shape[0]]
+        topk_dst = slot[1][: topk.shape[0], : topk.shape[1]]
+        count_dst = slot[2][: count.shape[0]]
+        source_dst.copy_(source)
+        topk_dst.copy_(topk)
+        count_dst.copy_(count)
+        return source_dst, topk_dst, count_dst
 
 
 def _torch():
@@ -111,9 +160,96 @@ def _cuda_fast_planner_ops():
     )
 
 
-def _synchronize(device: str) -> None:
-    if device.startswith("cuda"):
-        _torch().cuda.synchronize(device)
+def _reshard_tensor_trace(
+    source_tensor: Any,
+    topk_tensor: Any,
+    count_tensor: Any,
+    source_ep: int,
+    target_ep: int,
+) -> _TensorTrace:
+    torch = _torch()
+    if source_ep == target_ep:
+        return _TensorTrace(source_tensor, topk_tensor, count_tensor)
+    if target_ep < source_ep or target_ep % source_ep:
+        raise ValueError("target EP must be a multiple of source EP")
+    fanout = target_ep // source_ep
+    offsets = torch.arange(fanout, device=source_tensor.device)
+    split_counts = count_tensor[:, None] // fanout + (
+        offsets[None, :] < (count_tensor % fanout)[:, None]
+    )
+    keep = split_counts > 0
+    return _TensorTrace(
+        (source_tensor[:, None] * fanout + offsets[None, :]).expand_as(split_counts)[
+            keep
+        ],
+        topk_tensor[:, None, :]
+        .expand(-1, fanout, -1)[keep]
+        .reshape(-1, topk_tensor.shape[1]),
+        split_counts[keep],
+    )
+
+
+def _enqueue_cuda_tensors(
+    source_cpu: Any,
+    topk_cpu: Any,
+    count_cpu: Any,
+    *,
+    device: str,
+    source_ep: int,
+    target_ep: int,
+    copy_stream: Any = None,
+) -> _TensorTrace:
+    torch = _torch()
+    source_host = source_cpu if source_cpu.is_pinned() else source_cpu.pin_memory()
+    topk_host = topk_cpu if topk_cpu.is_pinned() else topk_cpu.pin_memory()
+    count_host = count_cpu if count_cpu.is_pinned() else count_cpu.pin_memory()
+    stream = copy_stream or torch.cuda.current_stream(device)
+    with torch.cuda.device(torch.device(device)):
+        with torch.cuda.stream(stream):
+            source = source_host.to(device, non_blocking=True)
+            topk = topk_host.to(device, non_blocking=True)
+            count = count_host.to(device, non_blocking=True)
+            if source.dtype != torch.int64:
+                source = source.to(torch.int64)
+            if topk.dtype != torch.int64:
+                topk = topk.to(torch.int64)
+            if count.dtype != torch.int64:
+                count = count.to(torch.int64)
+            # Compact traces are sorted at save time, so no Top-K sort is
+            # needed on the hot path.
+            trace = _reshard_tensor_trace(source, topk, count, source_ep, target_ep)
+            ready_event = torch.cuda.Event()
+            ready_event.record(stream)
+    return _TensorTrace(
+        trace.source_rank,
+        trace.topk_experts,
+        trace.count,
+        ready_event,
+        (source_host, topk_host, count_host),
+    )
+
+
+def _wait_tensor_trace(trace: _TensorTrace) -> None:
+    if trace.ready_event is not None:
+        trace.ready_event.synchronize()
+
+
+def _load_input(path: str) -> tuple[Any, list[tuple[str, Any]], bool]:
+    input_path = Path(path)
+    if input_path.suffix.lower() in {".pt", ".pth"}:
+        compact = load_compact_trace(input_path)
+        raw = {
+            "num_ranks": compact["num_ranks"],
+            "top_k": compact["top_k"],
+            "format": compact["format"],
+        }
+        layers = [
+            (str(layer.get("gate", f"layer{index}")), layer)
+            for index, layer in enumerate(compact["layers"])
+        ]
+        return raw, layers, True
+    raw = orjson.loads(input_path.read_bytes())
+    return raw, _raw_layers(raw), False
 
 
 def _tensorize_entries(
@@ -151,40 +287,142 @@ def _tensorize_entries(
         topks.append(experts)
         counts.append(count)
 
-    source_tensor = torch.tensor(sources, dtype=torch.int64, device=device)
-    topk_tensor = torch.tensor(topks, dtype=torch.int64, device=device)
-    count_tensor = torch.tensor(counts, dtype=torch.int64, device=device)
+    source_cpu = torch.tensor(sources, dtype=torch.int64)
+    topk_cpu = torch.tensor(topks, dtype=torch.int64)
+    count_cpu = torch.tensor(counts, dtype=torch.int64)
     invalid = (
-        (source_tensor < 0).any()
-        | (source_tensor >= source_ep).any()
-        | (count_tensor < 1).any()
-        | (topk_tensor < 0).any()
+        (source_cpu < 0).any()
+        | (source_cpu >= source_ep).any()
+        | (count_cpu < 1).any()
+        | (topk_cpu < 0).any()
     )
-    sorted_topk = topk_tensor.sort(dim=1).values
-    duplicates = (sorted_topk[:, 1:] == sorted_topk[:, :-1]).any()
+    topk_cpu = topk_cpu.sort(dim=1).values
+    duplicates = (topk_cpu[:, 1:] == topk_cpu[:, :-1]).any()
     if bool(invalid.item()) or bool(duplicates.item()):
         raise ValueError(f"invalid source, count, or expert ids in {name}")
-    topk_tensor = sorted_topk
-    if source_ep == target_ep:
-        return _TensorTrace(source_tensor, topk_tensor, count_tensor)
-    if target_ep < source_ep or target_ep % source_ep:
-        raise ValueError("target EP must be a multiple of source EP")
+    if device.startswith("cuda"):
+        trace = _enqueue_cuda_tensors(
+            source_cpu,
+            topk_cpu,
+            count_cpu,
+            device=device,
+            source_ep=source_ep,
+            target_ep=target_ep,
+        )
+        _wait_tensor_trace(trace)
+        return trace
+    source_tensor, topk_tensor, count_tensor = (
+        source_cpu,
+        topk_cpu,
+        count_cpu,
+    )
+    return _reshard_tensor_trace(
+        source_tensor, topk_tensor, count_tensor, source_ep, target_ep
+    )
 
-    fanout = target_ep // source_ep
-    offsets = torch.arange(fanout, device=device)
-    split_counts = count_tensor[:, None] // fanout + (
-        offsets[None, :] < (count_tensor % fanout)[:, None]
+
+def _tensorize_compact_layer(
+    name: str,
+    layer: Mapping[str, Any],
+    *,
+    device: str,
+    source_ep: int,
+    target_ep: int,
+    copy_stream: Any = None,
+    host_pool: _PinnedTracePool | None = None,
+    pool_index: int = 0,
+) -> _TensorTrace:
+    torch = _torch()
+    source = layer.get("source_rank")
+    topk = layer.get("topk_experts")
+    count = layer.get("count")
+    if not all(isinstance(value, torch.Tensor) for value in (source, topk, count)):
+        raise ValueError(f"invalid compact tensors in {name}")
+    if source.ndim != 1 or topk.ndim != 2 or count.ndim != 1:
+        raise ValueError(f"invalid compact dimensions in {name}")
+    if source.shape[0] != topk.shape[0] or count.shape[0] != topk.shape[0]:
+        raise ValueError(f"compact tensor lengths disagree in {name}")
+    if int(source.min().item()) < 0 or int(source.max().item()) >= source_ep:
+        raise ValueError(f"invalid source ranks in compact layer {name}")
+    if int(count.min().item()) < 1:
+        raise ValueError(f"invalid bundle counts in compact layer {name}")
+    if device.startswith("cuda"):
+        if host_pool is not None:
+            source, topk, count = host_pool.stage(pool_index, layer)
+        return _enqueue_cuda_tensors(
+            source,
+            topk,
+            count,
+            device=device,
+            source_ep=source_ep,
+            target_ep=target_ep,
+            copy_stream=copy_stream,
+        )
+    return _reshard_tensor_trace(
+        source.to(torch.int64),
+        topk.to(torch.int64),
+        count.to(torch.int64),
+        source_ep,
+        target_ep,
     )
-    keep = split_counts > 0
-    return _TensorTrace(
-        (source_tensor[:, None] * fanout + offsets[None, :]).expand_as(split_counts)[
-            keep
-        ],
-        topk_tensor[:, None, :]
-        .expand(-1, fanout, -1)[keep]
-        .reshape(-1, topk_tensor.shape[1]),
-        split_counts[keep],
-    )
+
+
+def _tokens_from_compact_layer(
+    name: str, layer: Mapping[str, Any], source_ep: int, target_ep: int
+) -> list[RoutedToken]:
+    source = layer["source_rank"].tolist()
+    topk = layer["topk_experts"].tolist()
+    count = layer["count"].tolist()
+    tokens = [
+        RoutedToken(int(src), tuple(sorted(map(int, experts))), int(weight))
+        for src, experts, weight in zip(source, topk, count)
+    ]
+    return _reshard_tokens(tokens, source_ep, target_ep)
+
+
+def _prefetched_layers(
+    layers: Sequence[tuple[str, Any]],
+    *,
+    compact_input: bool,
+    device: str,
+    source_ep: int,
+    target_ep: int,
+) -> Iterable[tuple[str, Any, _TensorTrace | None, float]]:
+    if not compact_input or not device.startswith("cuda"):
+        for name, entries in layers:
+            yield name, entries, None, 0.0
+        return
+
+    torch = _torch()
+    copy_stream = torch.cuda.Stream(device=device)
+    host_pool = _PinnedTracePool(layers)
+
+    def submit(executor: ThreadPoolExecutor, index: int) -> Future[_TensorTrace]:
+        name, layer = layers[index]
+        return executor.submit(
+            _tensorize_compact_layer,
+            name,
+            layer,
+            device=device,
+            source_ep=source_ep,
+            target_ep=target_ep,
+            copy_stream=copy_stream,
+            host_pool=host_pool,
+            pool_index=index,
+        )
+
+    with ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="moe-trace-prefetch"
+    ) as executor:
+        future = submit(executor, 0)
+        for index, (name, layer) in enumerate(layers):
+            wait_start = time.perf_counter()
+            trace = future.result()
+            _wait_tensor_trace(trace)
+            wait_seconds = time.perf_counter() - wait_start
+            if index + 1 < len(layers):
+                future = submit(executor, index + 1)
+            yield name, layer, trace, wait_seconds
 
 
 def _build_graph_tensor(trace: _TensorTrace, *, chunk_size: int) -> CoRoutingGraph:
@@ -358,8 +596,25 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--planner cuda-fast requires --device cuda")
     cuda_fast_ops = _cuda_fast_planner_ops() if args.planner == "cuda-fast" else None
     input_start = time.perf_counter()
-    raw = orjson.loads(Path(args.input).read_bytes())
-    layers = _raw_layers(raw)
+    raw, layers, compact_input = _load_input(args.input)
+    if args.compact_output:
+        if compact_input:
+            raise ValueError("--compact-output is only valid when --input is JSON")
+        compact_layers = [
+            compact_layer_from_records(name, entries) for name, entries in layers
+        ]
+        top_k = raw.get("top_k") if isinstance(raw, dict) else None
+        if top_k is None:
+            top_k = compact_layers[0]["topk_experts"].shape[1]
+        source_ranks = raw.get("num_ranks") if isinstance(raw, dict) else None
+        save_compact_trace(
+            args.compact_output,
+            num_ranks=source_ranks or args.source_ep or args.num_ranks,
+            top_k=top_k,
+            layers=compact_layers,
+        )
+        layers = [(layer["gate"], layer) for layer in compact_layers]
+        compact_input = True
     input_load_seconds = time.perf_counter() - input_start
     trace_ep = args.source_ep
     if trace_ep is None and isinstance(raw, dict):
@@ -370,13 +625,36 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if trace_ep < 1:
         raise ValueError("source EP must be positive")
     output_layers = []
-    for name, entries in layers:
+    prepared_layers = _prefetched_layers(
+        layers,
+        compact_input=compact_input,
+        device=args.device,
+        source_ep=trace_ep,
+        target_ep=args.num_ranks,
+    )
+    for name, entries, prefetched_trace, prefetch_wait_seconds in prepared_layers:
         layer_start = time.perf_counter()
         prepare_start = time.perf_counter()
         tensorize_start = time.perf_counter()
         tokens = None
         tensor_trace = None
-        if use_tensor_backend:
+        if prefetched_trace is not None:
+            tensor_trace = prefetched_trace
+            tensorize_seconds = prefetch_wait_seconds
+        elif compact_input and use_tensor_backend:
+            tensor_trace = _tensorize_compact_layer(
+                name,
+                entries,
+                device=args.device,
+                source_ep=trace_ep,
+                target_ep=args.num_ranks,
+            )
+            _wait_tensor_trace(tensor_trace)
+            tensorize_seconds = time.perf_counter() - tensorize_start
+        elif compact_input:
+            tokens = _tokens_from_compact_layer(name, entries, trace_ep, args.num_ranks)
+            tensorize_seconds = time.perf_counter() - tensorize_start
+        elif use_tensor_backend:
             tensor_trace = _tensorize_entries(
                 name,
                 entries,
@@ -384,12 +662,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 source_ep=trace_ep,
                 target_ep=args.num_ranks,
             )
-            _synchronize(args.device)
+            tensorize_seconds = time.perf_counter() - tensorize_start
         else:
             tokens = _reshard_tokens(
                 _tokens_from_entries(name, entries), trace_ep, args.num_ranks
             )
-        tensorize_seconds = time.perf_counter() - tensorize_start
+            tensorize_seconds = time.perf_counter() - tensorize_start
         graph_build_start = time.perf_counter()
         cuda_graph = None
         if tensor_trace is not None:
@@ -398,19 +676,24 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 cuda_graph = build_cuda_graph(
                     tensor_trace.topk_experts, tensor_trace.count
                 )
-                graph = cuda_graph.to_cpu_graph()
+                graph_experts, graph_demand, graph_edge_count = cuda_graph.cpu_summary()
             else:
                 graph = _build_graph_tensor(
                     tensor_trace, chunk_size=args.tensor_chunk_size
                 )
-            _synchronize(args.device)
+                graph_experts = graph.experts
+                graph_demand = graph.demand
+                graph_edge_count = len(graph.edges)
         else:
             graph = build_co_routing_graph(tokens)
+            graph_experts = graph.experts
+            graph_demand = graph.demand
+            graph_edge_count = len(graph.edges)
         graph_build_seconds = time.perf_counter() - graph_build_start
         prepare_seconds = time.perf_counter() - prepare_start
         capacity = args.slots_per_rank
         if capacity is None:
-            capacity = (len(graph.experts) + args.num_ranks - 1) // args.num_ranks
+            capacity = (len(graph_experts) + args.num_ranks - 1) // args.num_ranks
         solver = CoRoutingGraphSolver(
             num_ranks=args.num_ranks,
             slots_per_rank=capacity,
@@ -426,18 +709,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 slots_per_rank=capacity,
                 max_rounds=args.max_rounds,
                 balance_weight=args.balance_weight,
-                cpu_graph=graph,
             )
-            _synchronize(args.device)
         else:
             placement = solver.solve(graph)
         graph_solve_seconds = time.perf_counter() - graph_start
-        baseline_homes = _baseline_homes(graph.experts, args.num_ranks, args.baseline)
+        baseline_homes = _baseline_homes(graph_experts, args.num_ranks, args.baseline)
         baseline_compute_load = _compute_loads(
-            graph.demand, baseline_homes, args.num_ranks
+            graph_demand, baseline_homes, args.num_ranks
         )
         graph_compute_load = _compute_loads(
-            graph.demand, placement.rank_by_expert, args.num_ranks
+            graph_demand, placement.rank_by_expert, args.num_ranks
         )
         primary_replay_start = time.perf_counter()
         if tensor_trace is not None:
@@ -446,7 +727,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 [baseline_homes, placement.rank_by_expert],
                 chunk_size=args.tensor_chunk_size,
             )
-            _synchronize(args.device)
         else:
             baseline_remote = evaluate_primary_remote(tokens, baseline_homes)
             graph_remote = evaluate_primary_remote(tokens, placement.rank_by_expert)
@@ -538,8 +818,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "gate": name,
                 "tokens": token_count,
                 "bundles": bundle_count,
-                "experts": len(graph.experts),
-                "edges": len(graph.edges),
+                "experts": len(graph_experts),
+                "edges": graph_edge_count,
                 "baseline_remote": baseline_remote,
                 "graph_remote": graph_remote,
                 "planned_remote": planned_remote,
@@ -579,6 +859,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "baseline": args.baseline,
         "planner": args.planner,
         "device": args.device,
+        "input_format": "compact" if compact_input else "json",
         "input_load_seconds": input_load_seconds,
         "total_wall_seconds": time.perf_counter() - run_start,
         "layers": output_layers,
@@ -587,7 +868,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", required=True, help="offline bundle JSON")
+    parser.add_argument(
+        "--input", required=True, help="offline bundle JSON or compact .pt trace"
+    )
+    parser.add_argument(
+        "--compact-output",
+        default=None,
+        help=(
+            "when input is JSON, also save a mmap-compatible compact .pt trace "
+            "and use it for this run"
+        ),
+    )
     parser.add_argument("--num-ranks", type=int, required=True)
     parser.add_argument(
         "--source-ep",
@@ -713,6 +1004,7 @@ def main() -> None:
     print("Co-routing graph placement replay")
     print(
         f"device={result['device']} planner={result['planner']} "
+        f"input={result['input_format']} "
         f"input_load={result['input_load_seconds']:.3f}s"
     )
     print(_format_table(rows))
