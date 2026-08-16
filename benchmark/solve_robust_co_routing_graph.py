@@ -17,7 +17,7 @@ Example::
         --input traces/xsum.pt \
         --num-ranks 32 --device cuda \
         --robust-rounds 8 --swaps-per-round 2 \
-        --max-compute-inflation 1.2 \
+        --no-compute-limit \
         --save-placement traces/robust.json
 """
 
@@ -612,11 +612,16 @@ def _print_result(result: Mapping[str, Any], args: argparse.Namespace) -> None:
             ]
         )
     print("Robust multi-dataset hypergraph placement")
+    compute_cap = (
+        "disabled"
+        if result["max_compute_inflation"] is None
+        else f"{result['max_compute_inflation']:.2f}x"
+    )
     print(
         f"datasets={len(result['inputs'])} device={result['device']} "
         f"normalizer={result['robust_normalizer']} "
         f"worst_weight={result['robust_worst_weight']} "
-        f"compute_cap={result['max_compute_inflation'] or '-'}"
+        f"compute_cap={compute_cap}"
     )
     print(_format_table(rows))
 
@@ -717,6 +722,11 @@ def main() -> None:
         help="prefer placements whose max/avg is at most this times baseline",
     )
     parser.add_argument(
+        "--no-compute-limit",
+        action="store_true",
+        help="optimize robust communication without a compute imbalance limit",
+    )
+    parser.add_argument(
         "--baseline", choices=["round-robin", "contiguous"], default="round-robin"
     )
     parser.add_argument("--save-placement", default=None)
@@ -743,6 +753,10 @@ def main() -> None:
         parser.error("--robust-reweight-rate must be non-negative")
     if args.max_compute_inflation is not None and args.max_compute_inflation < 1:
         parser.error("--max-compute-inflation must be at least 1")
+    if args.no_compute_limit and args.max_compute_inflation is not None:
+        parser.error("--no-compute-limit conflicts with --max-compute-inflation")
+    if args.no_compute_limit:
+        args.max_compute_inflation = None
     result = run(args)
     if args.save_placement:
         _save_placements(args.save_placement, result)
