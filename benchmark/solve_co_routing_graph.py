@@ -13,6 +13,26 @@ Example::
     python benchmark/solve_co_routing_graph.py \
         --input bundles.json --num-ranks 8 --slots-per-rank 32 \
         --device cuda --planner cuda-fast
+
+Cross-dataset transfer replay::
+
+    # Solve on dataset A.
+    python benchmark/solve_co_routing_graph.py \
+        --input dataset_a.pt --num-ranks 8 --placement-mode hybrid \
+        --device cuda --planner cuda-fast \
+        --save-placement dataset_a_placement.json
+
+    # Solve dataset B once as the in-domain reference.
+    python benchmark/solve_co_routing_graph.py \
+        --input dataset_b.pt --num-ranks 8 --placement-mode hybrid \
+        --device cuda --planner cuda-fast \
+        --save-placement dataset_b_oracle.json
+
+    # Freeze A's placement while replaying dataset B, without solving again.
+    python benchmark/solve_co_routing_graph.py \
+        --input dataset_b.pt --num-ranks 8 --device cuda \
+        --load-placement dataset_a_placement.json \
+        --oracle-placement dataset_b_oracle.json --replay-only
 """
 
 from __future__ import annotations
@@ -259,6 +279,89 @@ def _load_input(path: str) -> tuple[Any, list[tuple[str, Any]], bool]:
         return raw, layers, True
     raw = orjson.loads(input_path.read_bytes())
     return raw, _raw_layers(raw), False
+
+
+def _load_placements(path: str | None) -> Mapping[str, Any]:
+    if path is None:
+        return {}
+    raw = orjson.loads(Path(path).read_bytes())
+    if not isinstance(raw, dict) or not raw:
+        raise ValueError(f"placement file must contain a non-empty object: {path}")
+    if isinstance(raw.get("layers"), list):
+        converted = {}
+        for index, layer in enumerate(raw["layers"]):
+            if not isinstance(layer, dict):
+                raise ValueError(f"placement {path} has invalid layers[{index}]")
+            gate = str(layer.get("gate", f"layer{index}"))
+            rank_map = layer.get("rank_by_expert")
+            if rank_map is None and isinstance(layer.get("experts_by_rank"), dict):
+                rank_map = {
+                    str(expert): int(rank)
+                    for rank, experts in layer["experts_by_rank"].items()
+                    for expert in experts
+                }
+            if not isinstance(rank_map, dict):
+                raise ValueError(f"placement {path} has no rank map for {gate!r}")
+            converted[gate] = rank_map
+        raw = converted
+    return raw
+
+
+def _placement_for_layer(
+    placements: Mapping[str, Any],
+    *,
+    path: str,
+    gate: str,
+    layer: int,
+    observed_experts: Sequence[int],
+    num_ranks: int,
+) -> dict[int, int]:
+    is_global = all(isinstance(value, int) for value in placements.values())
+    candidate = placements if is_global else placements.get(gate)
+    if candidate is None and not is_global:
+        candidate = placements.get(str(layer), placements.get(f"layer{layer}"))
+    if not isinstance(candidate, dict):
+        raise ValueError(
+            f"placement {path} has no mapping for gate {gate!r} (layer {layer})"
+        )
+
+    result = {}
+    for expert in observed_experts:
+        value = candidate.get(str(expert), candidate.get(expert))
+        if not isinstance(value, int) or not 0 <= value < num_ranks:
+            raise ValueError(
+                f"placement {path} has no valid rank for expert {expert} "
+                f"in gate {gate!r}"
+            )
+        result[expert] = value
+    return result
+
+
+def _graph_placement_from_rank_map(
+    rank_by_expert: Mapping[int, int], num_ranks: int
+) -> GraphPlacement:
+    experts_by_rank = {
+        rank: tuple(
+            sorted(
+                expert
+                for expert, expert_rank in rank_by_expert.items()
+                if expert_rank == rank
+            )
+        )
+        for rank in range(num_ranks)
+    }
+    return GraphPlacement(dict(rank_by_expert), experts_by_rank, 0.0, 0.0, 0)
+
+
+def _save_placements(path: str, result: Mapping[str, Any]) -> None:
+    payload = {
+        layer["gate"]: {
+            str(expert): rank
+            for expert, rank in sorted(layer["rank_by_expert"].items())
+        }
+        for layer in result["layers"]
+    }
+    Path(path).write_bytes(orjson.dumps(payload, option=orjson.OPT_INDENT_2))
 
 
 def _tensorize_entries(
@@ -697,6 +800,9 @@ def _reshard_tokens(
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
     run_start = time.perf_counter()
+    replay_only = getattr(args, "replay_only", False)
+    load_placement = getattr(args, "load_placement", None)
+    oracle_placement = getattr(args, "oracle_placement", None)
     use_tensor_backend = args.device != "cpu"
     if use_tensor_backend:
         torch = _torch()
@@ -704,11 +810,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             raise ValueError("--device must be cpu, cuda, or cuda:<index>")
         if not torch.cuda.is_available():
             raise RuntimeError(f"CUDA is not available for --device {args.device}")
-    if args.planner == "cuda-fast" and not use_tensor_backend:
+    if args.planner == "cuda-fast" and not use_tensor_backend and not replay_only:
         raise ValueError("--planner cuda-fast requires --device cuda")
-    cuda_fast_ops = _cuda_fast_planner_ops() if args.planner == "cuda-fast" else None
+    cuda_fast_ops = (
+        _cuda_fast_planner_ops()
+        if args.planner == "cuda-fast" and not replay_only
+        else None
+    )
     input_start = time.perf_counter()
     raw, layers, compact_input = _load_input(args.input)
+    transfer_placements = _load_placements(load_placement)
+    oracle_placements = _load_placements(oracle_placement)
     if args.compact_output:
         if compact_input:
             raise ValueError("--compact-output is only valid when --input is JSON")
@@ -737,8 +849,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if trace_ep < 1:
         raise ValueError("source EP must be positive")
     round_limit = None if args.until_convergence else args.max_rounds
-    pairwise_enabled = args.placement_mode in {"pairwise", "hybrid"}
-    hypergraph_enabled = args.placement_mode in {"hypergraph", "hybrid"}
+    pairwise_enabled = not replay_only and args.placement_mode in {"pairwise", "hybrid"}
+    hypergraph_enabled = not replay_only and args.placement_mode in {
+        "hypergraph",
+        "hybrid",
+    }
     hypergraph_limit = (
         None if args.hypergraph_until_convergence else args.hypergraph_rounds
     )
@@ -835,7 +950,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             capacity = (len(graph_experts) + args.num_ranks - 1) // args.num_ranks
 
         graph_solve_seconds = 0.0
-        if pairwise_enabled:
+        if replay_only:
+            transfer_map = _placement_for_layer(
+                transfer_placements,
+                path=load_placement,
+                gate=name,
+                layer=_layer_number(name, layer_position),
+                observed_experts=graph_experts,
+                num_ranks=args.num_ranks,
+            )
+            placement = _graph_placement_from_rank_map(transfer_map, args.num_ranks)
+            initial_cut = None
+            final_cut = None
+            graph_iterations = 0
+        elif pairwise_enabled:
             solver = CoRoutingGraphSolver(
                 num_ranks=args.num_ranks,
                 slots_per_rank=capacity,
@@ -876,19 +1004,42 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         seed_compute_load = _compute_loads(
             graph_demand, placement.rank_by_expert, args.num_ranks
         )
+        oracle_map = None
+        oracle_compute_load = None
+        if replay_only and oracle_placements:
+            oracle_map = _placement_for_layer(
+                oracle_placements,
+                path=oracle_placement,
+                gate=name,
+                layer=_layer_number(name, layer_position),
+                observed_experts=graph_experts,
+                num_ranks=args.num_ranks,
+            )
+            oracle_compute_load = _compute_loads(
+                graph_demand, oracle_map, args.num_ranks
+            )
         primary_replay_start = time.perf_counter()
+        replay_placements = [baseline_homes, placement.rank_by_expert]
+        if oracle_map is not None:
+            replay_placements.append(oracle_map)
         if tensor_trace is not None:
-            baseline_remote, seed_remote = _evaluate_primary_remote_tensor(
+            replay_values = _evaluate_primary_remote_tensor(
                 tensor_trace,
-                [baseline_homes, placement.rank_by_expert],
+                replay_placements,
                 chunk_size=args.tensor_chunk_size,
             )
         else:
-            baseline_remote = evaluate_primary_remote(tokens, baseline_homes)
-            seed_remote = evaluate_primary_remote(tokens, placement.rank_by_expert)
+            replay_values = [
+                evaluate_primary_remote(tokens, candidate)
+                for candidate in replay_placements
+            ]
+        baseline_remote, seed_remote = replay_values[:2]
+        oracle_remote = replay_values[2] if oracle_map is not None else None
         primary_replay_seconds = time.perf_counter() - primary_replay_start
         graph_remote = seed_remote if pairwise_enabled else None
         graph_compute_load = seed_compute_load if pairwise_enabled else None
+        fixed_remote = seed_remote if replay_only else None
+        fixed_compute_load = seed_compute_load if replay_only else None
         final_placement = placement
         hypergraph_remote = None
         hypergraph_iterations = 0
@@ -1060,14 +1211,28 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "experts": len(graph_experts),
                 "edges": graph_edge_count,
                 "baseline_remote": baseline_remote,
+                "transfer_remote": fixed_remote,
+                "oracle_remote": oracle_remote,
                 "graph_remote": graph_remote,
                 "hypergraph_seed_remote": seed_remote if hypergraph_enabled else None,
                 "hypergraph_remote": hypergraph_remote,
                 "replica_remote": replica_remote,
                 "baseline_compute_load": baseline_compute_load,
+                "transfer_compute_load": fixed_compute_load,
+                "oracle_compute_load": oracle_compute_load,
                 "graph_compute_load": graph_compute_load,
                 "hypergraph_compute_load": hypergraph_compute_load,
                 "baseline_compute_imbalance": _max_over_average(baseline_compute_load),
+                "transfer_compute_imbalance": (
+                    _max_over_average(fixed_compute_load)
+                    if fixed_compute_load is not None
+                    else None
+                ),
+                "oracle_compute_imbalance": (
+                    _max_over_average(oracle_compute_load)
+                    if oracle_compute_load is not None
+                    else None
+                ),
                 "graph_compute_imbalance": (
                     _max_over_average(graph_compute_load)
                     if graph_compute_load is not None
@@ -1087,6 +1252,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "replica_delta": (replica_remote / baseline_remote - 1.0)
                 if baseline_remote
                 else 0.0,
+                "transfer_delta": (fixed_remote / baseline_remote - 1.0)
+                if baseline_remote and fixed_remote is not None
+                else None,
+                "oracle_regret": (fixed_remote / oracle_remote - 1.0)
+                if fixed_remote is not None and oracle_remote
+                else None,
+                "retained_gain": (
+                    (baseline_remote - fixed_remote) / (baseline_remote - oracle_remote)
+                )
+                if fixed_remote is not None
+                and oracle_remote is not None
+                and baseline_remote > oracle_remote
+                else None,
+                "oracle_remote_gap": (fixed_remote - oracle_remote)
+                if fixed_remote is not None and oracle_remote is not None
+                else None,
                 "initial_cut": initial_cut,
                 "final_cut": final_cut,
                 "iterations": graph_iterations,
@@ -1111,6 +1292,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     str(rank): list(experts)
                     for rank, experts in final_placement.experts_by_rank.items()
                 },
+                "rank_by_expert": dict(final_placement.rank_by_expert),
             }
         )
     return {
@@ -1119,6 +1301,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "baseline": args.baseline,
         "planner": args.planner,
         "placement_mode": args.placement_mode,
+        "replay_only": replay_only,
+        "loaded_placement": load_placement,
+        "oracle_placement": oracle_placement,
         "device": args.device,
         "round_limit": round_limit,
         "hypergraph_round_limit": (
@@ -1144,10 +1329,115 @@ def _optional_seconds(value: float | None) -> str:
     return "-" if value is None else f"{value:.3f}s"
 
 
+def _print_replay_result(result: Mapping[str, Any], args: argparse.Namespace) -> None:
+    rows = [
+        [
+            "layer",
+            "tokens",
+            "bundles",
+            "baseline",
+            "transfer",
+            "oracle",
+            "transfer_delta",
+            "oracle_regret",
+            "retained",
+            "comp",
+            "replay",
+        ]
+    ]
+    for layer in result["layers"]:
+        compute_values = [
+            layer["baseline_compute_imbalance"],
+            layer["transfer_compute_imbalance"],
+        ]
+        if layer["oracle_compute_imbalance"] is not None:
+            compute_values.append(layer["oracle_compute_imbalance"])
+        rows.append(
+            [
+                str(layer["layer"]),
+                str(layer["tokens"]),
+                str(layer["bundles"]),
+                str(layer["baseline_remote"]),
+                str(layer["transfer_remote"]),
+                _optional_text(layer["oracle_remote"]),
+                _optional_percent(layer["transfer_delta"]),
+                _optional_percent(layer["oracle_regret"]),
+                (
+                    f"{layer['retained_gain']:.1%}"
+                    if layer["retained_gain"] is not None
+                    else "-"
+                ),
+                "->".join(f"{value:.2f}" for value in compute_values),
+                f"{layer['primary_replay_seconds']:.3f}s",
+            ]
+        )
+
+    baseline_total = sum(layer["baseline_remote"] for layer in result["layers"])
+    transfer_total = sum(layer["transfer_remote"] for layer in result["layers"])
+    oracle_available = all(
+        layer["oracle_remote"] is not None for layer in result["layers"]
+    )
+    oracle_total = (
+        sum(layer["oracle_remote"] for layer in result["layers"])
+        if oracle_available
+        else None
+    )
+    transfer_delta = transfer_total / baseline_total - 1.0 if baseline_total else 0.0
+    oracle_regret = transfer_total / oracle_total - 1.0 if oracle_total else None
+    retained_gain = (
+        (baseline_total - transfer_total) / (baseline_total - oracle_total)
+        if oracle_total is not None and baseline_total > oracle_total
+        else None
+    )
+
+    print("Frozen placement transfer replay")
+    print(
+        f"device={result['device']} placement={result['loaded_placement']} "
+        f"oracle={result['oracle_placement'] or '-'} "
+        f"input={result['input_format']} "
+        f"input_load={result['input_load_seconds']:.3f}s"
+    )
+    print(_format_table(rows))
+    print(
+        f"total baseline={baseline_total} transfer={transfer_total} "
+        f"oracle={oracle_total if oracle_total is not None else '-'} "
+        f"transfer_delta={transfer_delta:+.1%} "
+        f"oracle_regret={_optional_percent(oracle_regret)} "
+        "retained_gain="
+        f"{f'{retained_gain:.1%}' if retained_gain is not None else '-'} "
+        f"wall={result['total_wall_seconds']:.3f}s"
+    )
+    if getattr(args, "show_placement", False):
+        for layer in result["layers"]:
+            print(f"\n{layer['gate']} experts_by_rank")
+            for rank, experts in layer["experts_by_rank"].items():
+                print(f"  rank {rank}: {experts}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--input", required=True, help="offline bundle JSON or compact .pt trace"
+    )
+    parser.add_argument(
+        "--save-placement",
+        default=None,
+        help="save the solved per-gate primary placement as JSON",
+    )
+    parser.add_argument(
+        "--load-placement",
+        default=None,
+        help="load a frozen per-gate primary placement for replay-only evaluation",
+    )
+    parser.add_argument(
+        "--oracle-placement",
+        default=None,
+        help="optional target-dataset oracle placement for transfer regret metrics",
+    )
+    parser.add_argument(
+        "--replay-only",
+        action="store_true",
+        help="evaluate --load-placement without running any placement solver",
     )
     parser.add_argument(
         "--compact-output",
@@ -1290,9 +1580,24 @@ def main() -> None:
         parser.error("--hypergraph-restarts must be positive")
     if args.hypergraph_kick_swaps < 0:
         parser.error("--hypergraph-kick-swaps must be non-negative")
+    if args.replay_only and args.load_placement is None:
+        parser.error("--replay-only requires --load-placement")
+    if args.load_placement is not None and not args.replay_only:
+        parser.error("--load-placement requires --replay-only")
+    if args.oracle_placement is not None and not args.replay_only:
+        parser.error("--oracle-placement requires --replay-only")
+    if args.replay_only and args.replica_slots_per_rank:
+        parser.error("--replay-only does not run replica planning")
     result = run(args)
+    if args.save_placement:
+        _save_placements(args.save_placement, result)
     if args.json:
         print(json.dumps(result, indent=2))
+        return
+    if args.replay_only:
+        _print_replay_result(result, args)
+        if args.save_placement:
+            print(f"saved placement={args.save_placement}")
         return
     rows = [
         [
@@ -1439,6 +1744,8 @@ def main() -> None:
                         f"  {action['kind']}: experts={action['experts']} "
                         f"-> rank {action['destination_rank']}"
                     )
+    if args.save_placement:
+        print(f"saved placement={args.save_placement}")
 
 
 if __name__ == "__main__":
