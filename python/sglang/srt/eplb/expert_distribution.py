@@ -863,6 +863,7 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
     def dump(self, output_mode: _OutputMode):
         assert output_mode == "file"
         output = dict(
+            rank=self._rank,
             records=self._records,
             # NOTE: This may change during recording, so here we say it is the "last" one
             last_physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,

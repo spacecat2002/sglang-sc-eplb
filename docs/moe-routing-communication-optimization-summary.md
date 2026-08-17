@@ -41,19 +41,40 @@ GRACE-MoE 允许不同 GPU 保存不同数量的专家，因此可能降低通�
 
 ## 运行
 
+真实 SGLang 离线采集（单机 8 卡 NVLink/NVSwitch）：
+
+```bash
+PYTHONPATH=python python benchmark/benchmark_ep_trace.py \
+  --model Qwen/Qwen3-30B-A3B \
+  --tp-size 8 \
+  --ep-size 8 \
+  --moe-a2a-backend deepep \
+  --dataset sharegpt \
+  --num-samples 128 \
+  --batch-size 8 \
+  --max-new-tokens 1 \
+  --output /tmp/qwen3_ep8_trace.pt
+```
+
+再比较 Pairwise 与 GRACE。单机全部使用 NVLink/NVSwitch，因此 `ranks-per-node=8`、`rdma-cost=1`：
+
 ```bash
 PYTHONPATH=python python benchmark/compare_pairwise_grace.py \
-  --input trace.pt \
+  --input /tmp/qwen3_ep8_trace.pt \
   --num-ranks 8 \
-  --ranks-per-node 4 \
+  --ranks-per-node 8 \
+  --rdma-cost 1 \
   --pairwise-candidates 32 \
   --pairwise-max-imbalance 1.2
 ```
+
+采集脚本会强制使用 `per_token` recorder，并关闭 CUDA graph 和 overlap schedule。source rank 直接取真实 SGLang worker 的 `moe_ep_rank`，不再模拟 prompt/token round-robin。
 
 运行定向测试：
 
 ```bash
 PYTHONPATH=python python -m pytest -q \
+  test/registered/unit/eplb/test_moe_bundle_trace.py \
   test/registered/unit/eplb/test_pairwise_grace_placement.py
 ```
 
@@ -61,9 +82,10 @@ PYTHONPATH=python python -m pytest -q \
 
 ```bash
 PYTHONPATH=python python benchmark/compare_pairwise_grace.py \
-  --input trace.pt \
+  --input /tmp/qwen3_ep8_trace.pt \
   --num-ranks 8 \
-  --ranks-per-node 4 \
+  --ranks-per-node 8 \
+  --rdma-cost 1 \
   --save-pairwise pairwise.json \
   --save-grace grace.json
 ```
@@ -73,6 +95,9 @@ PYTHONPATH=python python benchmark/compare_pairwise_grace.py \
 ```text
 python/sglang/srt/eplb/co_routing_graph_solver.py
 python/sglang/srt/eplb/grace_expert_placement.py
+python/sglang/srt/eplb/moe_bundle_trace.py
+benchmark/benchmark_ep_trace.py
 benchmark/compare_pairwise_grace.py
+test/registered/unit/eplb/test_moe_bundle_trace.py
 test/registered/unit/eplb/test_pairwise_grace_placement.py
 ```

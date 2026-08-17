@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence, Tuple
 
@@ -110,6 +111,80 @@ def compact_layer_from_records(
         "topk_experts": topk_tensor,
         "count": torch.tensor(counts, dtype=_compact_signed_dtype(max(counts))),
     }
+
+
+def compact_layers_from_recorder_packs(
+    packs: Sequence[Mapping[str, Any]], *, num_ranks: int
+) -> tuple[int, list[dict[str, Any]]]:
+    """Convert real SGLang ``per_token`` recorder dumps to compact layers."""
+
+    if num_ranks < 1:
+        raise ValueError("num_ranks must be positive")
+    bundles_by_layer = defaultdict(Counter)
+    seen_ranks = set()
+    top_k = None
+    for pack_index, pack in enumerate(packs):
+        records = pack.get("records")
+        if not isinstance(records, list):
+            raise ValueError(f"recorder pack {pack_index} is missing records")
+        rank = pack.get("rank", records[0].get("rank") if records else None)
+        if not isinstance(rank, int) or not 0 <= rank < num_ranks:
+            raise ValueError(f"recorder pack {pack_index} has invalid rank {rank!r}")
+        if rank in seen_ranks:
+            raise ValueError(f"duplicate recorder pack for rank {rank}")
+        seen_ranks.add(rank)
+        physical_to_logical = pack.get("last_physical_to_logical_map")
+        if (
+            not isinstance(physical_to_logical, torch.Tensor)
+            or physical_to_logical.ndim != 2
+        ):
+            raise ValueError(f"recorder pack {pack_index} has invalid expert map")
+        physical_to_logical = physical_to_logical.cpu().long()
+        for record in records:
+            if record.get("rank") != rank:
+                raise ValueError(f"recorder pack {pack_index} mixes ranks")
+            topk = record.get("topk_ids_of_layer")
+            if not isinstance(topk, torch.Tensor) or topk.ndim != 3:
+                raise ValueError(f"recorder pack {pack_index} has invalid Top-K data")
+            if topk.shape[0] != physical_to_logical.shape[0]:
+                raise ValueError(f"recorder pack {pack_index} layer count mismatch")
+            for layer_index, physical in enumerate(topk.cpu().long()):
+                valid_counts = (physical >= 0).sum(dim=1)
+                physical = physical[valid_counts > 0]
+                valid_counts = valid_counts[valid_counts > 0]
+                if not physical.numel():
+                    continue
+                widths = torch.unique(valid_counts)
+                if widths.numel() != 1:
+                    raise ValueError(f"layer {layer_index} has inconsistent Top-K")
+                width = int(widths.item())
+                if top_k is None:
+                    top_k = width
+                elif top_k != width:
+                    raise ValueError("recorder layers disagree on Top-K")
+                physical = physical[physical >= 0].reshape(-1, width)
+                if int(physical.max()) >= physical_to_logical.shape[1]:
+                    raise ValueError(f"layer {layer_index} has invalid physical expert")
+                logical = physical_to_logical[layer_index][physical].sort(dim=1).values
+                if int(logical.min()) < 0 or (
+                    width > 1 and bool((logical[:, 1:] == logical[:, :-1]).any())
+                ):
+                    raise ValueError(f"layer {layer_index} has invalid logical experts")
+                unique, counts = torch.unique(logical, dim=0, return_counts=True)
+                for experts, count in zip(unique.tolist(), counts.tolist()):
+                    bundles_by_layer[layer_index][(rank, tuple(experts))] += count
+    expected_ranks = set(range(num_ranks))
+    if seen_ranks != expected_ranks:
+        raise ValueError(
+            f"recorder ranks {sorted(seen_ranks)} != {sorted(expected_ranks)}"
+        )
+    if top_k is None:
+        raise ValueError("recorder dumps contain no routed tokens")
+    layers = [
+        compact_layer_from_bundles(f"model.layers.{layer}.gate", bundles)
+        for layer, bundles in sorted(bundles_by_layer.items())
+    ]
+    return top_k, layers
 
 
 def save_compact_trace(
