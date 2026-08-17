@@ -199,6 +199,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 congestion_weight=args.cable_congestion_weight,
                 load_weight=args.cable_load_weight,
                 refine_swaps=args.cable_refine_swaps,
+                refine_strategy=args.cable_refine_strategy,
+                remote_budget=args.cable_remote_budget,
+                capacity_ratio=args.cable_capacity_ratio,
+                compute_refine_moves=args.cable_compute_moves,
+                compute_imbalance_limit=args.cable_compute_limit,
             )
             if args.cable
             else None
@@ -337,6 +342,15 @@ def main() -> None:
     parser.add_argument("--cable-congestion-weight", type=float, default=0.25)
     parser.add_argument("--cable-load-weight", type=float, default=0.25)
     parser.add_argument("--cable-refine-swaps", type=int, default=2)
+    parser.add_argument(
+        "--cable-refine-strategy",
+        choices=("remote", "balanced"),
+        default="balanced",
+    )
+    parser.add_argument("--cable-remote-budget", type=float, default=0.03)
+    parser.add_argument("--cable-capacity-ratio", type=float, default=0.15)
+    parser.add_argument("--cable-compute-moves", type=int, default=2)
+    parser.add_argument("--cable-compute-limit", type=float, default=2.0)
     parser.add_argument("--save-grace")
     parser.add_argument("--save-cable")
     parser.add_argument("--json", action="store_true")
@@ -351,6 +365,10 @@ def main() -> None:
         or not 0 <= args.grace_ratio < 1
         or args.rdma_cost < 1
         or args.cable_refine_swaps < 0
+        or args.cable_compute_moves < 0
+        or not 0 <= args.cable_remote_budget <= 1
+        or not 0 <= args.cable_capacity_ratio < 1
+        or args.cable_compute_limit < 1
         or min(args.cable_congestion_weight, args.cable_load_weight) < 0
     ):
         parser.error("invalid placement parameters")

@@ -50,6 +50,8 @@ PYTHONPATH=python python benchmark/compare_grace.py \
 
 默认执行两轮受约束 remote-decreasing swap；只测最快的初始贪心时加上 `--cable-refine-swaps 0`。
 
+联合优化模式默认允许专家容量在理想值的 `+/-15%` 内变化，计算上限为 `2.0x` 平均负载，并允许最多 3% 的 remote 预算换取计算负载改善。通信优先实验可使用 `--cable-refine-strategy remote --cable-capacity-ratio 0`；计算优先实验可使用 `--cable-compute-limit 1.5` 或提高 `--cable-remote-budget`。
+
 `--optimizer-bundles 0` 表示使用完整 compact trace，但一千万 bundle 会明显变慢。`--rdma-cost 1` 适用于单机 NVLink/NVSwitch；`none` backend 仅用于采集路由，实际通信收益需要在 token A2A backend 下验证。
 
 ## 后续改进方向

@@ -32,11 +32,56 @@ def test_cable_remote_refinement_accepts_only_improving_swaps():
         RoutedToken(0, (5, 3)),
     ]
     greedy = cable_expert_placement(
-        tokens, experts=range(8), num_ranks=2, refine_swaps=0
+        tokens,
+        experts=range(8),
+        num_ranks=2,
+        refine_swaps=0,
+        refine_strategy="remote",
+        capacity_ratio=0,
+        compute_imbalance_limit=10,
     )
     refined = cable_expert_placement(
-        tokens, experts=range(8), num_ranks=2, refine_swaps=1
+        tokens,
+        experts=range(8),
+        num_ranks=2,
+        refine_swaps=1,
+        refine_strategy="remote",
+        capacity_ratio=0,
+        compute_imbalance_limit=10,
     )
 
     assert refined.metrics.remote < greedy.metrics.remote
     assert refined.metrics.compute_imbalance <= greedy.metrics.compute_imbalance
+
+
+def test_cable_joint_mode_spreads_hot_experts_within_remote_budget():
+    tokens = [
+        RoutedToken(0, (0, 1), 50),
+        RoutedToken(1, (2, 3)),
+        RoutedToken(1, (4, 5)),
+        RoutedToken(1, (6, 7)),
+    ]
+    communication_first = cable_expert_placement(
+        tokens,
+        experts=range(8),
+        num_ranks=2,
+        capacity_ratio=0,
+        compute_imbalance_limit=10,
+        compute_refine_moves=0,
+        refine_strategy="remote",
+    )
+    joint = cable_expert_placement(
+        tokens,
+        experts=range(8),
+        num_ranks=2,
+        capacity_ratio=0.5,
+        compute_imbalance_limit=1.5,
+        compute_refine_moves=4,
+        refine_strategy="balanced",
+        remote_budget=0.2,
+    )
+
+    assert joint.metrics.compute_imbalance < (
+        communication_first.metrics.compute_imbalance
+    )
+    assert joint.metrics.remote <= sum(token.count for token in tokens)

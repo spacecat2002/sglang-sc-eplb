@@ -32,7 +32,125 @@ class CablePlacement:
     objective: float
 
 
-def _refine_remote_swaps(
+def _refine_compute_moves(
+    *,
+    source: np.ndarray,
+    count: np.ndarray,
+    token_indexes: Sequence[np.ndarray],
+    bundle_rank_counts: np.ndarray,
+    ranks: np.ndarray,
+    demand: np.ndarray,
+    compute_load: np.ndarray,
+    slots_used: np.ndarray,
+    traffic: np.ndarray,
+    num_ranks: int,
+    minimum_capacity: int,
+    maximum_capacity: int,
+    rounds: int,
+    total_tokens: int,
+    compute_imbalance_limit: float,
+    remote_budget: float,
+) -> None:
+    """Move hot experts to cooler ranks within capacity and traffic budgets."""
+
+    if rounds < 1:
+        return
+    average_load = demand.sum() / num_ranks
+    load_limit = compute_imbalance_limit * average_load
+    remote_budget_tokens = int(total_tokens * remote_budget)
+    remote_delta_total = 0
+    expert_count = len(ranks)
+    for _ in range(rounds):
+        candidates = []
+        for expert in np.argsort(-demand, kind="stable"):
+            old_rank = ranks[expert]
+            if slots_used[old_rank] <= minimum_capacity:
+                continue
+            indexes = token_indexes[expert]
+            sources = source[indexes]
+            old_counts = bundle_rank_counts[indexes, old_rank]
+            remove = -count[indexes] * (
+                (old_counts == 1) & (sources != old_rank)
+            )
+            for target in range(num_ranks):
+                if target == old_rank or slots_used[target] >= maximum_capacity:
+                    continue
+                next_load = compute_load.copy()
+                next_load[old_rank] -= demand[expert]
+                next_load[target] += demand[expert]
+                if next_load.max() > max(load_limit, compute_load.max()):
+                    continue
+                add = count[indexes] * (
+                    (bundle_rank_counts[indexes, target] == 0)
+                    & (sources != target)
+                )
+                delta = int((remove + add).sum())
+                if remote_delta_total + delta > remote_budget_tokens:
+                    continue
+                old_squares = compute_load[old_rank] ** 2 + compute_load[target] ** 2
+                new_squares = next_load[old_rank] ** 2 + next_load[target] ** 2
+                load_gain = int(old_squares - new_squares)
+                if load_gain > 0:
+                    candidates.append((-load_gain, delta, int(expert), target))
+        candidates.sort()
+        changed = False
+        locked = np.zeros(expert_count, dtype=bool)
+        for _, _, expert, target in candidates:
+            if locked[expert] or ranks[expert] == target:
+                continue
+            old_rank = ranks[expert]
+            if slots_used[old_rank] <= minimum_capacity:
+                continue
+            if slots_used[target] >= maximum_capacity:
+                continue
+            indexes = token_indexes[expert]
+            sources = source[indexes]
+            old_counts = bundle_rank_counts[indexes, old_rank]
+            target_counts = bundle_rank_counts[indexes, target]
+            remove = -count[indexes] * (
+                (old_counts == 1) & (sources != old_rank)
+            )
+            add = count[indexes] * (
+                (target_counts == 0) & (sources != target)
+            )
+            delta = int((remove + add).sum())
+            if remote_delta_total + delta > remote_budget_tokens:
+                continue
+            next_old = compute_load[old_rank] - demand[expert]
+            next_target = compute_load[target] + demand[expert]
+            if max(next_old, next_target) > max(load_limit, compute_load.max()):
+                continue
+            if compute_load[old_rank] ** 2 + compute_load[target] ** 2 <= (
+                next_old**2 + next_target**2
+            ):
+                continue
+
+            traffic[:, old_rank] += np.bincount(
+                sources[remove != 0],
+                weights=remove[remove != 0]
+                * (sources[remove != 0] != old_rank),
+                minlength=num_ranks,
+            ).astype(np.int64)
+            traffic[:, target] += np.bincount(
+                sources[add != 0],
+                weights=add[add != 0] * (sources[add != 0] != target),
+                minlength=num_ranks,
+            ).astype(np.int64)
+            bundle_rank_counts[indexes, old_rank] -= 1
+            bundle_rank_counts[indexes, target] += 1
+            ranks[expert] = target
+            slots_used[old_rank] -= 1
+            slots_used[target] += 1
+            compute_load[old_rank] = next_old
+            compute_load[target] = next_target
+            remote_delta_total += delta
+            locked[expert] = True
+            changed = True
+        if not changed:
+            break
+
+
+def _refine_swaps(
     *,
     source: np.ndarray,
     topk: np.ndarray,
@@ -45,13 +163,20 @@ def _refine_remote_swaps(
     traffic: np.ndarray,
     num_ranks: int,
     rounds: int,
+    total_tokens: int,
+    strategy: str,
+    remote_budget: float,
     candidate_partners: int = 4,
 ) -> None:
-    """Apply bounded remote-decreasing swaps in-place."""
+    """Apply bounded remote- or load-improving swaps in-place."""
 
     if rounds < 1:
         return
+    if strategy not in {"remote", "balanced"}:
+        raise ValueError("strategy must be 'remote' or 'balanced'")
     expert_count = len(ranks)
+    remote_delta_total = 0
+    remote_budget_tokens = int(total_tokens * remote_budget)
     for _ in range(rounds):
         move_delta = np.zeros((expert_count, num_ranks), dtype=np.int64)
         for expert, indexes in enumerate(token_indexes):
@@ -80,6 +205,11 @@ def _refine_remote_swaps(
                 partners = sorted(
                     pool.tolist(),
                     key=lambda partner: (
+                        (
+                            demand[partner]
+                            if strategy == "balanced"
+                            else move_delta[partner, old_rank]
+                        ),
                         move_delta[partner, old_rank],
                         abs(int(demand[expert] - demand[partner])),
                         int(partner),
@@ -91,9 +221,13 @@ def _refine_remote_swaps(
                     estimate = int(
                         move_delta[expert, target] + move_delta[partner, old_rank]
                     )
-                    if estimate < 0:
+                    load_gain = int(demand[expert] - demand[partner])
+                    if estimate < 0 or (
+                        strategy == "balanced" and load_gain > 0
+                    ):
                         candidates.append(
                             (
+                                -load_gain if strategy == "balanced" else estimate,
                                 estimate,
                                 abs(int(demand[expert] - demand[partner])),
                                 int(expert),
@@ -105,13 +239,17 @@ def _refine_remote_swaps(
         candidates.sort()
         locked = np.zeros(expert_count, dtype=bool)
         changed = False
-        for _, _, left, right in candidates:
+        for _, _, _, left, right in candidates:
             if locked[left] or locked[right] or ranks[left] == ranks[right]:
                 continue
             left_rank, right_rank = ranks[left], ranks[right]
             next_left = compute_load[left_rank] + demand[right] - demand[left]
             next_right = compute_load[right_rank] + demand[left] - demand[right]
-            if max(next_left, next_right) > compute_load.max():
+            next_load = compute_load.copy()
+            next_load[left_rank] = next_left
+            next_load[right_rank] = next_right
+            load_improves = next_load.max() < compute_load.max()
+            if next_load.max() > compute_load.max():
                 continue
 
             indexes = np.union1d(token_indexes[left], token_indexes[right])
@@ -138,7 +276,13 @@ def _refine_remote_swaps(
                     )
                 ).sum()
             )
-            if delta >= 0:
+            remote_improves = delta < 0
+            budget_allows = remote_delta_total + delta <= remote_budget_tokens
+            if strategy == "remote":
+                accept = remote_improves
+            else:
+                accept = remote_improves or (load_improves and budget_allows)
+            if not accept:
                 continue
 
             # Only two destination columns change, so update the traffic matrix
@@ -164,6 +308,7 @@ def _refine_remote_swaps(
             ranks[left], ranks[right] = right_rank, left_rank
             compute_load[left_rank] = next_left
             compute_load[right_rank] = next_right
+            remote_delta_total += delta
             locked[left] = locked[right] = True
             changed = True
         if not changed:
@@ -233,6 +378,11 @@ def cable_expert_placement(
     congestion_weight: float = 0.25,
     load_weight: float = 0.25,
     refine_swaps: int = 2,
+    refine_strategy: str = "balanced",
+    remote_budget: float = 0.03,
+    capacity_ratio: float = 0.15,
+    compute_refine_moves: int = 2,
+    compute_imbalance_limit: float = 2.0,
 ) -> CablePlacement:
     """Greedily place experts using exact incremental bundle traffic."""
 
@@ -245,6 +395,14 @@ def cable_expert_placement(
         raise ValueError("objective weights must be non-negative")
     if refine_swaps < 0:
         raise ValueError("refine_swaps must be non-negative")
+    if compute_refine_moves < 0:
+        raise ValueError("compute_refine_moves must be non-negative")
+    if refine_strategy not in {"remote", "balanced"}:
+        raise ValueError("refine_strategy must be 'remote' or 'balanced'")
+    if not 0 <= remote_budget <= 1:
+        raise ValueError("remote_budget must be in [0, 1]")
+    if not 0 <= capacity_ratio < 1 or compute_imbalance_limit < 1:
+        raise ValueError("invalid capacity or compute limits")
     if any(token.source_rank >= num_ranks for token in tokens):
         raise ValueError("token source rank exceeds num_ranks")
 
@@ -257,9 +415,17 @@ def cable_expert_placement(
     if any(len(token.topk_experts) != top_k for token in tokens):
         raise ValueError("all tokens must use the same Top-K")
 
-    quotient, remainder = divmod(len(experts), num_ranks)
-    capacities = [quotient + int(rank < remainder) for rank in range(num_ranks)]
-    if not quotient:
+    ideal_capacity = len(experts) / num_ranks
+    capacity_delta = round(ideal_capacity * capacity_ratio)
+    minimum_capacity = max(1, int(np.floor(ideal_capacity - capacity_delta)))
+    maximum_capacity = max(
+        minimum_capacity, int(np.ceil(ideal_capacity + capacity_delta))
+    )
+    if minimum_capacity * num_ranks > len(experts):
+        minimum_capacity = len(experts) // num_ranks
+    if maximum_capacity * num_ranks < len(experts):
+        maximum_capacity = int(np.ceil(ideal_capacity))
+    if not minimum_capacity or maximum_capacity * num_ranks < len(experts):
         raise ValueError("expert count must be at least num_ranks")
 
     source = np.fromiter(
@@ -306,14 +472,21 @@ def cable_expert_placement(
     max_egress = 0
     average_load = demand.sum() / num_ranks
     sum_load_squares = 0.0
+    minimum_needed = minimum_capacity * num_ranks
 
-    for expert in order:
+    for position, expert in enumerate(order):
         indexes = token_indexes[expert]
         sources = source[indexes]
         weights = count[indexes]
         best = None
+        best_feasible = None
         for rank in range(num_ranks):
-            if slots_used[rank] >= capacities[rank]:
+            if slots_used[rank] >= maximum_capacity:
+                continue
+            needed_after = minimum_needed - int(
+                slots_used[rank] < minimum_capacity
+            )
+            if needed_after > len(experts) - position - 1:
                 continue
             new_remote = (sources != rank) & (bundle_rank_counts[indexes, rank] == 0)
             delta_by_source = np.bincount(
@@ -342,9 +515,15 @@ def cable_expert_placement(
             candidate = (score, old_load, slots_used[rank], rank, delta_by_source)
             if best is None or candidate[:4] < best[:4]:
                 best = candidate
+            if new_load <= compute_imbalance_limit * average_load and (
+                best_feasible is None or candidate[:4] < best_feasible[:4]
+            ):
+                best_feasible = candidate
 
         assert best is not None
-        _, old_load, _, rank, delta_by_source = best
+        _, old_load, _, rank, delta_by_source = best_feasible or best
+        if slots_used[rank] < minimum_capacity:
+            minimum_needed -= 1
         ranks[expert] = rank
         slots_used[rank] += 1
         bundle_rank_counts[indexes, rank] += 1
@@ -359,7 +538,26 @@ def cable_expert_placement(
         sum_load_squares += new_load**2 - old_load**2
         compute_load[rank] = new_load
 
-    _refine_remote_swaps(
+    _refine_compute_moves(
+        source=source,
+        count=count,
+        token_indexes=token_indexes,
+        bundle_rank_counts=bundle_rank_counts,
+        ranks=ranks,
+        demand=demand,
+        compute_load=compute_load,
+        slots_used=slots_used,
+        traffic=traffic,
+        num_ranks=num_ranks,
+        minimum_capacity=minimum_capacity,
+        maximum_capacity=maximum_capacity,
+        rounds=compute_refine_moves,
+        total_tokens=total_tokens,
+        compute_imbalance_limit=compute_imbalance_limit,
+        remote_budget=remote_budget,
+    )
+
+    _refine_swaps(
         source=source,
         topk=topk,
         count=count,
@@ -371,6 +569,9 @@ def cable_expert_placement(
         traffic=traffic,
         num_ranks=num_ranks,
         rounds=refine_swaps,
+        total_tokens=total_tokens,
+        strategy=refine_strategy,
+        remote_budget=remote_budget,
     )
 
     # ponytail: rank-pair and port loads proxy NVSwitch contention; use a path
