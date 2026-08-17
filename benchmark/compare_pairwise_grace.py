@@ -157,58 +157,62 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         tokens = _reshard(_tokens(gate, value, compact), source_ep, args.num_ranks)
         graph = build_co_routing_graph(tokens)
         capacity = args.slots_per_rank or ceil(len(graph.experts) / args.num_ranks)
-        pairwise = CoRoutingGraphSolver(
-            num_ranks=args.num_ranks,
-            slots_per_rank=capacity,
-            max_rounds=args.max_rounds,
-            rerank_candidates=args.pairwise_candidates,
-            max_compute_imbalance=args.pairwise_max_imbalance,
-        ).solve(
-            graph,
-            routed_tokens=tokens,
-            ranks_per_node=args.ranks_per_node,
-            rdma_cost=args.rdma_cost,
-        )
-        grace = grace_hierarchical_placement(
-            graph,
-            num_ranks=args.num_ranks,
-            ranks_per_node=args.ranks_per_node,
-            nonuniform_ratio=args.grace_ratio,
-        )
-        placements = {
-            "pairwise": pairwise.rank_by_expert,
-            "grace": grace.rank_by_expert,
+        placements = {}
+        pairwise_iterations = None
+        if args.method in ("both", "pairwise"):
+            pairwise = CoRoutingGraphSolver(
+                num_ranks=args.num_ranks,
+                slots_per_rank=capacity,
+                max_rounds=args.max_rounds,
+                rerank_candidates=args.pairwise_candidates,
+                max_compute_imbalance=args.pairwise_max_imbalance,
+            ).solve(
+                graph,
+                routed_tokens=tokens,
+                ranks_per_node=args.ranks_per_node,
+                rdma_cost=args.rdma_cost,
+            )
+            placements["pairwise"] = pairwise.rank_by_expert
+            pairwise_iterations = pairwise.iterations
+        if args.method in ("both", "grace"):
+            grace = grace_hierarchical_placement(
+                graph,
+                num_ranks=args.num_ranks,
+                ranks_per_node=args.ranks_per_node,
+                nonuniform_ratio=args.grace_ratio,
+            )
+            placements["grace"] = grace.rank_by_expert
+        result = {
+            "gate": gate,
+            "layer": (
+                int(match.group(1))
+                if (match := _LAYER_PATTERN.search(gate))
+                else position
+            ),
+            "tokens": sum(token.count for token in tokens),
+            "bundles": len(tokens),
+            "metrics": {
+                name: _metrics(
+                    tokens,
+                    graph,
+                    placement,
+                    num_ranks=args.num_ranks,
+                    ranks_per_node=args.ranks_per_node,
+                    rdma_cost=args.rdma_cost,
+                )
+                for name, placement in placements.items()
+            },
+            "placements": placements,
         }
-        results.append(
-            {
-                "gate": gate,
-                "layer": (
-                    int(match.group(1))
-                    if (match := _LAYER_PATTERN.search(gate))
-                    else position
-                ),
-                "tokens": sum(token.count for token in tokens),
-                "bundles": len(tokens),
-                "pairwise_iterations": pairwise.iterations,
-                "metrics": {
-                    name: _metrics(
-                        tokens,
-                        graph,
-                        placement,
-                        num_ranks=args.num_ranks,
-                        ranks_per_node=args.ranks_per_node,
-                        rdma_cost=args.rdma_cost,
-                    )
-                    for name, placement in placements.items()
-                },
-                "placements": placements,
-            }
-        )
+        if pairwise_iterations is not None:
+            result["pairwise_iterations"] = pairwise_iterations
+        results.append(result)
     return {
         "input": args.input,
         "source_ep": source_ep,
         "num_ranks": args.num_ranks,
         "ranks_per_node": args.ranks_per_node,
+        "method": args.method,
         "pairwise_candidates": args.pairwise_candidates,
         "pairwise_max_imbalance": args.pairwise_max_imbalance,
         "grace_ratio": args.grace_ratio,
@@ -260,6 +264,9 @@ def main() -> None:
     parser.add_argument("--num-ranks", type=int, required=True)
     parser.add_argument("--source-ep", type=int)
     parser.add_argument("--ranks-per-node", type=int)
+    parser.add_argument(
+        "--method", choices=("both", "pairwise", "grace"), default="both"
+    )
     parser.add_argument("--slots-per-rank", type=int)
     parser.add_argument("--max-rounds", type=int, default=8)
     parser.add_argument("--pairwise-candidates", type=int, default=32)
@@ -281,6 +288,10 @@ def main() -> None:
         parser.error("invalid Pairwise candidate count or imbalance limit")
     if args.rdma_cost < 1:
         parser.error("--rdma-cost must be at least 1")
+    if args.save_pairwise and args.method == "grace":
+        parser.error("--save-pairwise requires --method pairwise or both")
+    if args.save_grace and args.method == "pairwise":
+        parser.error("--save-grace requires --method grace or both")
 
     result = run(args)
     if args.save_pairwise:

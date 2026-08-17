@@ -58,7 +58,7 @@ PYTHONPATH=python python benchmark/benchmark_ep_trace.py \
   --output /tmp/qwen3_ep8_trace.pt
 ```
 
-再比较 Pairwise 与 GRACE。单机全部使用 NVLink/NVSwitch，因此 `ranks-per-node=8`、`rdma-cost=1`：
+单独运行 Pairwise。单机全部使用 NVLink/NVSwitch，因此 `ranks-per-node=8`、`rdma-cost=1`：
 
 ```bash
 PYTHONPATH=python python benchmark/compare_pairwise_grace.py \
@@ -66,9 +66,12 @@ PYTHONPATH=python python benchmark/compare_pairwise_grace.py \
   --num-ranks 8 \
   --ranks-per-node 8 \
   --rdma-cost 1 \
+  --method pairwise \
   --pairwise-candidates 32 \
   --pairwise-max-imbalance 1.2
 ```
+
+单独运行 GRACE 时将最后三个 Pairwise 参数替换为 `--method grace`。不传 `--method` 仍会依次运行两种方案。
 
 采集脚本使用 SGLang 自带的 `return_routed_experts`，source rank 直接取每个请求返回的真实 `dp_rank`。脚本要求 `tp=dp=ep`，并关闭 CUDA graph 和 overlap schedule。
 
