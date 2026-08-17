@@ -6,6 +6,11 @@ from sglang.srt.eplb.co_routing_graph_solver import (
     evaluate_primary_remote,
     refine_hypergraph_placement,
 )
+from sglang.srt.eplb.offline_expert_placement import (
+    evaluate_topology_hypergraph_objective,
+    grace_hierarchical_placement,
+    refine_load_constrained_hypergraph_placement,
+)
 
 
 def test_build_graph_counts_bundle_pairs_and_demand():
@@ -196,3 +201,86 @@ def test_hypergraph_compute_balance_preserves_exact_remote():
     assert placement.final_remote == 201
     assert placement.balance_iterations == 1
     assert placement.experts_by_rank == {0: (1, 2), 1: (0, 3), 2: ()}
+
+
+def test_grace_grouping_respects_controlled_nonuniform_bounds():
+    tokens = [
+        RoutedToken(0, (0, 1), 20),
+        RoutedToken(0, (2, 3), 18),
+        RoutedToken(2, (4, 5), 16),
+        RoutedToken(2, (6, 7), 14),
+    ]
+    placement = grace_hierarchical_placement(
+        build_co_routing_graph(tokens),
+        num_ranks=4,
+        ranks_per_node=2,
+        nonuniform_ratio=0.15,
+    )
+
+    counts = [len(experts) for experts in placement.experts_by_rank.values()]
+    assert sorted(placement.rank_by_expert) == list(range(8))
+    for node in range(2):
+        node_counts = counts[node * 2 : node * 2 + 2]
+        ideal = sum(node_counts) // 2
+        delta = max(1, round(ideal * 0.15))
+        assert min(node_counts) >= max(1, ideal - delta)
+        assert max(node_counts) <= ideal + delta
+
+
+def test_topology_hypergraph_refinement_reduces_node_and_gpu_cuts():
+    tokens = [
+        RoutedToken(0, (0, 1), 10),
+        RoutedToken(2, (2, 3), 10),
+    ]
+    initial = {0: 0, 1: 2, 2: 1, 3: 3}
+    before = evaluate_topology_hypergraph_objective(
+        tokens, initial, ranks_per_node=2, rdma_cost=4
+    )
+
+    placement = refine_load_constrained_hypergraph_placement(
+        tokens,
+        initial,
+        num_ranks=4,
+        ranks_per_node=2,
+        rdma_cost=4,
+        max_load_ratio=1,
+        min_experts_per_rank=1,
+        max_experts_per_rank=1,
+        max_rounds=None,
+    )
+    after = evaluate_topology_hypergraph_objective(
+        tokens, placement.rank_by_expert, ranks_per_node=2, rdma_cost=4
+    )
+
+    assert before == 80
+    assert after == 20
+
+
+def test_topology_hypergraph_refinement_enforces_compute_cap_first():
+    tokens = [
+        RoutedToken(0, (0,), 100),
+        RoutedToken(0, (1,), 90),
+        RoutedToken(1, (2,), 10),
+        RoutedToken(1, (3,), 1),
+        RoutedToken(0, (0, 1), 20),
+        RoutedToken(1, (2, 3), 20),
+    ]
+    initial = {0: 0, 1: 0, 2: 1, 3: 1}
+    placement = refine_load_constrained_hypergraph_placement(
+        tokens,
+        initial,
+        num_ranks=2,
+        max_load_ratio=1.2,
+        min_experts_per_rank=2,
+        max_experts_per_rank=2,
+        max_rounds=None,
+    )
+    demand = {expert: 0 for expert in initial}
+    for token in tokens:
+        for expert in token.topk_experts:
+            demand[expert] += token.count
+    loads = [0, 0]
+    for expert, rank in placement.rank_by_expert.items():
+        loads[rank] += demand[expert]
+
+    assert max(loads) / (sum(loads) / 2) <= 1.2
