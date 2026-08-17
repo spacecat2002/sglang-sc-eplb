@@ -1,5 +1,6 @@
 from sglang.srt.eplb.cable_expert_placement import cable_expert_placement
 from sglang.srt.eplb.expert_affinity_graph import RoutedToken
+from sglang.srt.eplb.hypergraph_expert_placement import hypergraph_expert_placement
 
 
 def test_cable_finds_balanced_source_local_bundles_without_grace():
@@ -85,3 +86,27 @@ def test_cable_joint_mode_spreads_hot_experts_within_remote_budget():
         communication_first.metrics.compute_imbalance
     )
     assert joint.metrics.remote <= sum(token.count for token in tokens)
+
+
+def test_fixed_terminal_hypergraph_optimizes_bundle_connectivity():
+    tokens = [
+        RoutedToken(0, (12, 13, 1, 8)),
+        RoutedToken(3, (15, 6, 4, 9)),
+        RoutedToken(3, (3, 2, 1, 13)),
+        RoutedToken(2, (4, 15, 11, 3)),
+        RoutedToken(3, (14, 8, 7, 9)),
+        RoutedToken(2, (0, 6, 10, 3)),
+        RoutedToken(2, (6, 12, 3, 9)),
+        RoutedToken(1, (14, 6, 10, 1)),
+    ]
+    placement = hypergraph_expert_placement(
+        tokens,
+        experts=range(16),
+        num_ranks=4,
+        starts=4,
+        refine_rounds=4,
+        remote_budget=0.01,
+    )
+
+    assert placement["metrics"].remote >= 0
+    assert all(len(experts) >= 1 for experts in placement["experts_by_rank"].values())

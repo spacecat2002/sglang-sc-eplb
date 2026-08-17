@@ -22,6 +22,7 @@ from sglang.srt.eplb.expert_affinity_graph import (
     evaluate_weighted_remote,
 )
 from sglang.srt.eplb.grace_expert_placement import grace_hierarchical_placement
+from sglang.srt.eplb.hypergraph_expert_placement import hypergraph_expert_placement
 
 
 _LAYER_PATTERN = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
@@ -177,12 +178,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         grace_started = time.perf_counter() if not args.cable_only else None
         graph = (
             build_co_routing_graph(tokens, experts=experts)
-            if not args.cable_only
+            if not args.cable_only and not args.hypergraph_only
             else None
         )
         placement = None
         grace_seconds = None
-        if not args.cable_only:
+        if not args.cable_only and not args.hypergraph_only:
             placement = grace_hierarchical_placement(
                 graph,
                 num_ranks=args.num_ranks,
@@ -209,6 +210,24 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             else None
         )
         cable_seconds = time.perf_counter() - started if cable is not None else None
+        started = time.perf_counter()
+        hypergraph = (
+            hypergraph_expert_placement(
+                tokens,
+                experts=experts,
+                num_ranks=args.num_ranks,
+                capacity_ratio=args.hypergraph_capacity_ratio,
+                compute_imbalance_limit=args.hypergraph_compute_limit,
+                starts=args.hypergraph_starts,
+                refine_rounds=args.hypergraph_refine_rounds,
+                remote_budget=args.hypergraph_remote_budget,
+            )
+            if args.hypergraph
+            else None
+        )
+        hypergraph_seconds = (
+            time.perf_counter() - started if hypergraph is not None else None
+        )
         total_tokens = (
             int(value["count"].sum().item())
             if compact
@@ -252,15 +271,34 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "placement": cable.rank_by_expert,
                 "solve_seconds": cable_seconds,
             }
+        if hypergraph is not None:
+            result["hypergraph"] = {
+                "metrics": _metrics(
+                    tokens,
+                    hypergraph["rank_by_expert"],
+                    num_ranks=args.num_ranks,
+                    ranks_per_node=args.ranks_per_node,
+                    rdma_cost=args.rdma_cost,
+                    compute_load=hypergraph["metrics"].compute_load,
+                ),
+                "placement": hypergraph["rank_by_expert"],
+                "solve_seconds": hypergraph_seconds,
+            }
         results.append(result)
     return {
         "input": args.input,
         "method": (
             "cable"
             if args.cable_only
-            else "grace+cable"
-            if args.cable
-            else "grace"
+            else "hypergraph"
+            if args.hypergraph_only
+            else "+".join(
+                [
+                    "grace",
+                    *(["cable"] if args.cable else []),
+                    *(["hypergraph"] if args.hypergraph else []),
+                ]
+            )
         ),
         "source_ep": source_ep,
         "num_ranks": args.num_ranks,
@@ -310,6 +348,14 @@ def _print(result: Mapping[str, Any]) -> None:
                     layer["cable"]["solve_seconds"],
                 )
             )
+        if "hypergraph" in layer:
+            metrics.append(
+                (
+                    "hypergraph",
+                    layer["hypergraph"]["metrics"],
+                    layer["hypergraph"]["solve_seconds"],
+                )
+            )
         for method, metric, solve_seconds in metrics:
             rows.append(
                 [
@@ -339,6 +385,8 @@ def main() -> None:
     parser.add_argument("--rdma-cost", type=float, default=1.0)
     parser.add_argument("--cable", action="store_true")
     parser.add_argument("--cable-only", action="store_true")
+    parser.add_argument("--hypergraph", action="store_true")
+    parser.add_argument("--hypergraph-only", action="store_true")
     parser.add_argument("--cable-congestion-weight", type=float, default=0.25)
     parser.add_argument("--cable-load-weight", type=float, default=0.25)
     parser.add_argument("--cable-refine-swaps", type=int, default=2)
@@ -351,12 +399,20 @@ def main() -> None:
     parser.add_argument("--cable-capacity-ratio", type=float, default=0.15)
     parser.add_argument("--cable-compute-moves", type=int, default=2)
     parser.add_argument("--cable-compute-limit", type=float, default=2.0)
+    parser.add_argument("--hypergraph-capacity-ratio", type=float, default=0.15)
+    parser.add_argument("--hypergraph-compute-limit", type=float, default=2.0)
+    parser.add_argument("--hypergraph-starts", type=int, default=4)
+    parser.add_argument("--hypergraph-refine-rounds", type=int, default=4)
+    parser.add_argument("--hypergraph-remote-budget", type=float, default=0.01)
     parser.add_argument("--save-grace")
     parser.add_argument("--save-cable")
+    parser.add_argument("--save-hypergraph")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
     if args.cable_only:
         args.cable = True
+    if args.hypergraph_only:
+        args.hypergraph = True
     args.ranks_per_node = args.ranks_per_node or args.num_ranks
     if args.num_ranks < 1 or args.num_ranks % args.ranks_per_node:
         parser.error("--ranks-per-node must be positive and divide --num-ranks")
@@ -369,6 +425,11 @@ def main() -> None:
         or not 0 <= args.cable_remote_budget <= 1
         or not 0 <= args.cable_capacity_ratio < 1
         or args.cable_compute_limit < 1
+        or not 0 <= args.hypergraph_capacity_ratio < 1
+        or args.hypergraph_compute_limit < 1
+        or args.hypergraph_starts < 1
+        or args.hypergraph_refine_rounds < 0
+        or not 0 <= args.hypergraph_remote_budget <= 1
         or min(args.cable_congestion_weight, args.cable_load_weight) < 0
     ):
         parser.error("invalid placement parameters")
@@ -376,6 +437,8 @@ def main() -> None:
         parser.error("--save-cable requires --cable")
     if args.save_grace and args.cable_only:
         parser.error("--save-grace cannot be used with --cable-only")
+    if args.save_hypergraph and not args.hypergraph:
+        parser.error("--save-hypergraph requires --hypergraph")
     result = run(args)
     if args.save_grace:
         Path(args.save_grace).write_text(
@@ -398,6 +461,21 @@ def main() -> None:
                     layer["gate"]: {
                         str(e): r
                         for e, r in sorted(layer["cable"]["placement"].items())
+                    }
+                    for layer in result["layers"]
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    if args.save_hypergraph:
+        Path(args.save_hypergraph).write_text(
+            json.dumps(
+                {
+                    layer["gate"]: {
+                        str(e): r
+                        for e, r in sorted(layer["hypergraph"]["placement"].items())
                     }
                     for layer in result["layers"]
                 },
