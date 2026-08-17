@@ -1,0 +1,398 @@
+#!/usr/bin/env python3
+"""Run GRACE and optional CABLE offline expert placement on a routing trace."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import random
+import re
+import time
+from pathlib import Path
+from typing import Any, Iterable, Mapping, Sequence
+
+from sglang.srt.eplb.cable_expert_placement import (
+    cable_expert_placement,
+    evaluate_cable_placement,
+)
+from sglang.srt.eplb.expert_affinity_graph import (
+    RoutedToken,
+    build_co_routing_graph,
+    evaluate_primary_remote,
+    evaluate_weighted_remote,
+)
+from sglang.srt.eplb.grace_expert_placement import grace_hierarchical_placement
+
+
+_LAYER_PATTERN = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
+
+
+def _json_layers(raw: Any) -> list[tuple[str, Any, bool]]:
+    if isinstance(raw, list):
+        return [("layer0", raw, False)]
+    if not isinstance(raw, dict) or not isinstance(raw.get("layers"), list):
+        raise ValueError("input must be a bundle list or an object containing layers")
+    result = []
+    for index, layer in enumerate(raw["layers"]):
+        if not isinstance(layer, dict):
+            raise ValueError(f"layers[{index}] must be an object")
+        if layer.get("bundles"):
+            result.append(
+                (str(layer.get("gate", f"layer{index}")), layer["bundles"], False)
+            )
+    if not result:
+        raise ValueError("input contains no non-empty layers")
+    return result
+
+
+def _load(path: str) -> tuple[Any, list[tuple[str, Any, bool]]]:
+    if Path(path).suffix == ".pt":
+        from sglang.srt.eplb.moe_bundle_trace import load_compact_trace
+
+        raw = load_compact_trace(path)
+        return raw, [(str(layer["gate"]), layer, True) for layer in raw["layers"]]
+    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    return raw, _json_layers(raw)
+
+
+def _tokens(
+    name: str, value: Any, compact: bool, *, limit: int, seed: int
+) -> tuple[list[RoutedToken], int]:
+    if compact:
+        size = int(value["source_rank"].shape[0])
+        if limit and size > limit:
+            import torch
+
+            index = torch.tensor(
+                sorted(random.Random(seed).sample(range(size), limit)),
+                dtype=torch.int64,
+            )
+            source = value["source_rank"].index_select(0, index).tolist()
+            topk = value["topk_experts"].index_select(0, index).tolist()
+            count = value["count"].index_select(0, index).tolist()
+        else:
+            source, topk, count = (
+                value["source_rank"].tolist(),
+                value["topk_experts"].tolist(),
+                value["count"].tolist(),
+            )
+        return [
+            RoutedToken(int(s), tuple(map(int, experts)), int(c))
+            for s, experts, c in zip(source, topk, count)
+        ], size
+    result = []
+    for index, entry in enumerate(value):
+        try:
+            result.append(
+                RoutedToken(
+                    int(entry["source_rank"]),
+                    tuple(sorted(int(e) for e in entry["topk_experts"])),
+                    int(entry.get("count", 1)),
+                )
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"invalid bundle at {name}[{index}]: {entry!r}") from exc
+    return result, len(result)
+
+
+def _reshard(
+    tokens: Sequence[RoutedToken], source_ep: int, target_ep: int
+) -> list[RoutedToken]:
+    if source_ep < 1 or any(token.source_rank >= source_ep for token in tokens):
+        raise ValueError("trace contains a source rank outside source EP")
+    if source_ep == target_ep:
+        return list(tokens)
+    if target_ep < source_ep or target_ep % source_ep:
+        raise ValueError("target EP must be a multiple of source EP")
+    fanout = target_ep // source_ep
+    result = []
+    for token in tokens:
+        base, remainder = divmod(token.count, fanout)
+        for offset in range(fanout):
+            count = base + int(offset < remainder)
+            if count:
+                result.append(
+                    RoutedToken(
+                        token.source_rank * fanout + offset, token.topk_experts, count
+                    )
+                )
+    return result
+
+
+def _metrics(
+    tokens: Sequence[RoutedToken],
+    placement: Mapping[int, int],
+    *,
+    num_ranks: int,
+    ranks_per_node: int,
+    rdma_cost: float,
+    demand: Mapping[int, int] | None = None,
+    compute_load: Sequence[int] | None = None,
+) -> dict[str, Any]:
+    loads = list(compute_load) if compute_load is not None else [0] * num_ranks
+    counts = [0] * len(loads)
+    for expert, rank in placement.items():
+        counts[rank] += 1
+        if compute_load is None:
+            loads[rank] += demand[expert]
+    average = sum(loads) / len(loads)
+    cable_metrics = evaluate_cable_placement(tokens, placement, num_ranks=num_ranks)
+    return {
+        "remote": evaluate_primary_remote(tokens, placement),
+        "weighted_remote": evaluate_weighted_remote(
+            tokens, placement, ranks_per_node=ranks_per_node, rdma_cost=rdma_cost
+        ),
+        "compute_imbalance": max(loads, default=0) / average if average else 0.0,
+        "compute_load": loads,
+        "expert_count": counts,
+        "max_pair_traffic": cable_metrics.max_pair_traffic,
+        "max_ingress": cable_metrics.max_ingress,
+        "max_egress": cable_metrics.max_egress,
+    }
+
+
+def run(args: argparse.Namespace) -> dict[str, Any]:
+    raw, layers = _load(args.input)
+    source_ep = args.source_ep
+    if source_ep is None and isinstance(raw, dict):
+        source_ep = raw.get("num_ranks")
+    source_ep = int(source_ep or args.num_ranks)
+    results = []
+    for position, (gate, value, compact) in enumerate(layers):
+        tokens, bundle_count = _tokens(
+            gate,
+            value,
+            compact,
+            limit=args.optimizer_bundles if compact else 0,
+            seed=args.seed + position,
+        )
+        tokens = _reshard(tokens, source_ep, args.num_ranks)
+        experts = (
+            range(int(value["topk_experts"].max().item()) + 1) if compact else None
+        )
+        if experts is None:
+            experts = tuple(
+                sorted({expert for token in tokens for expert in token.topk_experts})
+            )
+        grace_started = time.perf_counter() if not args.cable_only else None
+        graph = (
+            build_co_routing_graph(tokens, experts=experts)
+            if not args.cable_only
+            else None
+        )
+        placement = None
+        grace_seconds = None
+        if not args.cable_only:
+            placement = grace_hierarchical_placement(
+                graph,
+                num_ranks=args.num_ranks,
+                ranks_per_node=args.ranks_per_node,
+                nonuniform_ratio=args.grace_ratio,
+            )
+            grace_seconds = time.perf_counter() - grace_started
+        started = time.perf_counter()
+        cable = (
+            cable_expert_placement(
+                tokens,
+                experts=graph.experts if graph is not None else experts,
+                num_ranks=args.num_ranks,
+                congestion_weight=args.cable_congestion_weight,
+                load_weight=args.cable_load_weight,
+                refine_swaps=args.cable_refine_swaps,
+            )
+            if args.cable
+            else None
+        )
+        cable_seconds = time.perf_counter() - started if cable is not None else None
+        total_tokens = (
+            int(value["count"].sum().item())
+            if compact
+            else sum(t.count for t in tokens)
+        )
+        result = {
+            "gate": gate,
+            "layer": int(match.group(1))
+            if (match := _LAYER_PATTERN.search(gate))
+            else position,
+            "tokens": total_tokens,
+            "bundles": bundle_count,
+            "optimizer_bundles": len(tokens),
+        }
+        if placement is not None:
+            result.update(
+                {
+                    "metrics": _metrics(
+                        tokens,
+                        placement.rank_by_expert,
+                        num_ranks=args.num_ranks,
+                        ranks_per_node=args.ranks_per_node,
+                        rdma_cost=args.rdma_cost,
+                        demand=graph.demand,
+                    ),
+                    "placement": placement.rank_by_expert,
+                    "solve_seconds": grace_seconds,
+                }
+            )
+        if cable is not None:
+            result["cable"] = {
+                "objective": cable.objective,
+                "metrics": _metrics(
+                    tokens,
+                    cable.rank_by_expert,
+                    num_ranks=args.num_ranks,
+                    ranks_per_node=args.ranks_per_node,
+                    rdma_cost=args.rdma_cost,
+                    compute_load=cable.metrics.compute_load,
+                ),
+                "placement": cable.rank_by_expert,
+                "solve_seconds": cable_seconds,
+            }
+        results.append(result)
+    return {
+        "input": args.input,
+        "method": (
+            "cable"
+            if args.cable_only
+            else "grace+cable"
+            if args.cable
+            else "grace"
+        ),
+        "source_ep": source_ep,
+        "num_ranks": args.num_ranks,
+        "ranks_per_node": args.ranks_per_node,
+        "grace_ratio": args.grace_ratio,
+        "optimizer_bundles": args.optimizer_bundles,
+        "layers": results,
+    }
+
+
+def _table(rows: Iterable[Sequence[str]]) -> str:
+    rows = list(rows)
+    widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
+    return "\n".join(
+        "  ".join(value.ljust(widths[i]) for i, value in enumerate(row)) for row in rows
+    )
+
+
+def _print(result: Mapping[str, Any]) -> None:
+    if any(layer["optimizer_bundles"] < layer["bundles"] for layer in result["layers"]):
+        print(
+            f"[trace] placements optimized on at most "
+            f"{result['optimizer_bundles']} bundles/layer"
+        )
+    rows = [
+        [
+            "layer",
+            "method",
+            "remote",
+            "weighted",
+            "max-pair",
+            "max-ingress",
+            "comp",
+            "experts/rank",
+            "solve-ms",
+        ]
+    ]
+    for layer in result["layers"]:
+        metrics = []
+        if "metrics" in layer:
+            metrics.append(("grace", layer["metrics"], layer["solve_seconds"]))
+        if "cable" in layer:
+            metrics.append(
+                (
+                    "cable",
+                    layer["cable"]["metrics"],
+                    layer["cable"]["solve_seconds"],
+                )
+            )
+        for method, metric, solve_seconds in metrics:
+            rows.append(
+                [
+                    str(layer["layer"]),
+                    method,
+                    str(metric["remote"]),
+                    f"{metric['weighted_remote']:.0f}",
+                    str(metric["max_pair_traffic"]),
+                    str(metric["max_ingress"]),
+                    f"{metric['compute_imbalance']:.2f}x",
+                    f"{min(metric['expert_count'])}-{max(metric['expert_count'])}",
+                    f"{solve_seconds * 1000:.1f}",
+                ]
+            )
+    print(_table(rows))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--input", required=True)
+    parser.add_argument("--num-ranks", type=int, required=True)
+    parser.add_argument("--source-ep", type=int)
+    parser.add_argument("--ranks-per-node", type=int)
+    parser.add_argument("--grace-ratio", type=float, default=0.15)
+    parser.add_argument("--optimizer-bundles", type=int, default=20_000)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--rdma-cost", type=float, default=1.0)
+    parser.add_argument("--cable", action="store_true")
+    parser.add_argument("--cable-only", action="store_true")
+    parser.add_argument("--cable-congestion-weight", type=float, default=0.25)
+    parser.add_argument("--cable-load-weight", type=float, default=0.25)
+    parser.add_argument("--cable-refine-swaps", type=int, default=2)
+    parser.add_argument("--save-grace")
+    parser.add_argument("--save-cable")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+    if args.cable_only:
+        args.cable = True
+    args.ranks_per_node = args.ranks_per_node or args.num_ranks
+    if args.num_ranks < 1 or args.num_ranks % args.ranks_per_node:
+        parser.error("--ranks-per-node must be positive and divide --num-ranks")
+    if (
+        args.optimizer_bundles < 0
+        or not 0 <= args.grace_ratio < 1
+        or args.rdma_cost < 1
+        or args.cable_refine_swaps < 0
+        or min(args.cable_congestion_weight, args.cable_load_weight) < 0
+    ):
+        parser.error("invalid placement parameters")
+    if args.save_cable and not args.cable:
+        parser.error("--save-cable requires --cable")
+    if args.save_grace and args.cable_only:
+        parser.error("--save-grace cannot be used with --cable-only")
+    result = run(args)
+    if args.save_grace:
+        Path(args.save_grace).write_text(
+            json.dumps(
+                {
+                    layer["gate"]: {
+                        str(e): r for e, r in sorted(layer["placement"].items())
+                    }
+                    for layer in result["layers"]
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    if args.save_cable:
+        Path(args.save_cable).write_text(
+            json.dumps(
+                {
+                    layer["gate"]: {
+                        str(e): r
+                        for e, r in sorted(layer["cable"]["placement"].items())
+                    }
+                    for layer in result["layers"]
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        _print(result)
+
+
+if __name__ == "__main__":
+    main()

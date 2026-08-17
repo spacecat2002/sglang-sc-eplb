@@ -1,43 +1,8 @@
-# Pairwise 与 GRACE-MoE 离线专家放置
+# GRACE/CABLE 离线专家放置
 
-当前实验只保留两种主专家放置算法：Pairwise 和 GRACE-MoE。两者使用相同的路由 trace、通信 replay 和负载指标，不包含专家复制、在线路由或其他 refinement。
+GRACE 从每层 Top-K 路由构造 expert co-activation affinity graph，再做层级谱聚类和受控非均匀分组。CABLE 独立使用完整 Top-K bundle 做 NumPy 贪心放置，再执行受约束 swap，并直接约束 remote、端口拥塞和计算负载。
 
-## Pairwise
-
-Pairwise 将每个专家视为顶点，将同一 Top-K bundle 中的专家两两连接。边权是专家对的共现次数。
-
-求解流程：
-
-1. 按加权度和专家负载生成容量受限的初始 placement。
-2. 用 pairwise edge-cut delta 筛选跨 rank 交换，默认保留最优的 32 个候选。
-3. 仅重放包含候选专家的 bundle，按真实节点内/跨节点通信代价重排。
-4. 接受通信代价下降且计算不均衡不超过限制的交换。
-5. 达到轮数上限或不存在改进交换时停止。
-
-Pairwise 默认保持每个 rank 的专家容量一致。通信重排默认使用 `rdma_cost=4`，计算不均衡上限为 `1.2`。
-
-## GRACE-MoE
-
-GRACE-MoE 使用相同的专家共现图，但通过谱聚类生成分层 placement：
-
-1. 节点级使用非均匀谱聚类，优先减少跨节点专家共现。
-2. 节点内再次谱聚类，将专家映射到 GPU。
-3. 使用论文 Algorithm 2 的受控非均匀范围限制每个 GPU 的专家数量。
-4. 默认非均匀比例为 `r=0.15`。
-
-GRACE-MoE 允许不同 GPU 保存不同数量的专家，因此可能降低通信，也可能增加计算和显存不均衡。
-
-## 对比指标
-
-统一脚本输出：
-
-| 指标 | 含义 |
-|---|---|
-| `remote` | token 访问的不同远程 rank 数量 |
-| `weighted` | 节点内通信权重为 1、跨节点通信权重为 `rdma_cost` 的通信量 |
-| `cut` | Pairwise 共现图的跨 rank 边权 |
-| `comp` | 最大 rank 计算负载除以平均负载 |
-| `experts/rank` | 每个 rank 的最少和最多专家数 |
+GRACE 的完整论文方案还包括动态专家复制和在线 locality-aware routing；本仓库当前实现的是离线 grouping 部分。
 
 ## 运行
 
@@ -58,74 +23,56 @@ PYTHONPATH=python python benchmark/benchmark_ep_trace.py \
   --output /tmp/qwen3_ep8_trace.pt
 ```
 
-单独运行 Pairwise。单机全部使用 NVLink/NVSwitch，因此 `ranks-per-node=8`、`rdma-cost=1`：
+运行 Grace。compact trace 超过 `--optimizer-bundles` 时，求解阶段只使用可复现的 bundle 样本，避免创建千万级 Python 对象：
 
 ```bash
-PYTHONPATH=python python benchmark/compare_pairwise_grace.py \
+PYTHONPATH=python python benchmark/compare_grace.py \
   --input /tmp/qwen3_ep8_trace.pt \
   --num-ranks 8 \
   --ranks-per-node 8 \
   --rdma-cost 1 \
-  --method pairwise \
-  --pairwise-candidates 32 \
-  --pairwise-max-imbalance 1.2
-```
-
-单独运行 GRACE 时将最后三个 Pairwise 参数替换为 `--method grace`。不传 `--method` 仍会依次运行两种方案。
-
-运行新的源 rank 感知超图方案（固定每个 rank 的专家槽位，并自动执行多启动局部优化）：
-
-```bash
-PYTHONPATH=python python benchmark/compare_pairwise_grace.py \
-  --input /tmp/qwen3_ep8_trace.pt \
-  --num-ranks 8 \
-  --ranks-per-node 8 \
-  --rdma-cost 1 \
-  --method hypergraph \
-  --hypergraph-restarts 2 \
-  --hypergraph-rounds 8 \
-  --hypergraph-candidates 128 \
-  --save-hypergraph hypergraph.json
-```
-
-`hypergraph-restarts`、`hypergraph-rounds` 和 `hypergraph-candidates` 控制质量与运行时间；它是有界启发式搜索，不声称对 NP-hard 放置问题求数学全局最优。
-
-论文对比三种方案时使用 `--method all`，它会在同一份 trace 上输出 Pairwise、GRACE 和 Hypergraph 三行结果。
-
-采集脚本使用 SGLang 自带的 `return_routed_experts`，source rank 直接取每个请求返回的真实 `dp_rank`。脚本要求 `tp=dp=ep`，并关闭 CUDA graph 和 overlap schedule。
-
-`moe-a2a-backend=none` 可以用于采集路由，但实际运行的是 all-gather/reduce-scatter，专家重排不会减少这条通信路径的通信量。Pairwise/GRACE 的通信收益需要切换到 token A2A backend 后验证。
-
-运行定向测试：
-
-```bash
-PYTHONPATH=python python -m pytest -q \
-  test/registered/unit/eplb/test_moe_bundle_trace.py \
-  test/registered/unit/eplb/test_pairwise_grace_placement.py \
-  test/registered/unit/eplb/test_hypergraph_expert_placement.py
-```
-
-保存两个 placement：
-
-```bash
-PYTHONPATH=python python benchmark/compare_pairwise_grace.py \
-  --input /tmp/qwen3_ep8_trace.pt \
-  --num-ranks 8 \
-  --ranks-per-node 8 \
-  --rdma-cost 1 \
-  --save-pairwise pairwise.json \
+  --optimizer-bundles 20000 \
+  --grace-ratio 0.15 \
   --save-grace grace.json
 ```
 
-相关文件：
+只追求最快求解速度时跳过 GRACE 图构造，直接运行 CABLE：
+
+```bash
+PYTHONPATH=python python benchmark/compare_grace.py \
+  --input /tmp/qwen3_ep8_trace.pt \
+  --num-ranks 8 \
+  --ranks-per-node 8 \
+  --rdma-cost 1 \
+  --cable-only \
+  --save-cable cable.json
+```
+
+默认执行两轮受约束 remote-decreasing swap；只测最快的初始贪心时加上 `--cable-refine-swaps 0`。
+
+`--optimizer-bundles 0` 表示使用完整 compact trace，但一千万 bundle 会明显变慢。`--rdma-cost 1` 适用于单机 NVLink/NVSwitch；`none` backend 仅用于采集路由，实际通信收益需要在 token A2A backend 下验证。
+
+## 后续改进方向
+
+- 按论文的 affinity utilization `U(r)` 与 size deviation `S(r)` 自动选择每层非均匀比例，而不是固定 `0.15`。
+- 补齐动态 hot-expert replication 和 locality-aware routing。
+- 使用 compact tensor 直接构造 affinity，避免 Python bundle 转换。
+- 用全量 trace 分块验证最终 placement，不在求解阶段扫描所有 Python 对象。
+
+## 测试
+
+```bash
+PYTHONPATH=python python -m pytest -q \
+  test/registered/unit/eplb/test_moe_bundle_trace.py
+```
+
+## 相关文件
 
 ```text
-python/sglang/srt/eplb/co_routing_graph_solver.py
+python/sglang/srt/eplb/expert_affinity_graph.py
 python/sglang/srt/eplb/grace_expert_placement.py
-python/sglang/srt/eplb/hypergraph_expert_placement.py
 python/sglang/srt/eplb/moe_bundle_trace.py
 benchmark/benchmark_ep_trace.py
-benchmark/compare_pairwise_grace.py
+benchmark/compare_grace.py
 test/registered/unit/eplb/test_moe_bundle_trace.py
-test/registered/unit/eplb/test_pairwise_grace_placement.py
 ```

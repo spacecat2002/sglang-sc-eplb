@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Sequence
 
-from .co_routing_graph_solver import CoRoutingGraph
+from .expert_affinity_graph import CoRoutingGraph
 
 
 @dataclass(frozen=True)

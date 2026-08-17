@@ -3,7 +3,7 @@
 
 The script launches ``sglang.Engine`` with attention DP and MoE EP, then writes
 the returned routed experts and actual DP source ranks as a compact trace for
-``compare_pairwise_grace.py``.
+``compare_grace.py``.
 
 Example:
 
