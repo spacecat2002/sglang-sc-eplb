@@ -47,8 +47,10 @@ GRACE-MoE 允许不同 GPU 保存不同数量的专家，因此可能降低通�
 PYTHONPATH=python python benchmark/benchmark_ep_trace.py \
   --model Qwen/Qwen3-30B-A3B \
   --tp-size 8 \
+  --dp-size 8 \
   --ep-size 8 \
-  --moe-a2a-backend deepep \
+  --enable-dp-attention \
+  --moe-a2a-backend none \
   --dataset sharegpt \
   --num-samples 128 \
   --batch-size 8 \
@@ -68,7 +70,9 @@ PYTHONPATH=python python benchmark/compare_pairwise_grace.py \
   --pairwise-max-imbalance 1.2
 ```
 
-采集脚本会强制使用 `per_token` recorder，并关闭 CUDA graph 和 overlap schedule。source rank 直接取真实 SGLang worker 的 `moe_ep_rank`，不再模拟 prompt/token round-robin。
+采集脚本使用 SGLang 自带的 `return_routed_experts`，source rank 直接取每个请求返回的真实 `dp_rank`。脚本要求 `tp=dp=ep`，并关闭 CUDA graph 和 overlap schedule。
+
+`moe-a2a-backend=none` 可以用于采集路由，但实际运行的是 all-gather/reduce-scatter，专家重排不会减少这条通信路径的通信量。Pairwise/GRACE 的通信收益需要切换到 token A2A backend 后验证。
 
 运行定向测试：
 

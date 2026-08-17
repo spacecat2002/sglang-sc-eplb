@@ -3,7 +3,6 @@ import torch
 from sglang.srt.eplb.moe_bundle_trace import (
     COMPACT_TRACE_FORMAT,
     compact_layer_from_bundles,
-    compact_layers_from_recorder_packs,
     compact_layer_from_records,
     load_compact_trace,
     save_compact_trace,
@@ -41,47 +40,3 @@ def test_json_records_are_canonicalized_for_compact_trace():
     assert layer["source_rank"].tolist() == [1, 0]
     assert layer["topk_experts"].tolist() == [[2, 4], [1, 3]]
     assert layer["count"].tolist() == [3, 2]
-
-
-def test_sglang_recorder_packs_use_real_rank_and_logical_experts():
-    expert_map = torch.tensor([[2, 0, 3, 1], [1, 3, 0, 2]])
-    packs = [
-        {
-            "rank": 0,
-            "last_physical_to_logical_map": expert_map,
-            "records": [
-                {
-                    "rank": 0,
-                    "topk_ids_of_layer": torch.tensor(
-                        [
-                            [[0, 1, -1], [1, 0, -1]],
-                            [[0, 2, -1], [0, 2, -1]],
-                        ]
-                    ),
-                }
-            ],
-        },
-        {
-            "rank": 1,
-            "last_physical_to_logical_map": expert_map,
-            "records": [
-                {
-                    "rank": 1,
-                    "topk_ids_of_layer": torch.tensor(
-                        [
-                            [[2, 3, -1]],
-                            [[1, 3, -1]],
-                        ]
-                    ),
-                }
-            ],
-        },
-    ]
-
-    top_k, layers = compact_layers_from_recorder_packs(packs, num_ranks=2)
-
-    assert top_k == 2
-    assert layers[0]["source_rank"].tolist() == [0, 1]
-    assert layers[0]["topk_experts"].tolist() == [[0, 2], [1, 3]]
-    assert layers[0]["count"].tolist() == [2, 1]
-    assert layers[1]["topk_experts"].tolist() == [[0, 1], [2, 3]]

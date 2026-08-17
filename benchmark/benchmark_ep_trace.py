@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """Capture a real distributed SGLang MoE routing trace.
 
-The script launches ``sglang.Engine`` with real TP/EP workers, records each
-worker's router output and EP rank, then writes a compact trace for
+The script launches ``sglang.Engine`` with attention DP and MoE EP, then writes
+the returned routed experts and actual DP source ranks as a compact trace for
 ``compare_pairwise_grace.py``.
 
 Example:
 
     PYTHONPATH=python python benchmark/benchmark_ep_trace.py \
         --model Qwen/Qwen3-30B-A3B \
-        --tp-size 8 --ep-size 8 --moe-a2a-backend deepep \
+        --tp-size 8 --dp-size 8 --ep-size 8 --enable-dp-attention \
         --dataset sharegpt --num-samples 128 --batch-size 8 \
         --output /tmp/qwen3_ep8_trace.pt
 """
@@ -18,15 +18,17 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
-import torch
-
 from bench_next_layer_gate_topm import _batches, _read_texts
 from sglang.srt.eplb.moe_bundle_trace import (
-    compact_layers_from_recorder_packs,
+    compact_layer_from_bundles,
     save_compact_trace,
+)
+from sglang.srt.state_capturer.routed_experts import (
+    extract_routed_experts_from_meta_info,
 )
 
 
@@ -38,11 +40,13 @@ def _engine_args(args: argparse.Namespace) -> dict[str, Any]:
         **extra,
         "model_path": args.model,
         "tp_size": args.tp_size,
+        "dp_size": args.dp_size,
         "ep_size": args.ep_size,
+        "enable_dp_attention": args.enable_dp_attention,
         "moe_a2a_backend": args.moe_a2a_backend,
         "dtype": args.dtype,
         "trust_remote_code": args.trust_remote_code,
-        "expert_distribution_recorder_mode": "per_token",
+        "enable_return_routed_experts": True,
         "enable_eplb": False,
         "disable_cuda_graph": True,
         "disable_overlap_schedule": True,
@@ -55,57 +59,77 @@ def _engine_args(args: argparse.Namespace) -> dict[str, Any]:
     return result
 
 
-def _record_files(directory: Path) -> set[Path]:
-    return {
-        path.resolve() for path in directory.glob("expert_distribution_recorder_*.pt")
-    }
-
-
 def run(args: argparse.Namespace) -> dict[str, Any]:
     import sglang as sgl
-    from sglang.srt.environ import envs
 
     texts = _read_texts(args)
     if not texts:
         raise ValueError("no non-empty prompts were loaded")
-    record_dir = Path(args.record_dir).resolve()
-    record_dir.mkdir(parents=True, exist_ok=True)
-    previous_files = _record_files(record_dir)
-    envs.SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR.set(str(record_dir))
 
     engine = None
-    recording = False
+    bundles_by_layer = None
+    top_k = None
+    num_layers = None
+    observed_ranks = set()
     try:
+        print(
+            f"[engine] launching tp={args.tp_size} dp={args.dp_size} "
+            f"ep={args.ep_size} backend={args.moe_a2a_backend}",
+            flush=True,
+        )
         engine = sgl.Engine(**_engine_args(args))
-        engine.start_expert_distribution_record()
-        recording = True
+        config = engine.server_args.get_model_config().hf_text_config
+        num_layers = int(config.num_hidden_layers)
+        top_k = int(config.num_experts_per_tok)
+        bundles_by_layer = [Counter() for _ in range(num_layers)]
+        print(f"[engine] ready, layers={num_layers} top_k={top_k}", flush=True)
+
         batches = list(_batches(texts, args.batch_size))
         for index, prompts in enumerate(batches, start=1):
-            engine.generate(
+            responses = engine.generate(
                 prompt=prompts,
                 sampling_params={
                     "temperature": args.temperature,
                     "max_new_tokens": args.max_new_tokens,
                 },
+                return_routed_experts=True,
             )
+            if isinstance(responses, dict):
+                responses = [responses]
+            for response in responses:
+                meta = response["meta_info"]
+                if "dp_rank" not in meta or "routed_experts" not in meta:
+                    raise RuntimeError(
+                        "SGLang response is missing dp_rank or routed_experts"
+                    )
+                source_rank = int(meta["dp_rank"])
+                if not 0 <= source_rank < args.dp_size:
+                    raise ValueError(f"invalid source DP rank {source_rank}")
+                routed = extract_routed_experts_from_meta_info(response)
+                width = num_layers * top_k
+                if routed.size == 0 or routed.size % width:
+                    raise ValueError(
+                        f"invalid routed expert result with {routed.size} values"
+                    )
+                routed = routed.reshape(-1, num_layers, top_k)
+                observed_ranks.add(source_rank)
+                for layer_index in range(num_layers):
+                    bundles_by_layer[layer_index].update(
+                        (source_rank, tuple(sorted(map(int, experts))))
+                        for experts in routed[:, layer_index]
+                    )
             print(f"[capture] batch {index}/{len(batches)}", flush=True)
-        engine.stop_expert_distribution_record()
-        recording = False
-        engine.dump_expert_distribution_record()
     finally:
         if engine is not None:
-            if recording:
-                engine.stop_expert_distribution_record()
             engine.shutdown()
 
-    paths = sorted(_record_files(record_dir) - previous_files)
-    if not paths:
-        raise RuntimeError(f"SGLang wrote no recorder dumps to {record_dir}")
-    packs = [torch.load(path, map_location="cpu", weights_only=True) for path in paths]
-    top_k, layers = compact_layers_from_recorder_packs(packs, num_ranks=args.ep_size)
+    layers = [
+        compact_layer_from_bundles(f"model.layers.{index}.gate", bundles)
+        for index, bundles in enumerate(bundles_by_layer)
+    ]
     save_compact_trace(
         args.output,
-        num_ranks=args.ep_size,
+        num_ranks=args.dp_size,
         top_k=top_k,
         layers=layers,
     )
@@ -113,10 +137,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "output": str(Path(args.output).resolve()),
         "model": args.model,
         "prompts": len(texts),
+        "dp_size": args.dp_size,
         "ep_size": args.ep_size,
         "top_k": top_k,
-        "layers": len(layers),
-        "recorder_files": [str(path) for path in paths],
+        "layers": num_layers,
+        "observed_source_ranks": sorted(observed_ranks),
     }
 
 
@@ -126,7 +151,13 @@ def main() -> None:
     )
     parser.add_argument("--model", "--model-path", dest="model", required=True)
     parser.add_argument("--tp-size", type=int)
+    parser.add_argument("--dp-size", type=int)
     parser.add_argument("--ep-size", type=int, required=True)
+    parser.add_argument(
+        "--enable-dp-attention",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument(
         "--moe-a2a-backend",
         choices=["none", "deepep", "flashinfer", "mooncake", "nixl", "mori", "megamoe"],
@@ -136,7 +167,7 @@ def main() -> None:
     parser.add_argument("--quantization")
     parser.add_argument("--mem-fraction-static", type=float)
     parser.add_argument("--trust-remote-code", action="store_true")
-    parser.add_argument("--log-level", default="error")
+    parser.add_argument("--log-level", default="info")
     parser.add_argument("--engine-args-json", default="{}")
 
     parser.add_argument("--text")
@@ -154,17 +185,17 @@ def main() -> None:
     parser.add_argument("--max-new-tokens", type=int, default=1)
     parser.add_argument("--temperature", type=float, default=0.0)
 
-    parser.add_argument(
-        "--record-dir",
-        default="/tmp/sglang_ep_trace",
-        help="temporary SGLang per-rank recorder directory",
-    )
     parser.add_argument("--output", "--bundles-output", dest="output", required=True)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
     args.tp_size = args.tp_size or args.ep_size
-    if args.tp_size < 1 or args.ep_size < 1:
-        parser.error("--tp-size and --ep-size must be positive")
+    args.dp_size = args.dp_size or args.ep_size
+    if min(args.tp_size, args.dp_size, args.ep_size) < 1:
+        parser.error("--tp-size, --dp-size and --ep-size must be positive")
+    if not args.enable_dp_attention or not (
+        args.tp_size == args.dp_size == args.ep_size
+    ):
+        parser.error("trace capture requires --enable-dp-attention and tp=dp=ep")
     if args.batch_size < 1 or args.num_samples < 1:
         parser.error("--batch-size and --num-samples must be positive")
     if args.max_new_tokens < 1:
