@@ -58,6 +58,7 @@ from sglang.srt.eplb.co_routing_graph_solver import (
     CoRoutingGraphSolver,
     GraphPlacement,
     build_co_routing_graph,
+    evaluate_hypergraph_objective,
     evaluate_primary_remote,
     refine_hypergraph_placement,
 )
@@ -615,6 +616,23 @@ def _evaluate_primary_remote_tensor(
     *,
     chunk_size: int,
 ) -> list[int]:
+    return _evaluate_hypergraph_objective_tensor(
+        trace,
+        placements,
+        objective="source-aware",
+        chunk_size=chunk_size,
+    )
+
+
+def _evaluate_hypergraph_objective_tensor(
+    trace: _TensorTrace,
+    placements: Sequence[Mapping[int, int]],
+    *,
+    objective: str,
+    chunk_size: int,
+) -> list[int]:
+    if objective not in {"source-aware", "source-agnostic"}:
+        raise ValueError("objective must be 'source-aware' or 'source-agnostic'")
     torch = _torch()
     max_expert = int(trace.topk_experts.max().item())
     homes = torch.full(
@@ -645,9 +663,13 @@ def _evaluate_primary_remote_tensor(
         destination = homes[:, topk].sort(dim=-1).values
         is_new = torch.ones_like(destination, dtype=torch.bool)
         is_new[:, :, 1:] = destination[:, :, 1:] != destination[:, :, :-1]
-        is_remote = destination != trace.source_rank[start:stop][None, :, None]
-        remote_per_bundle = (is_new & is_remote).sum(dim=-1)
-        totals += (remote_per_bundle * trace.count[start:stop][None, :]).sum(dim=1)
+        selected = is_new
+        if objective == "source-aware":
+            selected = selected & (
+                destination != trace.source_rank[start:stop][None, :, None]
+            )
+        copies_per_bundle = selected.sum(dim=-1)
+        totals += (copies_per_bundle * trace.count[start:stop][None, :]).sum(dim=1)
     return totals.cpu().tolist()
 
 
@@ -1035,6 +1057,23 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             ]
         baseline_remote, seed_remote = replay_values[:2]
         oracle_remote = replay_values[2] if oracle_map is not None else None
+        if args.hypergraph_objective == "source-aware":
+            baseline_objective = baseline_remote
+            seed_objective = seed_remote
+        elif tensor_trace is not None:
+            baseline_objective, seed_objective = _evaluate_hypergraph_objective_tensor(
+                tensor_trace,
+                [baseline_homes, placement.rank_by_expert],
+                objective=args.hypergraph_objective,
+                chunk_size=args.tensor_chunk_size,
+            )
+        else:
+            baseline_objective, seed_objective = [
+                evaluate_hypergraph_objective(
+                    tokens, candidate, objective=args.hypergraph_objective
+                )
+                for candidate in (baseline_homes, placement.rank_by_expert)
+            ]
         primary_replay_seconds = time.perf_counter() - primary_replay_start
         graph_remote = seed_remote if pairwise_enabled else None
         graph_compute_load = seed_compute_load if pairwise_enabled else None
@@ -1042,6 +1081,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         fixed_compute_load = seed_compute_load if replay_only else None
         final_placement = placement
         hypergraph_remote = None
+        hypergraph_objective = None
         hypergraph_iterations = 0
         hypergraph_balance_iterations = 0
         hypergraph_solve_seconds = 0.0
@@ -1076,6 +1116,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         num_ranks=args.num_ranks,
                         max_rounds=hypergraph_limit,
                         balance_rounds=hypergraph_balance_limit,
+                        objective=args.hypergraph_objective,
                     )
                     hypergraph_solve_seconds += candidate_placement.solve_seconds
                 else:
@@ -1086,11 +1127,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         num_ranks=args.num_ranks,
                         max_rounds=hypergraph_limit,
                         balance_rounds=hypergraph_balance_limit,
+                        objective=args.hypergraph_objective,
                     )
                     hypergraph_solve_seconds += time.perf_counter() - hypergraph_start
                 if restart == 0 and candidate_placement.initial_remote != seed_remote:
                     raise RuntimeError(
                         "hypergraph refinement initial replay disagrees with seed replay"
+                    )
+                if (
+                    restart == 0
+                    and candidate_placement.initial_objective != seed_objective
+                ):
+                    raise RuntimeError(
+                        "hypergraph refinement initial objective disagrees with seed replay"
                     )
                 candidate_loads = _compute_loads(
                     graph_demand,
@@ -1098,7 +1147,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     args.num_ranks,
                 )
                 candidate_key = (
-                    candidate_placement.final_remote,
+                    candidate_placement.final_objective,
                     max(candidate_loads),
                     sum(load * load for load in candidate_loads),
                 )
@@ -1107,6 +1156,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     best_hypergraph_key = candidate_key
             final_placement = best_hypergraph_placement
             hypergraph_remote = best_hypergraph_placement.final_remote
+            hypergraph_objective = best_hypergraph_placement.final_objective
             hypergraph_iterations = best_hypergraph_placement.iterations
             hypergraph_balance_iterations = best_hypergraph_placement.balance_iterations
         hypergraph_compute_load = (
@@ -1211,11 +1261,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "experts": len(graph_experts),
                 "edges": graph_edge_count,
                 "baseline_remote": baseline_remote,
+                "baseline_hypergraph_objective": baseline_objective,
                 "transfer_remote": fixed_remote,
                 "oracle_remote": oracle_remote,
                 "graph_remote": graph_remote,
                 "hypergraph_seed_remote": seed_remote if hypergraph_enabled else None,
                 "hypergraph_remote": hypergraph_remote,
+                "hypergraph_seed_objective": (
+                    seed_objective if hypergraph_enabled else None
+                ),
+                "hypergraph_objective": hypergraph_objective,
                 "replica_remote": replica_remote,
                 "baseline_compute_load": baseline_compute_load,
                 "transfer_compute_load": fixed_compute_load,
@@ -1248,6 +1303,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 else None,
                 "hypergraph_delta": (hypergraph_remote / baseline_remote - 1.0)
                 if baseline_remote and hypergraph_remote is not None
+                else None,
+                "hypergraph_objective_delta": (
+                    hypergraph_objective / baseline_objective - 1.0
+                )
+                if baseline_objective and hypergraph_objective is not None
                 else None,
                 "replica_delta": (replica_remote / baseline_remote - 1.0)
                 if baseline_remote
@@ -1301,6 +1361,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "baseline": args.baseline,
         "planner": args.planner,
         "placement_mode": args.placement_mode,
+        "hypergraph_objective": args.hypergraph_objective,
         "replay_only": replay_only,
         "loaded_placement": load_placement,
         "oracle_placement": oracle_placement,
@@ -1504,6 +1565,15 @@ def main() -> None:
         help="cross-rank perturbation swaps before each additional start (default: 2)",
     )
     parser.add_argument("--hypergraph-seed", type=int, default=0)
+    parser.add_argument(
+        "--hypergraph-objective",
+        choices=["source-aware", "source-agnostic"],
+        default="source-aware",
+        help=(
+            "exact objective: remote destination ranks relative to each source, "
+            "or source-independent distinct destination ranks (default: source-aware)"
+        ),
+    )
     parser.add_argument("--balance-weight", type=float, default=0.0)
     parser.add_argument(
         "--device",
@@ -1608,9 +1678,11 @@ def main() -> None:
             "baseline",
             "graph",
             "hypergraph",
+            "hyper_obj",
             "replica",
             "graph_delta",
             "hyper_delta",
+            "obj_delta",
             "replica_delta",
             "cut",
             "comp",
@@ -1639,9 +1711,11 @@ def main() -> None:
                 str(layer["baseline_remote"]),
                 _optional_text(layer["graph_remote"]),
                 _optional_text(layer["hypergraph_remote"]),
+                _optional_text(layer["hypergraph_objective"]),
                 str(layer["replica_remote"]),
                 _optional_percent(layer["graph_delta"]),
                 _optional_percent(layer["hypergraph_delta"]),
+                _optional_percent(layer["hypergraph_objective_delta"]),
                 f"{layer['replica_delta']:+.1%}",
                 (
                     "-"
@@ -1705,6 +1779,7 @@ def main() -> None:
     print(
         f"device={result['device']} planner={result['planner']} "
         f"placement={result['placement_mode']} "
+        f"hyper_objective={result['hypergraph_objective']} "
         f"rounds={round_mode} "
         f"hypergraph={hypergraph_mode} "
         f"hyper_balance={hypergraph_balance_mode} "

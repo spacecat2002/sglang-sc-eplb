@@ -78,6 +78,7 @@ def _hypergraph_move_delta_kernel(
     num_experts,
     num_ranks,
     TOPK: tl.constexpr,
+    SOURCE_AWARE: tl.constexpr,
     USE_BUNDLE_INDICES: tl.constexpr,
     SIGN: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -109,8 +110,12 @@ def _hypergraph_move_delta_kernel(
         target_rank_count += (other_rank == target_rank).to(tl.int32)
 
     valid = mask & (expert_rank != target_rank)
-    removed = (expert_rank != source) & (old_rank_count == 1)
-    added = (target_rank != source) & (target_rank_count == 0)
+    if SOURCE_AWARE:
+        removed = (expert_rank != source) & (old_rank_count == 1)
+        added = (target_rank != source) & (target_rank_count == 0)
+    else:
+        removed = old_rank_count == 1
+        added = target_rank_count == 0
     weight = tl.load(count_ptr + bundle, mask=mask, other=0).to(tl.int64)
     delta = SIGN * (added.to(tl.int64) - removed.to(tl.int64)) * weight
     tl.atomic_add(
@@ -134,6 +139,7 @@ def _hypergraph_pair_correction_kernel(
     num_experts,
     TOPK: tl.constexpr,
     NUM_PAIRS: tl.constexpr,
+    SOURCE_AWARE: tl.constexpr,
     USE_BUNDLE_INDICES: tl.constexpr,
     SIGN: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -168,10 +174,16 @@ def _hypergraph_pair_correction_kernel(
 
     # The two independent move gains include co-containing bundles, but
     # swapping both experts leaves such a bundle's rank set unchanged.
-    left_removed = (left_rank != source) & (left_rank_count == 1)
-    left_added = (right_rank != source) & (right_rank_count == 0)
-    right_removed = (right_rank != source) & (right_rank_count == 1)
-    right_added = (left_rank != source) & (left_rank_count == 0)
+    if SOURCE_AWARE:
+        left_removed = (left_rank != source) & (left_rank_count == 1)
+        left_added = (right_rank != source) & (right_rank_count == 0)
+        right_removed = (right_rank != source) & (right_rank_count == 1)
+        right_added = (left_rank != source) & (left_rank_count == 0)
+    else:
+        left_removed = left_rank_count == 1
+        left_added = right_rank_count == 0
+        right_removed = right_rank_count == 1
+        right_added = left_rank_count == 0
     independent_delta = (
         left_added.to(tl.int64)
         - left_removed.to(tl.int64)
@@ -291,6 +303,9 @@ class CudaHypergraphPlacement:
     iterations: int
     solve_seconds: float
     balance_iterations: int = 0
+    objective: str = "source-aware"
+    initial_objective: Optional[int] = None
+    final_objective: Optional[int] = None
 
 
 def build_co_routing_graph_cuda(
@@ -548,6 +563,17 @@ def _evaluate_primary_remote_cuda(
     return int((remote.sum(dim=1).to(torch.int64) * count).sum().item())
 
 
+def _evaluate_destination_rank_copies_cuda(
+    topk_experts: torch.Tensor,
+    count: torch.Tensor,
+    rank_by_expert: torch.Tensor,
+) -> int:
+    destinations = rank_by_expert[topk_experts].sort(dim=1).values
+    is_new = torch.ones_like(destinations, dtype=torch.bool)
+    is_new[:, 1:] = destinations[:, 1:] != destinations[:, :-1]
+    return int((is_new.sum(dim=1).to(torch.int64) * count).sum().item())
+
+
 def refine_hypergraph_placement_cuda(
     source_rank: torch.Tensor,
     topk_experts: torch.Tensor,
@@ -557,8 +583,9 @@ def refine_hypergraph_placement_cuda(
     num_ranks: int,
     max_rounds: Optional[int] = 8,
     balance_rounds: Optional[int] = 0,
+    objective: str = "source-aware",
 ) -> CudaHypergraphPlacement:
-    """Refine placement against exact Top-K distinct-remote-rank traffic."""
+    """Refine placement against an exact Top-K rank-cardinality objective."""
 
     if not source_rank.is_cuda or not topk_experts.is_cuda or not count.is_cuda:
         raise ValueError("CUDA hypergraph refinement requires CUDA tensors")
@@ -582,6 +609,8 @@ def refine_hypergraph_placement_cuda(
         raise ValueError("balance_rounds must be non-negative")
     if num_ranks < 1:
         raise ValueError("num_ranks must be positive")
+    if objective not in {"source-aware", "source-agnostic"}:
+        raise ValueError("objective must be 'source-aware' or 'source-agnostic'")
     if not initial_rank_by_expert:
         raise ValueError("initial placement must not be empty")
 
@@ -605,6 +634,11 @@ def refine_hypergraph_placement_cuda(
 
     initial_remote = _evaluate_primary_remote_cuda(
         source_rank, topk_experts, count, rank_by_expert
+    )
+    initial_objective = (
+        initial_remote
+        if objective == "source-aware"
+        else _evaluate_destination_rank_copies_cuda(topk_experts, count, rank_by_expert)
     )
     torch.cuda.current_stream(topk_experts.device).synchronize()
     solve_start = time.perf_counter()
@@ -674,6 +708,7 @@ def refine_hypergraph_placement_cuda(
             num_experts,
             num_ranks,
             TOPK=topk,
+            SOURCE_AWARE=objective == "source-aware",
             USE_BUNDLE_INDICES=use_bundle_indices,
             SIGN=sign,
             BLOCK=block,
@@ -693,6 +728,7 @@ def refine_hypergraph_placement_cuda(
                 num_experts,
                 TOPK=topk,
                 NUM_PAIRS=num_pairs,
+                SOURCE_AWARE=objective == "source-aware",
                 USE_BUNDLE_INDICES=use_bundle_indices,
                 SIGN=sign,
                 BLOCK=block,
@@ -863,6 +899,11 @@ def refine_hypergraph_placement_cuda(
     final_remote = _evaluate_primary_remote_cuda(
         source_rank, topk_experts, count, rank_by_expert
     )
+    final_objective = (
+        final_remote
+        if objective == "source-aware"
+        else _evaluate_destination_rank_copies_cuda(topk_experts, count, rank_by_expert)
+    )
     solve_seconds = time.perf_counter() - solve_start
     ranks_cpu = rank_by_expert[expert_ids].cpu().tolist()
     experts_cpu = expert_ids.cpu().tolist()
@@ -872,13 +913,16 @@ def refine_hypergraph_placement_cuda(
         for rank in range(num_ranks)
     }
     return CudaHypergraphPlacement(
-        rank_map,
-        experts_by_rank,
-        initial_remote,
-        final_remote,
-        rounds,
-        solve_seconds,
-        balance_iterations,
+        rank_by_expert=rank_map,
+        experts_by_rank=experts_by_rank,
+        initial_remote=initial_remote,
+        final_remote=final_remote,
+        iterations=rounds,
+        solve_seconds=solve_seconds,
+        balance_iterations=balance_iterations,
+        objective=objective,
+        initial_objective=initial_objective,
+        final_objective=final_objective,
     )
 
 

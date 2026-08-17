@@ -2,6 +2,7 @@ from sglang.srt.eplb.bundle_aware_replica_planner import RoutedToken
 from sglang.srt.eplb.co_routing_graph_solver import (
     CoRoutingGraphSolver,
     build_co_routing_graph,
+    evaluate_destination_rank_copies,
     evaluate_primary_remote,
     refine_hypergraph_placement,
 )
@@ -59,6 +60,12 @@ def test_primary_remote_replays_distinct_destination_ranks():
     assert evaluate_primary_remote(tokens, {0: 0, 1: 1, 2: 2}) == 2 * 4
 
 
+def test_destination_rank_copies_include_source_rank():
+    tokens = [RoutedToken(0, (0, 1, 2), count=4)]
+
+    assert evaluate_destination_rank_copies(tokens, {0: 0, 1: 1, 2: 1}) == 8
+
+
 def test_hypergraph_refinement_optimizes_exact_bundle_remote():
     tokens = [
         RoutedToken(0, (0, 1), count=10),
@@ -77,6 +84,61 @@ def test_hypergraph_refinement_optimizes_exact_bundle_remote():
     assert placement.final_remote == 0
     assert placement.iterations == 1
     assert evaluate_primary_remote(tokens, placement.rank_by_expert) == 0
+
+
+def test_source_agnostic_hypergraph_optimizes_destination_cardinality():
+    tokens = [
+        RoutedToken(0, (0, 1), count=10),
+        RoutedToken(1, (2, 3), count=10),
+    ]
+    initial = {0: 0, 1: 1, 2: 0, 3: 1}
+
+    placement = refine_hypergraph_placement(
+        tokens,
+        initial,
+        num_ranks=2,
+        max_rounds=None,
+        objective="source-agnostic",
+    )
+
+    assert placement.objective == "source-agnostic"
+    assert placement.initial_remote == 20
+    assert placement.final_remote == 0
+    assert placement.initial_objective == 40
+    assert placement.final_objective == 20
+    assert placement.iterations == 1
+
+
+def test_source_agnostic_hypergraph_is_source_permutation_invariant():
+    first = [
+        RoutedToken(0, (0, 1), count=10),
+        RoutedToken(1, (2, 3), count=10),
+    ]
+    permuted = [
+        RoutedToken(1, (0, 1), count=10),
+        RoutedToken(0, (2, 3), count=10),
+    ]
+    initial = {0: 0, 1: 1, 2: 0, 3: 1}
+
+    expected = refine_hypergraph_placement(
+        first,
+        initial,
+        num_ranks=2,
+        max_rounds=None,
+        objective="source-agnostic",
+    )
+    actual = refine_hypergraph_placement(
+        permuted,
+        initial,
+        num_ranks=2,
+        max_rounds=None,
+        objective="source-agnostic",
+    )
+
+    assert actual.rank_by_expert == expected.rank_by_expert
+    assert actual.initial_objective == expected.initial_objective
+    assert actual.final_objective == expected.final_objective
+    assert actual.iterations == expected.iterations
 
 
 def test_hypergraph_refinement_can_improve_converged_pairwise_graph():

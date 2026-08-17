@@ -58,7 +58,7 @@ class GraphPlacement:
 
 @dataclass(frozen=True)
 class HypergraphPlacement:
-    """A placement refined against exact Top-K bundle remote-rank counts."""
+    """A placement refined against an exact Top-K hypergraph objective."""
 
     rank_by_expert: Dict[int, int]
     experts_by_rank: Dict[int, Tuple[int, ...]]
@@ -66,6 +66,9 @@ class HypergraphPlacement:
     final_remote: int
     iterations: int
     balance_iterations: int = 0
+    objective: str = "source-aware"
+    initial_objective: Optional[int] = None
+    final_objective: Optional[int] = None
 
 
 def build_co_routing_graph(
@@ -110,12 +113,15 @@ def refine_hypergraph_placement(
     num_ranks: int,
     max_rounds: Optional[int] = 8,
     balance_rounds: Optional[int] = 0,
+    objective: str = "source-aware",
 ) -> HypergraphPlacement:
-    """Refine a placement using the exact distinct-remote-rank objective.
+    """Refine a placement using an exact Top-K rank-cardinality objective.
 
     Swapping two experts preserves the number of primary experts on every
     rank. Only bundles containing exactly one of the swapped experts can
-    change their destination-rank cardinality.
+    change their destination-rank cardinality. ``source-aware`` counts only
+    ranks remote to the token source, while ``source-agnostic`` counts every
+    distinct destination rank and is invariant to source-rank permutations.
     """
 
     if num_ranks < 1:
@@ -124,6 +130,9 @@ def refine_hypergraph_placement(
         raise ValueError("max_rounds must be non-negative")
     if balance_rounds is not None and balance_rounds < 0:
         raise ValueError("balance_rounds must be non-negative")
+    if objective not in {"source-aware", "source-agnostic"}:
+        raise ValueError("objective must be 'source-aware' or 'source-agnostic'")
+    source_aware = objective == "source-aware"
     tokens = list(routed_tokens)
     rank_by_expert = dict(initial_rank_by_expert)
     if any(rank < 0 or rank >= num_ranks for rank in rank_by_expert.values()):
@@ -150,12 +159,14 @@ def refine_hypergraph_placement(
             counts[rank_by_expert[expert]] += 1
         for expert in token.topk_experts:
             old_rank = rank_by_expert[expert]
-            removed = old_rank != token.source_rank and counts[old_rank] == 1
+            removed = counts[old_rank] == 1 and (
+                not source_aware or old_rank != token.source_rank
+            )
             for target_rank in range(num_ranks):
                 if target_rank == old_rank:
                     continue
-                added = (
-                    target_rank != token.source_rank and counts.get(target_rank, 0) == 0
+                added = counts.get(target_rank, 0) == 0 and (
+                    not source_aware or target_rank != token.source_rank
                 )
                 move_gains[expert][target_rank] += (
                     sign * token.count * (int(added) - int(removed))
@@ -166,13 +177,21 @@ def refine_hypergraph_placement(
             if left_rank == right_rank:
                 continue
             independent_delta = 0
-            if right_rank != token.source_rank and counts.get(right_rank, 0) == 0:
+            if counts.get(right_rank, 0) == 0 and (
+                not source_aware or right_rank != token.source_rank
+            ):
                 independent_delta += 1
-            if left_rank != token.source_rank and counts[left_rank] == 1:
+            if counts[left_rank] == 1 and (
+                not source_aware or left_rank != token.source_rank
+            ):
                 independent_delta -= 1
-            if left_rank != token.source_rank and counts.get(left_rank, 0) == 0:
+            if counts.get(left_rank, 0) == 0 and (
+                not source_aware or left_rank != token.source_rank
+            ):
                 independent_delta += 1
-            if right_rank != token.source_rank and counts[right_rank] == 1:
+            if counts[right_rank] == 1 and (
+                not source_aware or right_rank != token.source_rank
+            ):
                 independent_delta -= 1
             pair_correction[(left, right)] -= sign * token.count * independent_delta
 
@@ -180,6 +199,9 @@ def refine_hypergraph_placement(
         accumulate_bundle(bundle_index, 1)
 
     initial_remote = evaluate_primary_remote(tokens, rank_by_expert)
+    initial_objective = evaluate_hypergraph_objective(
+        tokens, rank_by_expert, objective=objective
+    )
     rounds = 0
     while max_rounds is None or rounds < max_rounds:
         best: Optional[Tuple[int, int, int]] = None
@@ -294,6 +316,9 @@ def refine_hypergraph_placement(
             balance_iterations += 1
 
     final_remote = evaluate_primary_remote(tokens, rank_by_expert)
+    final_objective = evaluate_hypergraph_objective(
+        tokens, rank_by_expert, objective=objective
+    )
     experts_by_rank = {
         rank: tuple(
             sorted(
@@ -305,12 +330,15 @@ def refine_hypergraph_placement(
         for rank in range(num_ranks)
     }
     return HypergraphPlacement(
-        rank_by_expert,
-        experts_by_rank,
-        initial_remote,
-        final_remote,
-        rounds,
-        balance_iterations,
+        rank_by_expert=rank_by_expert,
+        experts_by_rank=experts_by_rank,
+        initial_remote=initial_remote,
+        final_remote=final_remote,
+        iterations=rounds,
+        balance_iterations=balance_iterations,
+        objective=objective,
+        initial_objective=initial_objective,
+        final_objective=final_objective,
     )
 
 
@@ -552,3 +580,29 @@ def evaluate_primary_remote(
             }
         )
     return total
+
+
+def evaluate_destination_rank_copies(
+    routed_tokens: Iterable[RoutedToken], rank_by_expert: Mapping[int, int]
+) -> int:
+    """Count all distinct destination ranks touched by each Top-K bundle."""
+
+    return sum(
+        token.count * len({rank_by_expert[expert] for expert in token.topk_experts})
+        for token in routed_tokens
+    )
+
+
+def evaluate_hypergraph_objective(
+    routed_tokens: Iterable[RoutedToken],
+    rank_by_expert: Mapping[int, int],
+    *,
+    objective: str,
+) -> int:
+    """Evaluate either supported exact hypergraph placement objective."""
+
+    if objective == "source-aware":
+        return evaluate_primary_remote(routed_tokens, rank_by_expert)
+    if objective == "source-agnostic":
+        return evaluate_destination_rank_copies(routed_tokens, rank_by_expert)
+    raise ValueError("objective must be 'source-aware' or 'source-agnostic'")

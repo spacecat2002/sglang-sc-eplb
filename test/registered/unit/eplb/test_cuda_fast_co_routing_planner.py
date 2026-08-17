@@ -163,6 +163,64 @@ def test_cuda_incremental_hypergraph_matches_cpu_across_rounds():
     assert actual.iterations == expected.iterations
 
 
+def test_cuda_source_agnostic_hypergraph_matches_cpu():
+    tokens = [
+        RoutedToken(0, (0, 1), count=10),
+        RoutedToken(1, (2, 3), count=10),
+    ]
+    source = torch.tensor([0, 1], device="cuda", dtype=torch.int64)
+    topk = torch.tensor([[0, 1], [2, 3]], device="cuda", dtype=torch.int64)
+    count = torch.tensor([10, 10], device="cuda", dtype=torch.int64)
+    initial = {0: 0, 1: 1, 2: 0, 3: 1}
+
+    expected = refine_hypergraph_placement(
+        tokens,
+        initial,
+        num_ranks=2,
+        max_rounds=None,
+        objective="source-agnostic",
+    )
+    actual = refine_hypergraph_placement_cuda(
+        source,
+        topk,
+        count,
+        initial,
+        num_ranks=2,
+        max_rounds=None,
+        objective="source-agnostic",
+    )
+
+    assert actual.rank_by_expert == expected.rank_by_expert
+    assert actual.initial_remote == 20
+    assert actual.final_remote == 0
+    assert actual.initial_objective == expected.initial_objective
+    assert actual.final_objective == expected.final_objective
+    assert actual.iterations == expected.iterations
+
+
+def test_cuda_source_agnostic_hypergraph_ignores_source_rank():
+    topk = torch.tensor([[0, 1], [2, 3]], device="cuda", dtype=torch.int64)
+    count = torch.tensor([10, 10], device="cuda", dtype=torch.int64)
+    initial = {0: 0, 1: 1, 2: 0, 3: 1}
+
+    placements = [
+        refine_hypergraph_placement_cuda(
+            torch.tensor(sources, device="cuda", dtype=torch.int64),
+            topk,
+            count,
+            initial,
+            num_ranks=2,
+            max_rounds=None,
+            objective="source-agnostic",
+        )
+        for sources in ([0, 1], [1, 0])
+    ]
+
+    assert placements[0].rank_by_expert == placements[1].rank_by_expert
+    assert placements[0].final_objective == placements[1].final_objective
+    assert placements[0].iterations == placements[1].iterations
+
+
 def test_cuda_hypergraph_compute_balance_preserves_remote():
     source = torch.tensor([2, 2, 2, 2], device="cuda", dtype=torch.int64)
     topk = torch.tensor([[0], [1], [2], [3]], device="cuda", dtype=torch.int64)

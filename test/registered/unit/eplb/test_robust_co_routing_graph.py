@@ -49,7 +49,7 @@ def test_weighted_trace_equalizes_different_dataset_sizes():
 def test_reweighting_increases_weight_of_worst_dataset():
     weights = _updated_weights(
         [0.5, 0.5],
-        [{"normalized_remote": 0.5}, {"normalized_remote": 1.0}],
+        [{"normalized_objective": 0.5}, {"normalized_objective": 1.0}],
         rate=1.0,
     )
 
@@ -59,12 +59,12 @@ def test_reweighting_increases_weight_of_worst_dataset():
 
 def test_quality_prioritizes_compute_cap_before_communication():
     communication_better_but_over_cap = [
-        {"normalized_remote": 0.4, "compute_inflation": 1.3},
-        {"normalized_remote": 0.4, "compute_inflation": 1.0},
+        {"normalized_objective": 0.4, "compute_inflation": 1.3},
+        {"normalized_objective": 0.4, "compute_inflation": 1.0},
     ]
     communication_worse_but_feasible = [
-        {"normalized_remote": 0.6, "compute_inflation": 1.1},
-        {"normalized_remote": 0.6, "compute_inflation": 1.0},
+        {"normalized_objective": 0.6, "compute_inflation": 1.1},
+        {"normalized_objective": 0.6, "compute_inflation": 1.0},
     ]
 
     over_cap_key, _ = _quality(

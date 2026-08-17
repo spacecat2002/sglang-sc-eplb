@@ -7,7 +7,7 @@ because it contains more tokens. After each short refinement, multiplicative
 reweighting focuses the next round on datasets with the worst normalized
 communication. The best placement is selected using::
 
-    compute-cap violation, mean_normalized_remote + rho * worst_normalized_remote
+    compute-cap violation, mean_normalized_objective + rho * worst_normalized_objective
 
 Example::
 
@@ -36,6 +36,7 @@ from solve_co_routing_graph import (
     _balanced_initial_placement,
     _baseline_homes,
     _compute_loads,
+    _evaluate_hypergraph_objective_tensor,
     _evaluate_primary_remote_tensor,
     _format_table,
     _graph_placement_from_rank_map,
@@ -56,6 +57,7 @@ from sglang.srt.eplb.co_routing_graph_solver import (
     GraphPlacement,
     RoutedToken,
     build_co_routing_graph,
+    evaluate_hypergraph_objective,
     evaluate_primary_remote,
     refine_hypergraph_placement,
 )
@@ -65,7 +67,6 @@ from sglang.srt.eplb.co_routing_graph_solver import (
 class _InputTrace:
     path: str
     label: str
-    raw: Any
     layers: tuple[tuple[str, Any], ...]
     compact: bool
     source_ep: int
@@ -117,7 +118,7 @@ def _load_traces(args: argparse.Namespace) -> list[_InputTrace]:
                 f"target EP {args.num_ranks} must be a multiple of source EP "
                 f"{source_ep} for {path}"
             )
-        result.append(_InputTrace(path, label, raw, tuple(layers), compact, source_ep))
+        result.append(_InputTrace(path, label, tuple(layers), compact, source_ep))
     return result
 
 
@@ -186,13 +187,31 @@ def _remote(
     return evaluate_primary_remote(trace.value, placement)
 
 
+def _objective(
+    trace: _LayerTrace,
+    placement: Mapping[int, int],
+    objective: str,
+    chunk_size: int,
+) -> int:
+    if objective == "source-aware":
+        return _remote(trace, placement, chunk_size)
+    if trace.tensor:
+        return _evaluate_hypergraph_objective_tensor(
+            trace.value,
+            [placement],
+            objective=objective,
+            chunk_size=chunk_size,
+        )[0]
+    return evaluate_hypergraph_objective(trace.value, placement, objective=objective)
+
+
 def _normalizer(
     trace: _LayerTrace,
-    baseline_remote: int,
+    baseline_objective: int,
     mode: str,
 ) -> int:
-    if mode == "baseline" and baseline_remote > 0:
-        return baseline_remote
+    if mode == "baseline" and baseline_objective > 0:
+        return baseline_objective
     return max(trace.tokens, 1)
 
 
@@ -284,10 +303,16 @@ def _dataset_metrics(
     normalizers: Sequence[int],
     num_ranks: int,
     chunk_size: int,
+    objective: str,
 ) -> list[dict[str, Any]]:
     result = []
     for trace, baseline, normalizer in zip(traces, baselines, normalizers):
         remote = _remote(trace, placement, chunk_size)
+        objective_value = (
+            remote
+            if objective == "source-aware"
+            else _objective(trace, placement, objective, chunk_size)
+        )
         compute_load = _compute_loads(trace.demand, placement, num_ranks)
         compute_imbalance = _max_over_average(compute_load)
         baseline_compute = baseline["compute_imbalance"]
@@ -299,7 +324,14 @@ def _dataset_metrics(
                 "bundles": trace.bundles,
                 "baseline_remote": baseline["remote"],
                 "remote": remote,
-                "normalized_remote": remote / normalizer,
+                "baseline_objective": baseline["objective"],
+                "objective": objective_value,
+                "normalized_objective": objective_value / normalizer,
+                "objective_delta": (
+                    objective_value / baseline["objective"] - 1.0
+                    if baseline["objective"]
+                    else None
+                ),
                 "remote_delta": (
                     remote / baseline["remote"] - 1.0 if baseline["remote"] else None
                 ),
@@ -319,21 +351,27 @@ def _quality(
     worst_weight: float,
     max_compute_inflation: float | None,
 ) -> tuple[tuple[float, ...], dict[str, float]]:
-    normalized = [float(metric["normalized_remote"]) for metric in metrics]
-    mean_remote = sum(normalized) / len(normalized)
-    worst_remote = max(normalized)
+    normalized = [float(metric["normalized_objective"]) for metric in metrics]
+    mean_objective = sum(normalized) / len(normalized)
+    worst_objective = max(normalized)
     max_inflation = max(float(metric["compute_inflation"]) for metric in metrics)
     violation = (
         max(0.0, max_inflation - max_compute_inflation)
         if max_compute_inflation is not None
         else 0.0
     )
-    objective = mean_remote + worst_weight * worst_remote
+    objective = mean_objective + worst_weight * worst_objective
     return (
-        (float(violation > 1e-12), violation, objective, worst_remote, mean_remote),
+        (
+            float(violation > 1e-12),
+            violation,
+            objective,
+            worst_objective,
+            mean_objective,
+        ),
         {
-            "mean_normalized_remote": mean_remote,
-            "worst_normalized_remote": worst_remote,
+            "mean_normalized_objective": mean_objective,
+            "worst_normalized_objective": worst_objective,
             "robust_objective": objective,
             "max_compute_inflation": max_inflation,
             "compute_cap_violation": violation,
@@ -346,7 +384,7 @@ def _updated_weights(
     metrics: Sequence[Mapping[str, Any]],
     rate: float,
 ) -> list[float]:
-    costs = [float(metric["normalized_remote"]) for metric in metrics]
+    costs = [float(metric["normalized_objective"]) for metric in metrics]
     average = sum(costs) / len(costs)
     if average <= 0 or rate == 0:
         return list(weights)
@@ -372,6 +410,7 @@ def _candidate(
         normalizers,
         args.num_ranks,
         args.tensor_chunk_size,
+        args.hypergraph_objective,
     )
     key, summary = _quality(
         metrics,
@@ -434,6 +473,7 @@ def _refine(
             num_ranks=args.num_ranks,
             max_rounds=args.swaps_per_round,
             balance_rounds=balance_rounds,
+            objective=args.hypergraph_objective,
         )
         elapsed = result.solve_seconds
     else:
@@ -443,6 +483,7 @@ def _refine(
             num_ranks=args.num_ranks,
             max_rounds=args.swaps_per_round,
             balance_rounds=balance_rounds,
+            objective=args.hypergraph_objective,
         )
         elapsed = time.perf_counter() - start
     return (
@@ -470,14 +511,26 @@ def _solve_layer(
     baselines = []
     for trace in traces:
         compute_load = _compute_loads(trace.demand, baseline_homes, args.num_ranks)
+        baseline_remote = _remote(trace, baseline_homes, args.tensor_chunk_size)
+        baseline_objective = (
+            baseline_remote
+            if args.hypergraph_objective == "source-aware"
+            else _objective(
+                trace,
+                baseline_homes,
+                args.hypergraph_objective,
+                args.tensor_chunk_size,
+            )
+        )
         baselines.append(
             {
-                "remote": _remote(trace, baseline_homes, args.tensor_chunk_size),
+                "remote": baseline_remote,
+                "objective": baseline_objective,
                 "compute_imbalance": _max_over_average(compute_load),
             }
         )
     normalizers = [
-        _normalizer(trace, baseline["remote"], args.robust_normalizer)
+        _normalizer(trace, baseline["objective"], args.robust_normalizer)
         for trace, baseline in zip(traces, baselines)
     ]
     equal_weights = [1.0 / len(traces)] * len(traces)
@@ -542,7 +595,6 @@ def _solve_layer(
     )
     return {
         **best,
-        "gate": traces[0].label,
         "experts": len(experts),
         "normalizers": normalizers,
         "final_dataset_weights": weights,
@@ -589,6 +641,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "baseline": args.baseline,
         "robust_normalizer": args.robust_normalizer,
         "robust_worst_weight": args.robust_worst_weight,
+        "hypergraph_objective": args.hypergraph_objective,
         "max_compute_inflation": args.max_compute_inflation,
         "input_load_seconds": input_load_seconds,
         "total_wall_seconds": time.perf_counter() - start,
@@ -602,8 +655,8 @@ def _print_result(result: Mapping[str, Any], args: argparse.Namespace) -> None:
         rows.append(
             [
                 str(layer["layer"]),
-                f"{layer['mean_normalized_remote']:.3f}",
-                f"{layer['worst_normalized_remote']:.3f}",
+                f"{layer['mean_normalized_objective']:.3f}",
+                f"{layer['worst_normalized_objective']:.3f}",
                 f"{layer['max_compute_inflation']:.2f}x",
                 str(layer["robust_rounds"]),
                 str(layer["iterations"]),
@@ -619,6 +672,7 @@ def _print_result(result: Mapping[str, Any], args: argparse.Namespace) -> None:
     )
     print(
         f"datasets={len(result['inputs'])} device={result['device']} "
+        f"objective={result['hypergraph_objective']} "
         f"normalizer={result['robust_normalizer']} "
         f"worst_weight={result['robust_worst_weight']} "
         f"compute_cap={compute_cap}"
@@ -626,25 +680,58 @@ def _print_result(result: Mapping[str, Any], args: argparse.Namespace) -> None:
     print(_format_table(rows))
 
     totals = {
-        label: {"baseline": 0, "remote": 0, "comp": [], "inflation": []}
+        label: {
+            "baseline_remote": 0,
+            "remote": 0,
+            "baseline_objective": 0,
+            "objective": 0,
+            "comp": [],
+            "inflation": [],
+        }
         for label in result["labels"]
     }
     for layer in result["layers"]:
         for metric in layer["datasets"]:
             item = totals[metric["label"]]
-            item["baseline"] += metric["baseline_remote"]
+            item["baseline_remote"] += metric["baseline_remote"]
             item["remote"] += metric["remote"]
+            item["baseline_objective"] += metric["baseline_objective"]
+            item["objective"] += metric["objective"]
             item["comp"].append(metric["compute_imbalance"])
             item["inflation"].append(metric["compute_inflation"])
-    dataset_rows = [["dataset", "baseline", "robust", "delta", "avg_comp", "max_infl"]]
+    dataset_rows = [
+        [
+            "dataset",
+            "base_remote",
+            "robust_remote",
+            "remote_delta",
+            "base_obj",
+            "robust_obj",
+            "obj_delta",
+            "avg_comp",
+            "max_infl",
+        ]
+    ]
     for label, item in totals.items():
-        delta = item["remote"] / item["baseline"] - 1.0 if item["baseline"] else 0.0
+        remote_delta = (
+            item["remote"] / item["baseline_remote"] - 1.0
+            if item["baseline_remote"]
+            else 0.0
+        )
+        objective_delta = (
+            item["objective"] / item["baseline_objective"] - 1.0
+            if item["baseline_objective"]
+            else 0.0
+        )
         dataset_rows.append(
             [
                 label,
-                str(item["baseline"]),
+                str(item["baseline_remote"]),
                 str(item["remote"]),
-                f"{delta:+.1%}",
+                f"{remote_delta:+.1%}",
+                str(item["baseline_objective"]),
+                str(item["objective"]),
+                f"{objective_delta:+.1%}",
                 f"{sum(item['comp']) / len(item['comp']):.2f}",
                 f"{max(item['inflation']):.2f}x",
             ]
@@ -679,6 +766,15 @@ def main() -> None:
     parser.add_argument("--tensor-chunk-size", type=int, default=262144)
     parser.add_argument("--graph-rounds", type=int, default=8)
     parser.add_argument("--balance-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--hypergraph-objective",
+        choices=["source-aware", "source-agnostic"],
+        default="source-aware",
+        help=(
+            "exact objective: remote destination ranks relative to each source, "
+            "or source-independent distinct destination ranks (default: source-aware)"
+        ),
+    )
     parser.add_argument("--robust-rounds", type=int, default=8)
     parser.add_argument(
         "--swaps-per-round",
