@@ -229,6 +229,33 @@ def _refine_moves(
     return loads
 
 
+def _placement_state(
+    placement: Mapping[int, int],
+    experts: Sequence[int],
+    source: np.ndarray,
+    token_indexes: Sequence[np.ndarray],
+    demand: np.ndarray,
+    *,
+    num_ranks: int,
+    minimum_capacity: int,
+    maximum_capacity: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build the exact incremental state for a caller-provided seed."""
+
+    if set(placement) != set(experts):
+        raise ValueError("initial_placement must contain exactly all experts")
+    ranks = np.asarray([placement[expert] for expert in experts], dtype=np.intp)
+    if np.any((ranks < 0) | (ranks >= num_ranks)):
+        raise ValueError("initial_placement contains an invalid rank")
+    slots = np.bincount(ranks, minlength=num_ranks).astype(np.intp)
+    if np.any(slots < minimum_capacity) or np.any(slots > maximum_capacity):
+        raise ValueError("initial_placement violates expert capacity bounds")
+    bundle_counts = np.zeros((len(source), num_ranks), dtype=np.uint16)
+    for expert, indexes in enumerate(token_indexes):
+        bundle_counts[indexes, ranks[expert]] += 1
+    return ranks, slots, bundle_counts
+
+
 def hypergraph_expert_placement(
     tokens: Sequence[RoutedToken],
     *,
@@ -239,6 +266,7 @@ def hypergraph_expert_placement(
     starts: int = 4,
     refine_rounds: int = 4,
     remote_budget: float = 0.0,
+    initial_placement: Mapping[int, int] | None = None,
 ) -> dict[str, object]:
     """Solve fixed-terminal hypergraph connectivity placement.
 
@@ -261,18 +289,30 @@ def hypergraph_expert_placement(
     source, _, count, token_indexes, demand, source_demand = _prepare(tokens, experts)
     minimum, maximum = _capacity_bounds(len(experts), num_ranks, capacity_ratio)
     best = None
-    for mode in range(starts):
-        ranks, slots, bundle_counts = _greedy_seed(
-            source,
-            count,
-            token_indexes,
-            demand,
-            _order(mode, demand, source_demand),
-            num_ranks=num_ranks,
-            minimum_capacity=minimum,
-            maximum_capacity=maximum,
-            compute_limit=compute_imbalance_limit,
-        )
+    for mode in range(1 if initial_placement is not None else starts):
+        if initial_placement is None:
+            ranks, slots, bundle_counts = _greedy_seed(
+                source,
+                count,
+                token_indexes,
+                demand,
+                _order(mode, demand, source_demand),
+                num_ranks=num_ranks,
+                minimum_capacity=minimum,
+                maximum_capacity=maximum,
+                compute_limit=compute_imbalance_limit,
+            )
+        else:
+            ranks, slots, bundle_counts = _placement_state(
+                initial_placement,
+                experts,
+                source,
+                token_indexes,
+                demand,
+                num_ranks=num_ranks,
+                minimum_capacity=minimum,
+                maximum_capacity=maximum,
+            )
         loads = _refine_moves(
             source,
             count,

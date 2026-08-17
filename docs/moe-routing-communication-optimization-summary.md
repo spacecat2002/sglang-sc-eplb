@@ -61,6 +61,24 @@ PYTHONPATH=python python benchmark/compare_grace.py \
   --hypergraph --save-hypergraph hypergraph.json
 ```
 
+从 GRACE placement 出发做精确 Top-K refinement（`remote` 只减不增）：
+
+```bash
+PYTHONPATH=python python benchmark/compare_grace.py \
+  --input /tmp/qwen3_ep8_trace.pt \
+  --num-ranks 8 --ranks-per-node 8 --grace-refine \
+  --save-grace-refine grace-refined.json
+```
+
+独立调用 KaHyPar 需要先安装可选 `kahypar` Python 包；固定 source terminal 后，connectivity cut 对应 remote rank 数：
+
+```bash
+PYTHONPATH=python python benchmark/compare_grace.py \
+  --input /tmp/qwen3_ep8_trace.pt --num-ranks 8 \
+  --kahypar-only --kahypar-config /path/to/config.ini \
+  --save-kahypar kahypar.json
+```
+
 `--optimizer-bundles 0` 表示使用完整 compact trace，但一千万 bundle 会明显变慢。`--rdma-cost 1` 适用于单机 NVLink/NVSwitch；`none` backend 仅用于采集路由，实际通信收益需要在 token A2A backend 下验证。
 
 ## 后续改进方向
@@ -82,6 +100,8 @@ PYTHONPATH=python python -m pytest -q \
 ```text
 python/sglang/srt/eplb/expert_affinity_graph.py
 python/sglang/srt/eplb/grace_expert_placement.py
+python/sglang/srt/eplb/hypergraph_expert_placement.py
+python/sglang/srt/eplb/kahypar_expert_placement.py
 python/sglang/srt/eplb/moe_bundle_trace.py
 benchmark/benchmark_ep_trace.py
 benchmark/compare_grace.py

@@ -1,5 +1,10 @@
 from sglang.srt.eplb.cable_expert_placement import cable_expert_placement
-from sglang.srt.eplb.expert_affinity_graph import RoutedToken
+from sglang.srt.eplb.expert_affinity_graph import (
+    RoutedToken,
+    build_co_routing_graph,
+    evaluate_primary_remote,
+)
+from sglang.srt.eplb.grace_expert_placement import grace_hierarchical_placement
 from sglang.srt.eplb.hypergraph_expert_placement import hypergraph_expert_placement
 
 
@@ -110,3 +115,30 @@ def test_fixed_terminal_hypergraph_optimizes_bundle_connectivity():
 
     assert placement["metrics"].remote >= 0
     assert all(len(experts) >= 1 for experts in placement["experts_by_rank"].values())
+
+
+def test_hypergraph_refinement_keeps_grace_remote_non_increasing():
+    tokens = [
+        RoutedToken(0, (0, 1), 10),
+        RoutedToken(0, (0, 2), 8),
+        RoutedToken(1, (2, 3), 9),
+        RoutedToken(1, (2, 4), 7),
+        RoutedToken(2, (4, 5), 6),
+        RoutedToken(2, (4, 6), 5),
+        RoutedToken(3, (6, 7), 4),
+    ]
+    grace = grace_hierarchical_placement(
+        build_co_routing_graph(tokens, experts=range(8)), num_ranks=4
+    )
+    refined = hypergraph_expert_placement(
+        tokens,
+        experts=range(8),
+        num_ranks=4,
+        capacity_ratio=0.15,
+        initial_placement=grace.rank_by_expert,
+        refine_rounds=4,
+    )
+
+    assert evaluate_primary_remote(tokens, refined["rank_by_expert"]) <= (
+        evaluate_primary_remote(tokens, grace.rank_by_expert)
+    )
