@@ -73,6 +73,25 @@ PYTHONPATH=python python benchmark/compare_pairwise_grace.py \
 
 单独运行 GRACE 时将最后三个 Pairwise 参数替换为 `--method grace`。不传 `--method` 仍会依次运行两种方案。
 
+运行新的源 rank 感知超图方案（固定每个 rank 的专家槽位，并自动执行多启动局部优化）：
+
+```bash
+PYTHONPATH=python python benchmark/compare_pairwise_grace.py \
+  --input /tmp/qwen3_ep8_trace.pt \
+  --num-ranks 8 \
+  --ranks-per-node 8 \
+  --rdma-cost 1 \
+  --method hypergraph \
+  --hypergraph-restarts 2 \
+  --hypergraph-rounds 8 \
+  --hypergraph-candidates 128 \
+  --save-hypergraph hypergraph.json
+```
+
+`hypergraph-restarts`、`hypergraph-rounds` 和 `hypergraph-candidates` 控制质量与运行时间；它是有界启发式搜索，不声称对 NP-hard 放置问题求数学全局最优。
+
+论文对比三种方案时使用 `--method all`，它会在同一份 trace 上输出 Pairwise、GRACE 和 Hypergraph 三行结果。
+
 采集脚本使用 SGLang 自带的 `return_routed_experts`，source rank 直接取每个请求返回的真实 `dp_rank`。脚本要求 `tp=dp=ep`，并关闭 CUDA graph 和 overlap schedule。
 
 `moe-a2a-backend=none` 可以用于采集路由，但实际运行的是 all-gather/reduce-scatter，专家重排不会减少这条通信路径的通信量。Pairwise/GRACE 的通信收益需要切换到 token A2A backend 后验证。
@@ -82,7 +101,8 @@ PYTHONPATH=python python benchmark/compare_pairwise_grace.py \
 ```bash
 PYTHONPATH=python python -m pytest -q \
   test/registered/unit/eplb/test_moe_bundle_trace.py \
-  test/registered/unit/eplb/test_pairwise_grace_placement.py
+  test/registered/unit/eplb/test_pairwise_grace_placement.py \
+  test/registered/unit/eplb/test_hypergraph_expert_placement.py
 ```
 
 保存两个 placement：
@@ -102,6 +122,7 @@ PYTHONPATH=python python benchmark/compare_pairwise_grace.py \
 ```text
 python/sglang/srt/eplb/co_routing_graph_solver.py
 python/sglang/srt/eplb/grace_expert_placement.py
+python/sglang/srt/eplb/hypergraph_expert_placement.py
 python/sglang/srt/eplb/moe_bundle_trace.py
 benchmark/benchmark_ep_trace.py
 benchmark/compare_pairwise_grace.py

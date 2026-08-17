@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare Pairwise and GRACE-MoE offline expert placement.
+"""Compare Pairwise, GRACE-MoE, and source-aware hypergraph placement.
 
 Input is the JSON or compact ``.pt`` trace produced by ``benchmark_ep_trace.py``.
 
@@ -27,6 +27,7 @@ from sglang.srt.eplb.co_routing_graph_solver import (
     evaluate_weighted_remote,
 )
 from sglang.srt.eplb.grace_expert_placement import grace_hierarchical_placement
+from sglang.srt.eplb.hypergraph_expert_placement import SourceAwareHypergraphSolver
 
 
 _LAYER_PATTERN = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
@@ -159,7 +160,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         capacity = args.slots_per_rank or ceil(len(graph.experts) / args.num_ranks)
         placements = {}
         pairwise_iterations = None
-        if args.method in ("both", "pairwise"):
+        hypergraph_result = None
+        if args.method in ("both", "all", "pairwise"):
             pairwise = CoRoutingGraphSolver(
                 num_ranks=args.num_ranks,
                 slots_per_rank=capacity,
@@ -174,7 +176,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             )
             placements["pairwise"] = pairwise.rank_by_expert
             pairwise_iterations = pairwise.iterations
-        if args.method in ("both", "grace"):
+        if args.method in ("both", "all", "grace"):
             grace = grace_hierarchical_placement(
                 graph,
                 num_ranks=args.num_ranks,
@@ -182,6 +184,23 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 nonuniform_ratio=args.grace_ratio,
             )
             placements["grace"] = grace.rank_by_expert
+        if args.method in ("all", "hypergraph"):
+            hypergraph_result = SourceAwareHypergraphSolver(
+                num_ranks=args.num_ranks,
+                slots_per_rank=capacity,
+                max_rounds=args.hypergraph_rounds,
+                restarts=args.hypergraph_restarts,
+                candidates=args.hypergraph_candidates,
+                load_weight=args.hypergraph_load_weight,
+                max_compute_imbalance=args.pairwise_max_imbalance,
+                seed=args.hypergraph_seed,
+            ).solve(
+                graph,
+                tokens,
+                ranks_per_node=args.ranks_per_node,
+                rdma_cost=args.rdma_cost,
+            )
+            placements["hypergraph"] = hypergraph_result.rank_by_expert
         result = {
             "gate": gate,
             "layer": (
@@ -206,6 +225,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         }
         if pairwise_iterations is not None:
             result["pairwise_iterations"] = pairwise_iterations
+        if hypergraph_result is not None:
+            result["hypergraph_iterations"] = hypergraph_result.iterations
+            result["hypergraph_restarts"] = hypergraph_result.restarts
         results.append(result)
     return {
         "input": args.input,
@@ -265,16 +287,24 @@ def main() -> None:
     parser.add_argument("--source-ep", type=int)
     parser.add_argument("--ranks-per-node", type=int)
     parser.add_argument(
-        "--method", choices=("both", "pairwise", "grace"), default="both"
+        "--method",
+        choices=("both", "all", "pairwise", "grace", "hypergraph"),
+        default="both",
     )
     parser.add_argument("--slots-per-rank", type=int)
     parser.add_argument("--max-rounds", type=int, default=8)
     parser.add_argument("--pairwise-candidates", type=int, default=32)
     parser.add_argument("--pairwise-max-imbalance", type=float, default=1.2)
+    parser.add_argument("--hypergraph-rounds", type=int, default=8)
+    parser.add_argument("--hypergraph-restarts", type=int, default=2)
+    parser.add_argument("--hypergraph-candidates", type=int, default=128)
+    parser.add_argument("--hypergraph-load-weight", type=float, default=0.5)
+    parser.add_argument("--hypergraph-seed", type=int, default=0)
     parser.add_argument("--grace-ratio", type=float, default=0.15)
     parser.add_argument("--rdma-cost", type=float, default=4.0)
     parser.add_argument("--save-pairwise")
     parser.add_argument("--save-grace")
+    parser.add_argument("--save-hypergraph")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
     args.ranks_per_node = args.ranks_per_node or args.num_ranks
@@ -288,16 +318,24 @@ def main() -> None:
         parser.error("invalid Pairwise candidate count or imbalance limit")
     if args.rdma_cost < 1:
         parser.error("--rdma-cost must be at least 1")
-    if args.save_pairwise and args.method == "grace":
-        parser.error("--save-pairwise requires --method pairwise or both")
-    if args.save_grace and args.method == "pairwise":
-        parser.error("--save-grace requires --method grace or both")
+    if args.hypergraph_rounds < 0 or args.hypergraph_restarts < 1:
+        parser.error("invalid hypergraph rounds or restarts")
+    if args.hypergraph_candidates < 1 or args.hypergraph_load_weight < 0:
+        parser.error("invalid hypergraph candidates or load weight")
+    if args.save_pairwise and args.method not in ("both", "all", "pairwise"):
+        parser.error("--save-pairwise requires --method pairwise, both, or all")
+    if args.save_grace and args.method not in ("both", "all", "grace"):
+        parser.error("--save-grace requires --method grace, both, or all")
+    if args.save_hypergraph and args.method not in ("all", "hypergraph"):
+        parser.error("--save-hypergraph requires --method hypergraph or all")
 
     result = run(args)
     if args.save_pairwise:
         _save(args.save_pairwise, result, "pairwise")
     if args.save_grace:
         _save(args.save_grace, result, "grace")
+    if args.save_hypergraph:
+        _save(args.save_hypergraph, result, "hypergraph")
     if args.json:
         print(json.dumps(result, indent=2))
     else:
