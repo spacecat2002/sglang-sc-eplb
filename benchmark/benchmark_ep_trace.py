@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
-"""Collect real MoE routing metrics from offline inference.
+"""Collect MoE routing traces for Pairwise and GRACE-MoE placement.
 
 The script runs a Hugging Face MoE model, captures each router's real Top-K
-experts and aggregates identical ``(source_rank, Top-K)`` bundles. It models
-DeepEP normal mode: a token is transferred once for every *destination rank*,
-even if multiple selected experts live on that rank. No replica planner is
-run; this script only measures compute/communication imbalance and remote
-rank copies.
+experts and aggregates identical ``(source_rank, Top-K)`` bundles for the
+Pairwise and GRACE-MoE placement comparison.
 
 It is an offline what-if tool.  ``--num-ranks`` and ``--source-rank-mode``
 simulate how input tokens are sharded across EP ranks; they do not turn a
@@ -16,7 +13,7 @@ Example:
   python benchmark/benchmark_ep_trace.py \
       --model Qwen/Qwen3-30B-A3B --dataset sharegpt \
       --num-samples 128 --max-length 1024 --batch-size 2 \
-      --num-ranks 8 --ranks-per-node 8 --replica-slots-per-rank 0 \
+      --num-ranks 8 --ranks-per-node 8 \
       --bundles-output /tmp/moe_bundles.json
 """
 
@@ -40,7 +37,7 @@ from bench_next_layer_gate_topm import (
     _load_model,
     _read_texts,
 )
-from sglang.srt.eplb.bundle_aware_replica_planner import RoutedToken
+from sglang.srt.eplb.co_routing_graph_solver import RoutedToken
 from sglang.srt.eplb.moe_bundle_trace import (
     compact_layer_from_bundles,
     save_compact_trace,
@@ -180,12 +177,6 @@ def _max_over_avg(values: Sequence[float]) -> float:
     return max(values, default=0.0) / average if average else 0.0
 
 
-def _percent_change(before: float, after: float) -> str:
-    if before == 0:
-        return "n/a" if after else "0.0%"
-    return f"{(after / before - 1.0):+.1%}"
-
-
 def _format_table(headers: Sequence[str], rows: Iterable[Sequence[str]]) -> str:
     rows = list(rows)
     widths = [
@@ -230,138 +221,9 @@ def _layer_result(
     }
 
 
-def _reshard_tokens(
-    tokens: Sequence[RoutedToken], old_ranks: int, new_ranks: int
-) -> list[RoutedToken]:
-    """Evenly split each source-rank bundle across virtual target ranks."""
-    if new_ranks < old_ranks or new_ranks % old_ranks:
-        raise ValueError("target EP must be a multiple of source EP")
-    fanout = new_ranks // old_ranks
-    result = []
-    for token in tokens:
-        base, remainder = divmod(token.count, fanout)
-        for offset in range(fanout):
-            count = base + int(offset < remainder)
-            if count:
-                result.append(
-                    RoutedToken(
-                        token.source_rank * fanout + offset,
-                        token.topk_experts,
-                        count,
-                    )
-                )
-    return result
-
-
-def _ep_comparison_result(
-    gate_name: str,
-    bundles: Mapping[Tuple[int, Tuple[int, ...]], int],
-    args: argparse.Namespace,
-    home_placements: Mapping[str, Any],
-) -> Dict[str, Any]:
-    """Compare source EP baseline with target EP replica planning.
-
-    The original trace does not contain post-reshard source rank ids. Each
-    source-rank bundle is evenly split across its virtual target-rank children.
-    """
-    tokens = [
-        RoutedToken(source_rank, experts, count)
-        for (source_rank, experts), count in sorted(bundles.items())
-    ]
-    observed_experts = sorted(
-        {expert for token in tokens for expert in token.topk_experts}
-    )
-    source_homes = _homes_for_gate(
-        gate_name,
-        observed_experts,
-        args,
-        home_placements,
-        args.num_ranks,
-    )
-    source_metrics = _route_metrics(tokens, source_homes, args)
-    target_tokens = _reshard_tokens(tokens, args.num_ranks, args.compare_ep)
-    target_args = argparse.Namespace(**vars(args))
-    target_args.num_ranks = args.compare_ep
-    target_args.ranks_per_node = args.compare_ranks_per_node
-    target_args.metrics_only = True
-    target_bundles: Counter[Tuple[int, Tuple[int, ...]]] = Counter()
-    for token in target_tokens:
-        target_bundles[(token.source_rank, token.topk_experts)] += token.count
-    target = _layer_result(gate_name, target_bundles, target_args, {})
-    return {
-        "gate": gate_name,
-        "tokens": sum(token.count for token in tokens),
-        "bundles": len(tokens),
-        "source": source_metrics,
-        "target": target,
-    }
-
-
-def _format_ep_comparison(result: Mapping[str, Any]) -> str:
-    source_ep = result["source_ep"]
-    target_ep = result["target_ep"]
+def _format_result(result: Mapping[str, Any]) -> str:
     lines = [
-        "MoE DeepEP EP resharding metrics",
-        (
-            f"source_ep={source_ep} target_ep={target_ep}; single-copy expert "
-            f"homes; placement={result['home_placement']}; "
-            "each source-rank bundle is evenly split over its virtual target children."
-        ),
-    ]
-    rows = []
-    source_total = 0
-    target_total = 0
-    for layer in result["layers"]:
-        source_remote = layer["source"]["unique_remote_rank_copies"]
-        target_metrics = layer["target"]["metrics"]
-        target_remote = target_metrics["unique_remote_rank_copies"]
-        source_total += source_remote
-        target_total += target_remote
-        rows.append(
-            [
-                layer["gate"],
-                str(layer["tokens"]),
-                str(layer["bundles"]),
-                str(source_remote),
-                str(target_remote),
-                _percent_change(source_remote, target_remote),
-                f"{target_metrics['compute_imbalance']:.2f}",
-                f"{target_metrics['communication_imbalance']:.2f}",
-            ]
-        )
-    rows.append(
-        [
-            "total",
-            "-",
-            "-",
-            str(source_total),
-            str(target_total),
-            _percent_change(source_total, target_total),
-            "-",
-            "-",
-        ]
-    )
-    lines.append(
-        _format_table(
-            [
-                "gate",
-                "tokens",
-                "bundles",
-                f"remote@EP{source_ep}",
-                f"target@EP{target_ep}",
-                "delta",
-                "comp@target",
-                "comm@target",
-            ],
-            rows,
-        )
-    )
-    return "\n".join(lines)
-
-
-def _format_result(result: Mapping[str, Any], show_actions: bool) -> str:
-    lines = [
-        "MoE offline routing metrics (DeepEP normal-mode rank-set dedup)",
+        "MoE routing trace for Pairwise/GRACE placement (DeepEP rank-set dedup)",
         (
             f"model={result['model']}  dataset={result['dataset']}  prompts={result['num_prompts']}  "
             f"K={result['top_k']}  simulated_ep={result['num_ranks']}  "
@@ -554,27 +416,6 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             f"[data] saved {output_kind} Top-K bundles to {args.bundles_output}",
             flush=True,
         )
-    if args.compare_ep is not None:
-        print(
-            f"[compare] resharding EP={args.num_ranks} -> EP={args.compare_ep} "
-            "and collecting metrics",
-            flush=True,
-        )
-        layers = [
-            _ep_comparison_result(name, bundles, args, home_placements)
-            for name, bundles in nonempty_layers
-        ]
-        return {
-            "model": args.model,
-            "dataset": args.dataset or "text",
-            "num_prompts": len(texts),
-            "top_k": args.top_k,
-            "source_ep": args.num_ranks,
-            "target_ep": args.compare_ep,
-            "home_placement": args.home_placement,
-            "metrics_only": True,
-            "layers": layers,
-        }
     print(f"[metrics] replaying {len(nonempty_layers)} router layers", flush=True)
     layers = []
     for layer_index, (name, bundles) in enumerate(nonempty_layers, start=1):
@@ -604,7 +445,6 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         "top_k": args.top_k,
         "num_ranks": args.num_ranks,
         "source_rank_mode": args.source_rank_mode,
-        "metrics_only": True,
         "total_replay_seconds": total_solve_seconds,
         "layers": layers,
     }
@@ -655,62 +495,6 @@ def main() -> None:
     parser.add_argument("--ranks-per-node", type=int, default=None)
     parser.add_argument("--rdma-cost", type=float, default=4.0)
     parser.add_argument(
-        "--replica-slots-per-rank",
-        type=int,
-        default=0,
-        help="deprecated and ignored; retained for command compatibility",
-    )
-    parser.add_argument(
-        "--max-actions",
-        type=int,
-        default=None,
-        help="deprecated and ignored; this script never runs a planner",
-    )
-    parser.add_argument(
-        "--compare-ep",
-        type=int,
-        default=None,
-        help="reshard trace and compare metrics at this EP",
-    )
-    parser.add_argument(
-        "--compare-ranks-per-node",
-        type=int,
-        default=None,
-        help="ranks per node for --compare-ep; defaults to --ranks-per-node",
-    )
-    parser.add_argument(
-        "--metrics-only",
-        action="store_true",
-        help="deprecated no-op; this script is always metrics-only",
-    )
-    parser.add_argument(
-        "--planner",
-        choices=["exact", "fast"],
-        default="exact",
-        help="deprecated and ignored",
-    )
-    parser.add_argument(
-        "--fast-max-candidates",
-        type=int,
-        default=32,
-        help="deprecated and ignored",
-    )
-    parser.add_argument(
-        "--max-bundle-size",
-        type=int,
-        default=None,
-        help="deprecated and ignored",
-    )
-    parser.add_argument(
-        "--compute-weight", type=float, default=1.0, help="deprecated and ignored"
-    )
-    parser.add_argument(
-        "--communication-weight",
-        type=float,
-        default=1.0,
-        help="deprecated and ignored",
-    )
-    parser.add_argument(
         "--home-placement", choices=["round-robin", "contiguous"], default="round-robin"
     )
     parser.add_argument(
@@ -722,9 +506,6 @@ def main() -> None:
         "--source-rank-mode",
         choices=["token-round-robin", "prompt-round-robin"],
         default="prompt-round-robin",
-    )
-    parser.add_argument(
-        "--show-actions", action="store_true", help="deprecated and ignored"
     )
     parser.add_argument("--json", action="store_true")
     parser.add_argument(
@@ -741,31 +522,11 @@ def main() -> None:
     args = parser.parse_args()
     if args.num_ranks < 1:
         parser.error("--num-ranks must be positive")
-    if args.compare_ep is not None:
-        if args.compare_ep < args.num_ranks or args.compare_ep % args.num_ranks:
-            parser.error("--compare-ep must be a multiple of --num-ranks")
-        if args.home_placement_json:
-            parser.error(
-                "--compare-ep cannot use --home-placement-json because its rank ids "
-                "only describe the source EP placement"
-            )
-        if args.compare_ranks_per_node is None:
-            args.compare_ranks_per_node = args.ranks_per_node
     if args.log_interval < 1:
         parser.error("--log-interval must be positive")
-    if args.fast_max_candidates < 1:
-        parser.error("--fast-max-candidates must be positive")
     result = run(args)
     output = json.dumps(result, indent=2)
-    print(
-        output
-        if args.json
-        else (
-            _format_ep_comparison(result)
-            if args.compare_ep is not None
-            else _format_result(result, args.show_actions)
-        )
-    )
+    print(output if args.json else _format_result(result))
     if args.output:
         Path(args.output).write_text(output + "\n")
 

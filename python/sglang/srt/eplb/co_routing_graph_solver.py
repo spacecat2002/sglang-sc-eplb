@@ -1,44 +1,45 @@
-"""Offline co-routing graph placement for MoE experts.
-
-The graph is an inexpensive approximation of the DeepEP communication
-objective.  Each logical expert is a vertex and an edge counts how often two
-experts occur in the same Top-K bundle.  A capacity-constrained partition
-then groups frequently co-routed experts on the same rank.  The resulting
-placement should always be validated by replaying the original Top-K bundles,
-because a pairwise graph does not preserve the full hyperedge semantics.
-
-This module is intentionally offline.  It does not allocate CUDA tensors or
-run on the request path.
-"""
+"""Offline pairwise co-routing placement for MoE experts."""
 
 from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
+from heapq import nsmallest
 from itertools import combinations
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
-
-from .bundle_aware_replica_planner import RoutedToken
+from typing import Iterable, Mapping, Optional, Sequence
 
 
-Edge = Tuple[int, int]
+Edge = tuple[int, int]
+
+
+@dataclass(frozen=True)
+class RoutedToken:
+    """One token or an aggregate with the same source rank and Top-K experts."""
+
+    source_rank: int
+    topk_experts: tuple[int, ...]
+    count: int = 1
+
+    def __post_init__(self) -> None:
+        if self.count < 1:
+            raise ValueError("count must be positive")
+        if not self.topk_experts:
+            raise ValueError("topk_experts must not be empty")
+        if self.source_rank < 0 or min(self.topk_experts) < 0:
+            raise ValueError("source rank and expert ids must be non-negative")
+        if len(set(self.topk_experts)) != len(self.topk_experts):
+            raise ValueError("topk_experts must not contain duplicates")
 
 
 @dataclass(frozen=True)
 class CoRoutingGraph:
-    """Weighted pairwise projection of Top-K hyperedges."""
-
-    experts: Tuple[int, ...]
+    experts: tuple[int, ...]
     demand: Mapping[int, int]
     edges: Mapping[Edge, int]
     adjacency: Mapping[int, Mapping[int, int]]
 
     @property
-    def total_edge_weight(self) -> int:
-        return sum(self.edges.values())
-
-    @property
-    def weighted_degree(self) -> Dict[int, int]:
+    def weighted_degree(self) -> dict[int, int]:
         return {
             expert: sum(self.adjacency.get(expert, {}).values())
             for expert in self.experts
@@ -47,28 +48,11 @@ class CoRoutingGraph:
 
 @dataclass(frozen=True)
 class GraphPlacement:
-    """A primary (one home rank per logical expert) graph placement."""
-
-    rank_by_expert: Dict[int, int]
-    experts_by_rank: Dict[int, Tuple[int, ...]]
-    initial_cut: float
-    final_cut: float
+    rank_by_expert: dict[int, int]
+    experts_by_rank: dict[int, tuple[int, ...]]
+    initial_cut: int
+    final_cut: int
     iterations: int
-
-
-@dataclass(frozen=True)
-class HypergraphPlacement:
-    """A placement refined against an exact Top-K hypergraph objective."""
-
-    rank_by_expert: Dict[int, int]
-    experts_by_rank: Dict[int, Tuple[int, ...]]
-    initial_remote: int
-    final_remote: int
-    iterations: int
-    balance_iterations: int = 0
-    objective: str = "source-aware"
-    initial_objective: Optional[int] = None
-    final_objective: Optional[int] = None
 
 
 def build_co_routing_graph(
@@ -76,280 +60,103 @@ def build_co_routing_graph(
     *,
     experts: Optional[Iterable[int]] = None,
 ) -> CoRoutingGraph:
-    """Build a weighted co-routing graph from aggregated Top-K bundles.
-
-    For a bundle ``(e0, e1, ..., ek)`` with count ``c``, every unordered pair
-    receives ``c`` additional edge weight.  The expert demand counts each
-    selected expert once per token, so it can be used to seed a balanced
-    partition.  Duplicate experts in a bundle are rejected by ``RoutedToken``.
-    """
+    """Project Top-K bundles to weighted pairwise expert affinities."""
 
     tokens = list(routed_tokens)
     if not tokens and experts is None:
         raise ValueError("routed_tokens or experts must not be empty")
-    demand: Dict[int, int] = defaultdict(int)
-    edges: Dict[Edge, int] = defaultdict(int)
-    observed: Set[int] = set(experts or ())
+    demand: dict[int, int] = defaultdict(int)
+    edges: dict[Edge, int] = defaultdict(int)
+    observed = set(experts or ())
     for token in tokens:
         observed.update(token.topk_experts)
         for expert in token.topk_experts:
             demand[expert] += token.count
         for left, right in combinations(sorted(token.topk_experts), 2):
             edges[(left, right)] += token.count
-    ordered_experts = tuple(sorted(observed))
-    for expert in ordered_experts:
+    ordered = tuple(sorted(observed))
+    adjacency: dict[int, dict[int, int]] = {expert: {} for expert in ordered}
+    for expert in ordered:
         demand.setdefault(expert, 0)
-    adjacency: Dict[int, Dict[int, int]] = {expert: {} for expert in ordered_experts}
     for (left, right), weight in edges.items():
         adjacency[left][right] = weight
         adjacency[right][left] = weight
-    return CoRoutingGraph(ordered_experts, dict(demand), dict(edges), adjacency)
+    return CoRoutingGraph(ordered, dict(demand), dict(edges), adjacency)
 
 
-def refine_hypergraph_placement(
-    routed_tokens: Iterable[RoutedToken],
-    initial_rank_by_expert: Mapping[int, int],
-    *,
-    num_ranks: int,
-    max_rounds: Optional[int] = 8,
-    balance_rounds: Optional[int] = 0,
-    objective: str = "source-aware",
-) -> HypergraphPlacement:
-    """Refine a placement using an exact Top-K rank-cardinality objective.
-
-    Swapping two experts preserves the number of primary experts on every
-    rank. Only bundles containing exactly one of the swapped experts can
-    change their destination-rank cardinality. ``source-aware`` counts only
-    ranks remote to the token source, while ``source-agnostic`` counts every
-    distinct destination rank and is invariant to source-rank permutations.
-    """
-
-    if num_ranks < 1:
-        raise ValueError("num_ranks must be positive")
-    if max_rounds is not None and max_rounds < 0:
-        raise ValueError("max_rounds must be non-negative")
-    if balance_rounds is not None and balance_rounds < 0:
-        raise ValueError("balance_rounds must be non-negative")
-    if objective not in {"source-aware", "source-agnostic"}:
-        raise ValueError("objective must be 'source-aware' or 'source-agnostic'")
-    source_aware = objective == "source-aware"
-    tokens = list(routed_tokens)
-    rank_by_expert = dict(initial_rank_by_expert)
-    if any(rank < 0 or rank >= num_ranks for rank in rank_by_expert.values()):
-        raise ValueError("initial placement contains an invalid rank")
-    observed = {expert for token in tokens for expert in token.topk_experts}
-    missing = observed - rank_by_expert.keys()
-    if missing:
-        raise ValueError(f"initial placement is missing experts: {sorted(missing)}")
-
-    incidence: Dict[int, Set[int]] = {expert: set() for expert in rank_by_expert}
-    for bundle_index, token in enumerate(tokens):
-        for expert in token.topk_experts:
-            incidence[expert].add(bundle_index)
-
-    move_gains: Dict[int, list[int]] = {
-        expert: [0] * num_ranks for expert in rank_by_expert
-    }
-    pair_correction: Dict[Edge, int] = defaultdict(int)
-
-    def accumulate_bundle(bundle_index: int, sign: int) -> None:
-        token = tokens[bundle_index]
-        counts: Dict[int, int] = defaultdict(int)
-        for expert in token.topk_experts:
-            counts[rank_by_expert[expert]] += 1
-        for expert in token.topk_experts:
-            old_rank = rank_by_expert[expert]
-            removed = counts[old_rank] == 1 and (
-                not source_aware or old_rank != token.source_rank
-            )
-            for target_rank in range(num_ranks):
-                if target_rank == old_rank:
-                    continue
-                added = counts.get(target_rank, 0) == 0 and (
-                    not source_aware or target_rank != token.source_rank
-                )
-                move_gains[expert][target_rank] += (
-                    sign * token.count * (int(added) - int(removed))
-                )
-        for left, right in combinations(sorted(token.topk_experts), 2):
-            left_rank = rank_by_expert[left]
-            right_rank = rank_by_expert[right]
-            if left_rank == right_rank:
-                continue
-            independent_delta = 0
-            if counts.get(right_rank, 0) == 0 and (
-                not source_aware or right_rank != token.source_rank
-            ):
-                independent_delta += 1
-            if counts[left_rank] == 1 and (
-                not source_aware or left_rank != token.source_rank
-            ):
-                independent_delta -= 1
-            if counts.get(left_rank, 0) == 0 and (
-                not source_aware or left_rank != token.source_rank
-            ):
-                independent_delta += 1
-            if counts[right_rank] == 1 and (
-                not source_aware or right_rank != token.source_rank
-            ):
-                independent_delta -= 1
-            pair_correction[(left, right)] -= sign * token.count * independent_delta
-
-    for bundle_index in range(len(tokens)):
-        accumulate_bundle(bundle_index, 1)
-
-    initial_remote = evaluate_primary_remote(tokens, rank_by_expert)
-    initial_objective = evaluate_hypergraph_objective(
-        tokens, rank_by_expert, objective=objective
+def evaluate_pairwise_cut(
+    graph: CoRoutingGraph, rank_by_expert: Mapping[int, int]
+) -> int:
+    return sum(
+        weight
+        for (left, right), weight in graph.edges.items()
+        if rank_by_expert[left] != rank_by_expert[right]
     )
-    rounds = 0
-    while max_rounds is None or rounds < max_rounds:
-        best: Optional[Tuple[int, int, int]] = None
-        experts = sorted(rank_by_expert)
-        for left_index, left in enumerate(experts):
-            left_rank = rank_by_expert[left]
-            for right in experts[left_index + 1 :]:
-                right_rank = rank_by_expert[right]
-                if left_rank == right_rank:
-                    continue
-                delta = (
-                    move_gains[left][right_rank]
-                    + move_gains[right][left_rank]
-                    + pair_correction.get((left, right), 0)
-                )
-                candidate = (delta, left, right)
-                if delta < 0 and (best is None or candidate < best):
-                    best = candidate
-        if best is None:
-            break
-        _, left, right = best
-        affected = incidence[left] | incidence[right]
-        for bundle_index in affected:
-            accumulate_bundle(bundle_index, -1)
-        rank_by_expert[left], rank_by_expert[right] = (
-            rank_by_expert[right],
-            rank_by_expert[left],
-        )
-        for bundle_index in affected:
-            accumulate_bundle(bundle_index, 1)
-        rounds += 1
 
-    balance_iterations = 0
-    if balance_rounds is None or balance_rounds > 0:
-        expert_demand: Dict[int, int] = defaultdict(int)
-        for token in tokens:
-            for expert in token.topk_experts:
-                expert_demand[expert] += token.count
-        rank_load = [0] * num_ranks
-        for expert, rank in rank_by_expert.items():
-            rank_load[rank] += expert_demand[expert]
 
-        while balance_rounds is None or balance_iterations < balance_rounds:
-            current_max = max(rank_load, default=0)
-            max_without_pair = {
-                (left_rank, right_rank): max(
-                    (
-                        load
-                        for rank, load in enumerate(rank_load)
-                        if rank not in {left_rank, right_rank}
-                    ),
-                    default=0,
-                )
-                for left_rank in range(num_ranks)
-                for right_rank in range(left_rank + 1, num_ranks)
+def evaluate_primary_remote(
+    routed_tokens: Iterable[RoutedToken], rank_by_expert: Mapping[int, int]
+) -> int:
+    """Count distinct remote destination ranks touched by each routed token."""
+
+    return sum(
+        token.count
+        * len(
+            {
+                rank_by_expert[expert]
+                for expert in token.topk_experts
+                if rank_by_expert[expert] != token.source_rank
             }
-            best_balance: Optional[Tuple[int, int, int, int]] = None
-            experts = sorted(rank_by_expert)
-            for left_index, left in enumerate(experts):
-                left_rank = rank_by_expert[left]
-                for right in experts[left_index + 1 :]:
-                    right_rank = rank_by_expert[right]
-                    if left_rank == right_rank:
-                        continue
-                    remote_delta = (
-                        move_gains[left][right_rank]
-                        + move_gains[right][left_rank]
-                        + pair_correction.get((left, right), 0)
-                    )
-                    if remote_delta != 0:
-                        continue
-                    left_after = (
-                        rank_load[left_rank]
-                        - expert_demand[left]
-                        + expert_demand[right]
-                    )
-                    right_after = (
-                        rank_load[right_rank]
-                        - expert_demand[right]
-                        + expert_demand[left]
-                    )
-                    low_rank, high_rank = sorted((left_rank, right_rank))
-                    new_max = max(
-                        max_without_pair[(low_rank, high_rank)],
-                        left_after,
-                        right_after,
-                    )
-                    variance_delta = (
-                        left_after * left_after
-                        + right_after * right_after
-                        - rank_load[left_rank] * rank_load[left_rank]
-                        - rank_load[right_rank] * rank_load[right_rank]
-                    )
-                    if new_max > current_max or variance_delta >= 0:
-                        continue
-                    candidate = (new_max, variance_delta, left, right)
-                    if best_balance is None or candidate < best_balance:
-                        best_balance = candidate
-            if best_balance is None:
-                break
-            _, _, left, right = best_balance
-            affected = incidence[left] | incidence[right]
-            for bundle_index in affected:
-                accumulate_bundle(bundle_index, -1)
-            left_rank = rank_by_expert[left]
-            right_rank = rank_by_expert[right]
-            rank_by_expert[left], rank_by_expert[right] = right_rank, left_rank
-            rank_load[left_rank] += expert_demand[right] - expert_demand[left]
-            rank_load[right_rank] += expert_demand[left] - expert_demand[right]
-            for bundle_index in affected:
-                accumulate_bundle(bundle_index, 1)
-            balance_iterations += 1
-
-    final_remote = evaluate_primary_remote(tokens, rank_by_expert)
-    final_objective = evaluate_hypergraph_objective(
-        tokens, rank_by_expert, objective=objective
-    )
-    experts_by_rank = {
-        rank: tuple(
-            sorted(
-                expert
-                for expert, expert_rank in rank_by_expert.items()
-                if expert_rank == rank
-            )
         )
-        for rank in range(num_ranks)
-    }
-    return HypergraphPlacement(
-        rank_by_expert=rank_by_expert,
-        experts_by_rank=experts_by_rank,
-        initial_remote=initial_remote,
-        final_remote=final_remote,
-        iterations=rounds,
-        balance_iterations=balance_iterations,
-        objective=objective,
-        initial_objective=initial_objective,
-        final_objective=final_objective,
+        for token in routed_tokens
+    )
+
+
+def _token_weighted_remote(
+    token: RoutedToken,
+    rank_by_expert: Mapping[int, int],
+    ranks_per_node: int,
+    rdma_cost: float,
+    swap: tuple[int, int, int, int] | None = None,
+) -> float:
+    ranks = set()
+    for expert in token.topk_experts:
+        rank = rank_by_expert[expert]
+        if swap:
+            left, right, left_rank, right_rank = swap
+            if expert == left:
+                rank = right_rank
+            elif expert == right:
+                rank = left_rank
+        if rank != token.source_rank:
+            ranks.add(rank)
+    return token.count * sum(
+        1
+        if rank // ranks_per_node == token.source_rank // ranks_per_node
+        else rdma_cost
+        for rank in ranks
+    )
+
+
+def evaluate_weighted_remote(
+    routed_tokens: Iterable[RoutedToken],
+    rank_by_expert: Mapping[int, int],
+    *,
+    ranks_per_node: int,
+    rdma_cost: float = 4.0,
+) -> float:
+    """Count remote rank copies, weighting cross-node copies by ``rdma_cost``."""
+
+    if ranks_per_node < 1 or rdma_cost < 1:
+        raise ValueError("ranks_per_node and rdma_cost must be at least 1")
+    return sum(
+        _token_weighted_remote(token, rank_by_expert, ranks_per_node, rdma_cost)
+        for token in routed_tokens
     )
 
 
 class CoRoutingGraphSolver:
-    """Capacity-constrained graph partition with deterministic swap refinement.
-
-    ``slots_per_rank`` is the number of primary logical experts assigned to a
-    rank.  Replica slots are deliberately outside this solver; after obtaining
-    a primary placement, callers can pass it to ``BundleAwareReplicaPlanner``
-    to add communication-aware copies.
-    """
+    """Pairwise swaps, optionally reranked by exact weighted communication."""
 
     def __init__(
         self,
@@ -357,110 +164,156 @@ class CoRoutingGraphSolver:
         num_ranks: int,
         slots_per_rank: int | Sequence[int],
         max_rounds: Optional[int] = 8,
-        balance_weight: float = 0.0,
-    ):
+        rerank_candidates: int = 32,
+        max_compute_imbalance: Optional[float] = 1.2,
+    ) -> None:
         if num_ranks < 1:
             raise ValueError("num_ranks must be positive")
         if max_rounds is not None and max_rounds < 0:
             raise ValueError("max_rounds must be non-negative")
-        if balance_weight < 0:
-            raise ValueError("balance_weight must be non-negative")
-        if isinstance(slots_per_rank, int):
-            capacities = [slots_per_rank] * num_ranks
-        else:
-            capacities = list(slots_per_rank)
-        if len(capacities) != num_ranks or any(capacity < 0 for capacity in capacities):
+        if rerank_candidates < 1:
+            raise ValueError("rerank_candidates must be positive")
+        if max_compute_imbalance is not None and max_compute_imbalance < 1:
+            raise ValueError("max_compute_imbalance must be at least 1")
+        capacities = (
+            [slots_per_rank] * num_ranks
+            if isinstance(slots_per_rank, int)
+            else list(slots_per_rank)
+        )
+        if len(capacities) != num_ranks or any(value < 0 for value in capacities):
             raise ValueError("slots_per_rank must contain non-negative capacities")
         self.num_ranks = num_ranks
         self.capacities = capacities
         self.max_rounds = max_rounds
-        self.balance_weight = balance_weight
+        self.rerank_candidates = rerank_candidates
+        self.max_compute_imbalance = max_compute_imbalance
 
-    def solve(self, graph: CoRoutingGraph) -> GraphPlacement:
-        """Return a graph placement and the pairwise cut before/after swaps."""
-
+    def solve(
+        self,
+        graph: CoRoutingGraph,
+        *,
+        routed_tokens: Optional[Iterable[RoutedToken]] = None,
+        ranks_per_node: Optional[int] = None,
+        rdma_cost: float = 4.0,
+    ) -> GraphPlacement:
         if len(graph.experts) > sum(self.capacities):
             raise ValueError("expert count exceeds total rank capacity")
+        tokens = None if routed_tokens is None else list(routed_tokens)
+        if tokens is not None:
+            if ranks_per_node is None:
+                ranks_per_node = self.num_ranks
+            if not tokens:
+                raise ValueError("routed_tokens must not be empty")
+            if ranks_per_node < 1 or self.num_ranks % ranks_per_node:
+                raise ValueError("ranks_per_node must divide num_ranks")
+            if rdma_cost < 1:
+                raise ValueError("rdma_cost must be at least 1")
+            if any(token.source_rank >= self.num_ranks for token in tokens):
+                raise ValueError("routed token source rank exceeds num_ranks")
         assignment = self._initial_assignment(graph)
-        rank_by_expert = self._assignment_rank_map(assignment)
-        initial_cut = self._objective(graph, assignment, rank_by_expert)
+        rank_by_expert = self._rank_map(assignment)
+        initial_cut = evaluate_pairwise_cut(graph, rank_by_expert)
         rank_load = [
             sum(graph.demand[expert] for expert in experts) for experts in assignment
         ]
+        token_costs = (
+            [
+                _token_weighted_remote(token, rank_by_expert, ranks_per_node, rdma_cost)
+                for token in tokens
+            ]
+            if tokens is not None
+            else None
+        )
+        token_indexes: dict[int, set[int]] = defaultdict(set)
+        if tokens is not None:
+            for index, token in enumerate(tokens):
+                for expert in token.topk_experts:
+                    token_indexes[expert].add(index)
         rounds = 0
         while self.max_rounds is None or rounds < self.max_rounds:
-            # Compute all one-expert move gains once per round. A candidate
-            # swap is then scored in O(1), instead of rescanning neighbors
-            # and rank sets for every pair.
             move_gains = self._move_gains(graph, rank_by_expert)
-            best: Optional[Tuple[float, int, int, int, int]] = None
+            candidates = []
             for left_rank in range(self.num_ranks):
                 for right_rank in range(left_rank + 1, self.num_ranks):
-                    for left_expert in assignment[left_rank]:
-                        for right_expert in assignment[right_rank]:
-                            edge_weight = graph.adjacency.get(left_expert, {}).get(
-                                right_expert, 0
-                            )
+                    for left in assignment[left_rank]:
+                        for right in assignment[right_rank]:
                             delta = (
-                                move_gains[left_expert][right_rank]
-                                + move_gains[right_expert][left_rank]
-                                + 2 * edge_weight
+                                move_gains[left][right_rank]
+                                + move_gains[right][left_rank]
+                                + 2 * graph.adjacency.get(left, {}).get(right, 0)
                             )
-                            if self.balance_weight:
-                                delta += self._balance_delta(
-                                    graph,
-                                    rank_load,
-                                    left_expert,
-                                    right_expert,
-                                    left_rank,
-                                    right_rank,
-                                )
-                            candidate = (
-                                delta,
-                                left_rank,
-                                right_rank,
-                                left_expert,
-                                right_expert,
+                            candidates.append(
+                                (delta, left_rank, right_rank, left, right)
                             )
-                            if delta < 0 and (best is None or candidate < best):
-                                best = candidate
+            if tokens is None:
+                best = min((item for item in candidates if item[0] < 0), default=None)
+                affected = None
+            else:
+                best = None
+                affected = None
+                best_key = None
+                average_load = sum(rank_load) / self.num_ranks
+                current_imbalance = max(rank_load) / average_load
+                for candidate in nsmallest(self.rerank_candidates, candidates):
+                    delta, left_rank, right_rank, left, right = candidate
+                    next_load = list(rank_load)
+                    next_load[left_rank] += graph.demand[right] - graph.demand[left]
+                    next_load[right_rank] += graph.demand[left] - graph.demand[right]
+                    if self.max_compute_imbalance is not None and (
+                        max(next_load) / average_load
+                        > max(current_imbalance, self.max_compute_imbalance)
+                    ):
+                        continue
+                    indexes = token_indexes[left] | token_indexes[right]
+                    swap = left, right, left_rank, right_rank
+                    remote_delta = sum(
+                        _token_weighted_remote(
+                            tokens[index],
+                            rank_by_expert,
+                            ranks_per_node,
+                            rdma_cost,
+                            swap,
+                        )
+                        - token_costs[index]
+                        for index in indexes
+                    )
+                    key = remote_delta, delta, left_rank, right_rank, left, right
+                    if remote_delta < 0 and (best_key is None or key < best_key):
+                        best_key = key
+                        best = candidate
+                        affected = indexes
             if best is None:
                 break
-            _, left_rank, right_rank, left_expert, right_expert = best
-            assignment[left_rank].remove(left_expert)
-            assignment[left_rank].add(right_expert)
-            assignment[right_rank].remove(right_expert)
-            assignment[right_rank].add(left_expert)
-            rank_by_expert[left_expert] = right_rank
-            rank_by_expert[right_expert] = left_rank
-            rank_load[left_rank] += (
-                graph.demand[right_expert] - graph.demand[left_expert]
-            )
-            rank_load[right_rank] += (
-                graph.demand[left_expert] - graph.demand[right_expert]
-            )
+            _, left_rank, right_rank, left, right = best
+            assignment[left_rank].remove(left)
+            assignment[left_rank].add(right)
+            assignment[right_rank].remove(right)
+            assignment[right_rank].add(left)
+            rank_by_expert[left], rank_by_expert[right] = right_rank, left_rank
+            rank_load[left_rank] += graph.demand[right] - graph.demand[left]
+            rank_load[right_rank] += graph.demand[left] - graph.demand[right]
+            if affected is not None:
+                for index in affected:
+                    token_costs[index] = _token_weighted_remote(
+                        tokens[index], rank_by_expert, ranks_per_node, rdma_cost
+                    )
             rounds += 1
 
-        experts_by_rank = {
-            rank: tuple(sorted(experts)) for rank, experts in enumerate(assignment)
-        }
-        final_cut = self._objective(graph, assignment, rank_by_expert)
         return GraphPlacement(
-            rank_by_expert, experts_by_rank, initial_cut, final_cut, rounds
+            rank_by_expert,
+            {rank: tuple(sorted(experts)) for rank, experts in enumerate(assignment)},
+            initial_cut,
+            evaluate_pairwise_cut(graph, rank_by_expert),
+            rounds,
         )
 
-    def _initial_assignment(self, graph: CoRoutingGraph) -> List[Set[int]]:
+    def _initial_assignment(self, graph: CoRoutingGraph) -> list[set[int]]:
         assignment = [set() for _ in range(self.num_ranks)]
-        rank_load = [0] * self.num_ranks
-        # High-degree vertices carry the graph structure; demand breaks ties.
-        weighted_degree = graph.weighted_degree
+        loads = [0] * self.num_ranks
+        degree = graph.weighted_degree
         order = sorted(
             graph.experts,
-            key=lambda expert: (
-                -weighted_degree[expert],
-                -graph.demand[expert],
-                expert,
-            ),
+            key=lambda expert: (-degree[expert], -graph.demand[expert], expert),
         )
         for expert in order:
             candidates = [
@@ -470,139 +323,39 @@ class CoRoutingGraphSolver:
             ]
             if not candidates:
                 raise ValueError("expert count exceeds total rank capacity")
-
-            def score(rank: int) -> Tuple[int, int, int]:
-                connectivity = sum(
-                    graph.adjacency.get(expert, {}).get(other, 0)
-                    for other in assignment[rank]
-                )
-                # Prefer high connectivity, then less demand, then rank id.
-                return (-connectivity, rank_load[rank], rank)
-
-            rank = min(candidates, key=score)
+            rank = min(
+                candidates,
+                key=lambda candidate: (
+                    -sum(
+                        graph.adjacency.get(expert, {}).get(other, 0)
+                        for other in assignment[candidate]
+                    ),
+                    loads[candidate],
+                    candidate,
+                ),
+            )
             assignment[rank].add(expert)
-            rank_load[rank] += graph.demand[expert]
+            loads[rank] += graph.demand[expert]
         return assignment
-
-    def _objective(
-        self,
-        graph: CoRoutingGraph,
-        assignment: Sequence[Set[int]],
-        rank_by_expert: Optional[Mapping[int, int]] = None,
-    ) -> float:
-        rank_by_expert = rank_by_expert or self._assignment_rank_map(assignment)
-        cut = sum(
-            weight
-            for (left, right), weight in graph.edges.items()
-            if rank_by_expert[left] != rank_by_expert[right]
-        )
-        if self.balance_weight == 0:
-            return float(cut)
-        loads = [
-            sum(graph.demand[expert] for expert in experts) for experts in assignment
-        ]
-        average = sum(loads) / self.num_ranks
-        imbalance = sum((load - average) ** 2 for load in loads) / max(average, 1.0)
-        return cut + self.balance_weight * imbalance
 
     def _move_gains(
         self, graph: CoRoutingGraph, rank_by_expert: Mapping[int, int]
-    ) -> Dict[int, List[float]]:
-        gains: Dict[int, List[float]] = {}
+    ) -> dict[int, list[int]]:
+        result = {}
         for expert in graph.experts:
             weight_to_rank = [0] * self.num_ranks
-            total_weight = 0
+            total = 0
             for neighbor, weight in graph.adjacency.get(expert, {}).items():
                 weight_to_rank[rank_by_expert[neighbor]] += weight
-                total_weight += weight
-            home = rank_by_expert[expert]
-            old_cut = total_weight - weight_to_rank[home]
-            gains[expert] = [
-                float(total_weight - weight_to_rank[rank] - old_cut)
-                for rank in range(self.num_ranks)
-            ]
-        return gains
-
-    def _balance_delta(
-        self,
-        graph: CoRoutingGraph,
-        rank_load: Sequence[int],
-        left_expert: int,
-        right_expert: int,
-        left_rank: int,
-        right_rank: int,
-    ) -> float:
-        average = sum(rank_load) / self.num_ranks
-        before = (rank_load[left_rank] - average) ** 2 + (
-            rank_load[right_rank] - average
-        ) ** 2
-        left_after = (
-            rank_load[left_rank]
-            + graph.demand[right_expert]
-            - graph.demand[left_expert]
-        )
-        right_after = (
-            rank_load[right_rank]
-            + graph.demand[left_expert]
-            - graph.demand[right_expert]
-        )
-        after = (left_after - average) ** 2 + (right_after - average) ** 2
-        return self.balance_weight * (after - before) / max(average, 1.0)
+                total += weight
+            current = total - weight_to_rank[rank_by_expert[expert]]
+            result[expert] = [total - weight - current for weight in weight_to_rank]
+        return result
 
     @staticmethod
-    def _assignment_rank_map(assignment: Sequence[Set[int]]) -> Dict[int, int]:
+    def _rank_map(assignment: Sequence[set[int]]) -> dict[int, int]:
         return {
             expert: rank
             for rank, experts in enumerate(assignment)
             for expert in experts
         }
-
-    @staticmethod
-    def _rank_of(assignment: Sequence[Set[int]], expert: int) -> int:
-        for rank, experts in enumerate(assignment):
-            if expert in experts:
-                return rank
-        raise KeyError(f"expert {expert} is not assigned")
-
-
-def evaluate_primary_remote(
-    routed_tokens: Iterable[RoutedToken], rank_by_expert: Mapping[int, int]
-) -> int:
-    """Exact remote rank-copy count for a one-home-per-expert placement."""
-
-    total = 0
-    for token in routed_tokens:
-        total += token.count * len(
-            {
-                rank_by_expert[expert]
-                for expert in token.topk_experts
-                if rank_by_expert[expert] != token.source_rank
-            }
-        )
-    return total
-
-
-def evaluate_destination_rank_copies(
-    routed_tokens: Iterable[RoutedToken], rank_by_expert: Mapping[int, int]
-) -> int:
-    """Count all distinct destination ranks touched by each Top-K bundle."""
-
-    return sum(
-        token.count * len({rank_by_expert[expert] for expert in token.topk_experts})
-        for token in routed_tokens
-    )
-
-
-def evaluate_hypergraph_objective(
-    routed_tokens: Iterable[RoutedToken],
-    rank_by_expert: Mapping[int, int],
-    *,
-    objective: str,
-) -> int:
-    """Evaluate either supported exact hypergraph placement objective."""
-
-    if objective == "source-aware":
-        return evaluate_primary_remote(routed_tokens, rank_by_expert)
-    if objective == "source-agnostic":
-        return evaluate_destination_rank_copies(routed_tokens, rank_by_expert)
-    raise ValueError("objective must be 'source-aware' or 'source-agnostic'")
