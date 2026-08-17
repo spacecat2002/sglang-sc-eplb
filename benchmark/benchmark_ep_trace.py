@@ -129,8 +129,8 @@ def main() -> None:
     parser.add_argument("--ep-size", type=int, required=True)
     parser.add_argument(
         "--moe-a2a-backend",
-        choices=["deepep", "flashinfer", "mooncake", "nixl", "mori", "megamoe"],
-        default="deepep",
+        choices=["none", "deepep", "flashinfer", "mooncake", "nixl", "mori", "megamoe"],
+        default="none",
     )
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--quantization")
