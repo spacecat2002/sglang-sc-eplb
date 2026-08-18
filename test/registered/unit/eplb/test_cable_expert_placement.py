@@ -1,5 +1,8 @@
+import numpy as np
+
 from sglang.srt.eplb.cable_expert_placement import cable_expert_placement
 from sglang.srt.eplb.expert_affinity_graph import (
+    RoutedArrays,
     RoutedToken,
     build_co_routing_graph,
     evaluate_primary_remote,
@@ -24,6 +27,41 @@ def test_cable_finds_balanced_source_local_bundles_without_grace():
     assert placement.metrics.remote == 0
     assert placement.metrics.max_ingress == 0
     assert placement.metrics.compute_imbalance == 1
+
+
+def test_routed_arrays_match_token_path():
+    tokens = [
+        RoutedToken(0, (0, 1, 2), 7),
+        RoutedToken(1, (1, 2, 3), 5),
+        RoutedToken(2, (0, 2, 3), 3),
+    ]
+    arrays = RoutedArrays(
+        np.array([token.source_rank for token in tokens], dtype=np.int16),
+        np.array([token.topk_experts for token in tokens], dtype=np.int16),
+        np.array([token.count for token in tokens], dtype=np.int16),
+    )
+    token_graph = build_co_routing_graph(tokens, experts=range(4))
+    array_graph = build_co_routing_graph(arrays, experts=range(4))
+    initial = {expert: expert for expert in range(4)}
+    common = dict(
+        experts=range(4),
+        num_ranks=4,
+        capacity_ratio=0,
+        initial_placement=initial,
+        refine_rounds=2,
+        swap_rounds=2,
+        cycle_rounds=1,
+    )
+
+    assert array_graph == token_graph
+    assert hypergraph_expert_placement(arrays, **common) == (
+        hypergraph_expert_placement(tokens, **common)
+    )
+    assert cable_expert_placement(
+        arrays, experts=range(4), num_ranks=4, capacity_ratio=0
+    ) == cable_expert_placement(
+        tokens, experts=range(4), num_ranks=4, capacity_ratio=0
+    )
 
 
 def test_cable_remote_refinement_accepts_only_improving_swaps():
@@ -189,6 +227,69 @@ def test_grace_pair_swaps_improve_remote_at_equal_capacity():
 
     assert swapped["metrics"].remote < matched["metrics"].remote
     assert {len(group) for group in swapped["experts_by_rank"].values()} == {2}
+
+
+def test_grace_swaps_reduce_congestion_without_increasing_remote():
+    tokens = [
+        RoutedToken(1, (0, 1, 2), 7),
+        RoutedToken(3, (1, 3, 6), 6),
+        RoutedToken(3, (0, 6, 7), 7),
+        RoutedToken(3, (2, 4, 7), 7),
+        RoutedToken(3, (0, 2, 5), 9),
+        RoutedToken(2, (0, 1, 4), 6),
+        RoutedToken(1, (2, 3, 5), 9),
+    ]
+    initial = {expert: expert // 2 for expert in range(8)}
+    common = dict(
+        experts=range(8),
+        num_ranks=4,
+        capacity_ratio=0,
+        initial_placement=initial,
+        refine_rounds=0,
+    )
+    original = hypergraph_expert_placement(tokens, swap_rounds=0, **common)
+    refined = hypergraph_expert_placement(
+        tokens, swap_rounds=1, swap_candidate_partners=8, **common
+    )
+
+    assert refined["metrics"].remote == original["metrics"].remote
+    assert (
+        refined["metrics"].max_ingress,
+        refined["metrics"].max_pair_traffic,
+        refined["metrics"].max_egress,
+    ) < (
+        original["metrics"].max_ingress,
+        original["metrics"].max_pair_traffic,
+        original["metrics"].max_egress,
+    )
+
+
+def test_grace_three_cycles_escape_pair_swap_local_minimum():
+    tokens = [
+        RoutedToken(1, (1, 5, 6), 6),
+        RoutedToken(2, (3, 4, 5), 7),
+        RoutedToken(1, (2, 4, 7), 7),
+        RoutedToken(2, (1, 7, 8), 3),
+        RoutedToken(2, (1, 2, 3), 2),
+        RoutedToken(1, (0, 5, 8), 4),
+        RoutedToken(2, (0, 3, 6), 6),
+        RoutedToken(1, (0, 3, 6), 2),
+    ]
+    common = dict(
+        experts=range(9),
+        num_ranks=3,
+        capacity_ratio=0,
+        initial_placement={expert: expert // 3 for expert in range(9)},
+        refine_rounds=0,
+        swap_rounds=6,
+        swap_candidate_partners=9,
+        cycle_candidate_partners=9,
+    )
+    pair_only = hypergraph_expert_placement(tokens, cycle_rounds=0, **common)
+    cycled = hypergraph_expert_placement(tokens, cycle_rounds=3, **common)
+
+    assert cycled["metrics"].remote < pair_only["metrics"].remote
+    assert {len(group) for group in cycled["experts_by_rank"].values()} == {3}
 
 
 def test_grace_equal_experts_preserves_affinity_and_cardinality():

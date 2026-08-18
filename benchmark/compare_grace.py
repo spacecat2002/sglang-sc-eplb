@@ -11,11 +11,14 @@ import time
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+import numpy as np
+
 from sglang.srt.eplb.cable_expert_placement import (
     cable_expert_placement,
     evaluate_cable_placement,
 )
 from sglang.srt.eplb.expert_affinity_graph import (
+    RoutedArrays,
     RoutedToken,
     build_co_routing_graph,
     evaluate_primary_remote,
@@ -58,7 +61,7 @@ def _load(path: str) -> tuple[Any, list[tuple[str, Any, bool]]]:
 
 def _tokens(
     name: str, value: Any, compact: bool, *, limit: int, seed: int
-) -> tuple[list[RoutedToken], int]:
+) -> tuple[list[RoutedToken] | RoutedArrays, int]:
     if compact:
         size = int(value["source_rank"].shape[0])
         if limit and size > limit:
@@ -68,19 +71,16 @@ def _tokens(
                 sorted(random.Random(seed).sample(range(size), limit)),
                 dtype=torch.int64,
             )
-            source = value["source_rank"].index_select(0, index).tolist()
-            topk = value["topk_experts"].index_select(0, index).tolist()
-            count = value["count"].index_select(0, index).tolist()
+            source = value["source_rank"].index_select(0, index)
+            topk = value["topk_experts"].index_select(0, index)
+            count = value["count"].index_select(0, index)
         else:
             source, topk, count = (
-                value["source_rank"].tolist(),
-                value["topk_experts"].tolist(),
-                value["count"].tolist(),
+                value["source_rank"],
+                value["topk_experts"],
+                value["count"],
             )
-        return [
-            RoutedToken(int(s), tuple(map(int, experts)), int(c))
-            for s, experts, c in zip(source, topk, count)
-        ], size
+        return RoutedArrays(source.numpy(), topk.numpy(), count.numpy()), size
     result = []
     for index, entry in enumerate(value):
         try:
@@ -97,8 +97,25 @@ def _tokens(
 
 
 def _reshard(
-    tokens: Sequence[RoutedToken], source_ep: int, target_ep: int
-) -> list[RoutedToken]:
+    tokens: Sequence[RoutedToken] | RoutedArrays, source_ep: int, target_ep: int
+) -> list[RoutedToken] | RoutedArrays:
+    if isinstance(tokens, RoutedArrays):
+        if source_ep < 1 or tokens.source_rank.max() >= source_ep:
+            raise ValueError("trace contains a source rank outside source EP")
+        if source_ep == target_ep:
+            return tokens
+        if target_ep < source_ep or target_ep % source_ep:
+            raise ValueError("target EP must be a multiple of source EP")
+        fanout = target_ep // source_ep
+        offsets = np.tile(np.arange(fanout), len(tokens))
+        counts = np.repeat(tokens.count // fanout, fanout)
+        counts += offsets < np.repeat(tokens.count % fanout, fanout)
+        keep = counts != 0
+        return RoutedArrays(
+            (np.repeat(tokens.source_rank, fanout) * fanout + offsets)[keep],
+            np.repeat(tokens.topk_experts, fanout, axis=0)[keep],
+            counts[keep],
+        )
     if source_ep < 1 or any(token.source_rank >= source_ep for token in tokens):
         raise ValueError("trace contains a source rank outside source EP")
     if source_ep == target_ep:
@@ -121,7 +138,7 @@ def _reshard(
 
 
 def _metrics(
-    tokens: Sequence[RoutedToken],
+    tokens: Sequence[RoutedToken] | RoutedArrays,
     placement: Mapping[int, int],
     *,
     num_ranks: int,
@@ -213,7 +230,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 initial_placement=placement.rank_by_expert,
                 align_groups=True,
                 swap_rounds=args.grace_refine_swaps,
+                cycle_rounds=args.grace_refine_cycles,
                 swap_candidate_partners=args.grace_refine_partners,
+                cycle_candidate_partners=args.grace_refine_cycle_partners,
             )
             if args.grace_refine
             else None
@@ -442,7 +461,9 @@ def main() -> None:
     parser.add_argument("--grace-refine", action="store_true")
     parser.add_argument("--grace-refine-rounds", type=int, default=4)
     parser.add_argument("--grace-refine-swaps", type=int, default=2)
+    parser.add_argument("--grace-refine-cycles", type=int, default=1)
     parser.add_argument("--grace-refine-partners", type=int, default=8)
+    parser.add_argument("--grace-refine-cycle-partners", type=int, default=4)
     parser.add_argument("--grace-refine-capacity-ratio", type=float)
     parser.add_argument("--cable-congestion-weight", type=float, default=0.25)
     parser.add_argument("--cable-load-weight", type=float, default=0.25)
@@ -489,7 +510,9 @@ def main() -> None:
         or args.hypergraph_refine_rounds < 0
         or args.grace_refine_rounds < 0
         or args.grace_refine_swaps < 0
+        or args.grace_refine_cycles < 0
         or args.grace_refine_partners < 1
+        or args.grace_refine_cycle_partners < 1
         or (
             args.grace_refine_capacity_ratio is not None
             and not 0 <= args.grace_refine_capacity_ratio < 1

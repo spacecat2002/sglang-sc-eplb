@@ -7,7 +7,12 @@ from typing import Mapping, Sequence
 
 import numpy as np
 
-from .expert_affinity_graph import RoutedToken
+from .expert_affinity_graph import (
+    RoutedArrays,
+    RoutedToken,
+    as_routed_arrays,
+    index_topk_experts,
+)
 
 
 @dataclass(frozen=True)
@@ -30,6 +35,38 @@ class CablePlacement:
     experts_by_rank: dict[int, tuple[int, ...]]
     metrics: CableMetrics
     objective: float
+
+
+def _traffic_key(traffic: np.ndarray) -> tuple[int, int, int]:
+    return (
+        int(traffic.sum(axis=0).max()),
+        int(traffic.max()),
+        int(traffic.sum(axis=1).max()),
+    )
+
+
+def _move_deltas(
+    source: np.ndarray,
+    count: np.ndarray,
+    token_indexes: Sequence[np.ndarray],
+    bundle_rank_counts: np.ndarray,
+    ranks: np.ndarray,
+    num_ranks: int,
+) -> np.ndarray:
+    move_delta = np.zeros((len(ranks), num_ranks), dtype=np.int64)
+    for expert, indexes in enumerate(token_indexes):
+        old_rank = ranks[expert]
+        sources = source[indexes]
+        remove = -count[indexes] * (
+            (bundle_rank_counts[indexes, old_rank] == 1) & (sources != old_rank)
+        )
+        for target in range(num_ranks):
+            if target != old_rank:
+                add = count[indexes] * (
+                    (bundle_rank_counts[indexes, target] == 0) & (sources != target)
+                )
+                move_delta[expert, target] = int((remove + add).sum())
+    return move_delta
 
 
 def _refine_compute_moves(
@@ -178,22 +215,14 @@ def _refine_swaps(
     remote_delta_total = 0
     remote_budget_tokens = int(total_tokens * remote_budget)
     for _ in range(rounds):
-        move_delta = np.zeros((expert_count, num_ranks), dtype=np.int64)
-        for expert, indexes in enumerate(token_indexes):
-            old_rank = ranks[expert]
-            sources = source[indexes]
-            old_counts = bundle_rank_counts[indexes, old_rank]
-            remove = -count[indexes] * (
-                (old_counts == 1) & (sources != old_rank)
-            )
-            for target in range(num_ranks):
-                if target == old_rank:
-                    continue
-                add = count[indexes] * (
-                    (bundle_rank_counts[indexes, target] == 0)
-                    & (sources != target)
-                )
-                move_delta[expert, target] = int((remove + add).sum())
+        move_delta = _move_deltas(
+            source,
+            count,
+            token_indexes,
+            bundle_rank_counts,
+            ranks,
+            num_ranks,
+        )
 
         candidates = []
         for expert in np.argsort(-demand, kind="stable"):
@@ -222,8 +251,10 @@ def _refine_swaps(
                         move_delta[expert, target] + move_delta[partner, old_rank]
                     )
                     load_gain = int(demand[expert] - demand[partner])
-                    if estimate < 0 or (
-                        strategy == "balanced" and load_gain > 0
+                    if (
+                        estimate < 0
+                        or (strategy == "remote" and estimate == 0)
+                        or (strategy == "balanced" and load_gain > 0)
                     ):
                         candidates.append(
                             (
@@ -261,12 +292,10 @@ def _refine_swaps(
             old_right = bundle_rank_counts[indexes, right_rank]
             new_left = old_left - has_left + has_right
             new_right = old_right - has_right + has_left
-            delta_left = (new_left > 0).astype(np.int8) - (
-                old_left > 0
-            ).astype(np.int8)
-            delta_right = (new_right > 0).astype(np.int8) - (
-                old_right > 0
-            ).astype(np.int8)
+            delta_left = (new_left > 0).astype(np.int8) - (old_left > 0).astype(np.int8)
+            delta_right = (new_right > 0).astype(np.int8) - (old_right > 0).astype(
+                np.int8
+            )
             delta = int(
                 (
                     count[indexes]
@@ -280,6 +309,21 @@ def _refine_swaps(
             budget_allows = remote_delta_total + delta <= remote_budget_tokens
             if strategy == "remote":
                 accept = remote_improves
+                if delta == 0:
+                    next_traffic = traffic.copy()
+                    for rank, rank_delta in (
+                        (left_rank, delta_left),
+                        (right_rank, delta_right),
+                    ):
+                        changed_rows = rank_delta != 0
+                        next_traffic[:, rank] += np.bincount(
+                            sources[changed_rows],
+                            weights=count[indexes][changed_rows]
+                            * rank_delta[changed_rows]
+                            * (sources[changed_rows] != rank),
+                            minlength=num_ranks,
+                        ).astype(np.int64)
+                    accept = _traffic_key(next_traffic) < _traffic_key(traffic)
             else:
                 accept = remote_improves or (load_improves and budget_allows)
             if not accept:
@@ -315,13 +359,190 @@ def _refine_swaps(
             break
 
 
+def _refine_cycles(
+    *,
+    source: np.ndarray,
+    topk: np.ndarray,
+    count: np.ndarray,
+    token_indexes: Sequence[np.ndarray],
+    bundle_rank_counts: np.ndarray,
+    ranks: np.ndarray,
+    demand: np.ndarray,
+    compute_load: np.ndarray,
+    traffic: np.ndarray,
+    num_ranks: int,
+    rounds: int,
+    candidate_partners: int,
+) -> None:
+    """Apply bounded exact three-rank cycles without worsening max load."""
+
+    for _ in range(rounds):
+        move_delta = _move_deltas(
+            source,
+            count,
+            token_indexes,
+            bundle_rank_counts,
+            ranks,
+            num_ranks,
+        )
+        candidates = []
+        for first_rank in range(num_ranks):
+            for second_rank in range(first_rank + 1, num_ranks):
+                for third_rank in range(second_rank + 1, num_ranks):
+                    for middle_rank, last_rank in (
+                        (second_rank, third_rank),
+                        (third_rank, second_rank),
+                    ):
+                        pools = (
+                            (first_rank, middle_rank),
+                            (middle_rank, last_rank),
+                            (last_rank, first_rank),
+                        )
+                        choices = [
+                            sorted(
+                                np.flatnonzero(ranks == old_rank).tolist(),
+                                key=lambda expert: (
+                                    move_delta[expert, target_rank],
+                                    expert,
+                                ),
+                            )[:candidate_partners]
+                            for old_rank, target_rank in pools
+                        ]
+                        for first in choices[0]:
+                            for second in choices[1]:
+                                for third in choices[2]:
+                                    estimate = int(
+                                        move_delta[first, middle_rank]
+                                        + move_delta[second, last_rank]
+                                        + move_delta[third, first_rank]
+                                    )
+                                    if estimate <= 0:
+                                        candidates.append(
+                                            (
+                                                estimate,
+                                                first,
+                                                second,
+                                                third,
+                                                first_rank,
+                                                middle_rank,
+                                                last_rank,
+                                            )
+                                        )
+        candidates.sort()
+        locked = np.zeros(len(ranks), dtype=bool)
+        changed = False
+        for _, first, second, third, first_rank, second_rank, third_rank in candidates:
+            experts = (first, second, third)
+            old_ranks = (first_rank, second_rank, third_rank)
+            if (
+                any(locked[expert] for expert in experts)
+                or tuple(int(ranks[expert]) for expert in experts) != old_ranks
+            ):
+                continue
+            next_load = compute_load.copy()
+            next_load[first_rank] += demand[third] - demand[first]
+            next_load[second_rank] += demand[first] - demand[second]
+            next_load[third_rank] += demand[second] - demand[third]
+            if next_load.max() > compute_load.max():
+                continue
+
+            indexes = np.unique(
+                np.concatenate([token_indexes[expert] for expert in experts])
+            )
+            rows = topk[indexes]
+            present = [
+                np.any(rows == expert, axis=1).astype(np.int8) for expert in experts
+            ]
+            rank_deltas = (
+                -present[0] + present[2],
+                -present[1] + present[0],
+                -present[2] + present[1],
+            )
+            sources = source[indexes]
+            remote_delta = 0
+            traffic_deltas = []
+            for rank, rank_delta in zip(old_ranks, rank_deltas):
+                old_count = bundle_rank_counts[indexes, rank]
+                new_count = old_count + rank_delta
+                connectivity_delta = (new_count > 0).astype(np.int8) - (
+                    old_count > 0
+                ).astype(np.int8)
+                remote_delta += int(
+                    (count[indexes] * connectivity_delta * (sources != rank)).sum()
+                )
+                changed_rows = connectivity_delta != 0
+                traffic_deltas.append(
+                    np.bincount(
+                        sources[changed_rows],
+                        weights=count[indexes][changed_rows]
+                        * connectivity_delta[changed_rows]
+                        * (sources[changed_rows] != rank),
+                        minlength=num_ranks,
+                    ).astype(np.int64)
+                )
+            if remote_delta >= 0:
+                continue
+
+            for rank, delta_by_source in zip(old_ranks, traffic_deltas):
+                traffic[:, rank] += delta_by_source
+            for expert, old_rank, target_rank in zip(
+                experts, old_ranks, (second_rank, third_rank, first_rank)
+            ):
+                bundle_rank_counts[token_indexes[expert], old_rank] -= 1
+                bundle_rank_counts[token_indexes[expert], target_rank] += 1
+                ranks[expert] = target_rank
+                locked[expert] = True
+            compute_load[:] = next_load
+            changed = True
+        if not changed:
+            break
+
+
 def evaluate_cable_placement(
-    tokens: Sequence[RoutedToken],
+    tokens: Sequence[RoutedToken] | RoutedArrays,
     placement: Mapping[int, int],
     *,
     num_ranks: int,
 ) -> CableMetrics:
     """Measure exact bundle traffic for a fixed single-copy placement."""
+
+    if isinstance(tokens, RoutedArrays):
+        size = max(int(tokens.topk_experts.max()), max(placement, default=-1)) + 1
+        ranks = np.full(size, -1, dtype=np.intp)
+        for expert, rank in placement.items():
+            if expert < len(ranks):
+                ranks[expert] = rank
+        destinations = ranks[tokens.topk_experts]
+        if np.any(destinations < 0):
+            raise ValueError("placement is missing a routed expert")
+        traffic = np.zeros((num_ranks, num_ranks), dtype=np.int64)
+        for rank in range(num_ranks):
+            touched = np.any(destinations == rank, axis=1) & (
+                tokens.source_rank != rank
+            )
+            traffic[:, rank] = np.bincount(
+                tokens.source_rank[touched],
+                weights=tokens.count[touched],
+                minlength=num_ranks,
+            ).astype(np.int64)
+        demand = np.zeros(len(ranks), dtype=np.int64)
+        weights = tokens.count.astype(np.int64, copy=False)
+        for column in range(tokens.topk_experts.shape[1]):
+            demand += np.bincount(
+                tokens.topk_experts[:, column],
+                weights=weights,
+                minlength=len(ranks),
+            ).astype(np.int64)
+        compute_load = np.zeros(num_ranks, dtype=np.int64)
+        for expert, rank in placement.items():
+            compute_load[rank] += demand[expert]
+        return CableMetrics(
+            remote=int(traffic.sum()),
+            max_pair_traffic=int(traffic.max()),
+            max_ingress=int(traffic.sum(axis=0).max()),
+            max_egress=int(traffic.sum(axis=1).max()),
+            compute_load=tuple(int(load) for load in compute_load),
+        )
 
     traffic = [[0] * num_ranks for _ in range(num_ranks)]
     demand = {expert: 0 for expert in placement}
@@ -371,7 +592,7 @@ def _objective(
 
 
 def cable_expert_placement(
-    tokens: Sequence[RoutedToken],
+    tokens: Sequence[RoutedToken] | RoutedArrays,
     *,
     experts: Sequence[int],
     num_ranks: int,
@@ -389,6 +610,7 @@ def cable_expert_placement(
     experts = tuple(sorted(experts))
     if not tokens or not experts:
         raise ValueError("tokens and experts must not be empty")
+    arrays = as_routed_arrays(tokens)
     if num_ranks < 1:
         raise ValueError("num_ranks must be positive")
     if min(congestion_weight, load_weight) < 0:
@@ -403,17 +625,13 @@ def cable_expert_placement(
         raise ValueError("remote_budget must be in [0, 1]")
     if not 0 <= capacity_ratio < 1 or compute_imbalance_limit < 1:
         raise ValueError("invalid capacity or compute limits")
-    if any(token.source_rank >= num_ranks for token in tokens):
+    if arrays.source_rank.max() >= num_ranks:
         raise ValueError("token source rank exceeds num_ranks")
 
-    expert_index = {expert: index for index, expert in enumerate(experts)}
-    if any(
-        expert not in expert_index for token in tokens for expert in token.topk_experts
-    ):
-        raise ValueError("tokens contain an expert outside experts")
-    top_k = len(tokens[0].topk_experts)
-    if any(len(token.topk_experts) != top_k for token in tokens):
-        raise ValueError("all tokens must use the same Top-K")
+    topk = index_topk_experts(arrays, experts)
+    top_k = arrays.topk_experts.shape[1]
+    if top_k > np.iinfo(np.uint8).max:
+        raise ValueError("Top-K must fit in bundle rank counts")
 
     ideal_capacity = len(experts) / num_ranks
     capacity_delta = round(ideal_capacity * capacity_ratio)
@@ -428,41 +646,31 @@ def cable_expert_placement(
     if not minimum_capacity or maximum_capacity * num_ranks < len(experts):
         raise ValueError("expert count must be at least num_ranks")
 
-    source = np.fromiter(
-        (token.source_rank for token in tokens), dtype=np.intp, count=len(tokens)
-    )
-    topk = np.asarray(
-        [[expert_index[expert] for expert in token.topk_experts] for token in tokens],
-        dtype=np.intp,
-    )
-    count = np.fromiter(
-        (token.count for token in tokens), dtype=np.int64, count=len(tokens)
-    )
+    source = arrays.source_rank
+    count = arrays.count.astype(np.int64, copy=False)
     total_tokens = int(count.sum())
-    bundle_ids = np.repeat(np.arange(len(tokens)), top_k)
     flat_experts = topk.ravel()
     sorted_positions = np.argsort(flat_experts, kind="stable")
     expert_counts = np.bincount(flat_experts, minlength=len(experts))
     offsets = np.concatenate(([0], np.cumsum(expert_counts)))
+    index_dtype = np.int32 if len(arrays) <= np.iinfo(np.int32).max else np.intp
     token_indexes = [
-        bundle_ids[sorted_positions[offsets[expert] : offsets[expert + 1]]]
+        (
+            sorted_positions[offsets[expert] : offsets[expert + 1]] // top_k
+        ).astype(index_dtype)
         for expert in range(len(experts))
     ]
 
-    repeated_count = np.repeat(count, top_k)
     demand = np.zeros(len(experts), dtype=np.int64)
     source_demand = np.zeros((len(experts), num_ranks), dtype=np.int64)
-    np.add.at(demand, flat_experts, repeated_count)
-    np.add.at(
-        source_demand,
-        (flat_experts, np.repeat(source, top_k)),
-        repeated_count,
-    )
+    for column in range(top_k):
+        np.add.at(demand, topk[:, column], count)
+        np.add.at(source_demand, (topk[:, column], source), count)
     order = np.lexsort((np.arange(len(experts)), -demand, -source_demand.max(axis=1)))
 
     ranks = np.full(len(experts), -1, dtype=np.intp)
     slots_used = np.zeros(num_ranks, dtype=np.intp)
-    bundle_rank_counts = np.zeros((len(tokens), num_ranks), dtype=np.uint8)
+    bundle_rank_counts = np.zeros((len(arrays), num_ranks), dtype=np.uint8)
     traffic = np.zeros((num_ranks, num_ranks), dtype=np.int64)
     ingress = np.zeros(num_ranks, dtype=np.int64)
     egress = np.zeros(num_ranks, dtype=np.int64)
@@ -594,7 +802,7 @@ def cable_expert_placement(
         metrics=metrics,
         objective=_objective(
             metrics,
-            total_tokens=sum(token.count for token in tokens),
+            total_tokens=total_tokens,
             congestion_weight=congestion_weight,
             load_weight=load_weight,
         ),

@@ -7,10 +7,16 @@ from typing import Mapping, Sequence
 import numpy as np
 
 from .cable_expert_placement import (
+    _refine_cycles,
     _refine_swaps,
     evaluate_cable_placement,
 )
-from .expert_affinity_graph import RoutedToken
+from .expert_affinity_graph import (
+    RoutedArrays,
+    RoutedToken,
+    as_routed_arrays,
+    index_topk_experts,
+)
 
 
 def _capacity_bounds(
@@ -30,7 +36,7 @@ def _capacity_bounds(
 
 
 def _prepare(
-    tokens: Sequence[RoutedToken], experts: Sequence[int]
+    tokens: Sequence[RoutedToken] | RoutedArrays, experts: Sequence[int]
 ) -> tuple[
     np.ndarray,
     np.ndarray,
@@ -39,37 +45,27 @@ def _prepare(
     np.ndarray,
     np.ndarray,
 ]:
-    expert_index = {expert: index for index, expert in enumerate(experts)}
-    if any(
-        expert not in expert_index for token in tokens for expert in token.topk_experts
-    ):
-        raise ValueError("tokens contain an expert outside experts")
-    top_k = len(tokens[0].topk_experts)
-    if any(len(token.topk_experts) != top_k for token in tokens):
-        raise ValueError("all tokens must use the same Top-K")
-    source = np.fromiter(
-        (token.source_rank for token in tokens), dtype=np.intp, count=len(tokens)
-    )
-    topk = np.asarray(
-        [[expert_index[expert] for expert in token.topk_experts] for token in tokens],
-        dtype=np.intp,
-    )
-    count = np.fromiter(
-        (token.count for token in tokens), dtype=np.int64, count=len(tokens)
-    )
+    arrays = as_routed_arrays(tokens)
+    source = arrays.source_rank
+    topk = index_topk_experts(arrays, experts)
+    count = arrays.count.astype(np.int64, copy=False)
+    top_k = topk.shape[1]
+    if top_k > np.iinfo(np.uint8).max:
+        raise ValueError("Top-K must fit in bundle rank counts")
     flat = topk.ravel()
-    bundle_ids = np.repeat(np.arange(len(tokens)), top_k)
     order = np.argsort(flat, kind="stable")
     frequencies = np.bincount(flat, minlength=len(experts))
     offsets = np.concatenate(([0], np.cumsum(frequencies)))
+    index_dtype = np.int32 if len(tokens) <= np.iinfo(np.int32).max else np.intp
     token_indexes = [
-        bundle_ids[order[offsets[e] : offsets[e + 1]]] for e in range(len(experts))
+        (order[offsets[e] : offsets[e + 1]] // top_k).astype(index_dtype)
+        for e in range(len(experts))
     ]
-    repeated_count = np.repeat(count, top_k)
     demand = np.zeros(len(experts), dtype=np.int64)
     source_demand = np.zeros((len(experts), int(source.max()) + 1), dtype=np.int64)
-    np.add.at(demand, flat, repeated_count)
-    np.add.at(source_demand, (flat, np.repeat(source, top_k)), repeated_count)
+    for column in range(top_k):
+        np.add.at(demand, topk[:, column], count)
+        np.add.at(source_demand, (topk[:, column], source), count)
     return source, topk, count, token_indexes, demand, source_demand
 
 
@@ -253,7 +249,7 @@ def _placement_state(
     slots = np.bincount(ranks, minlength=num_ranks).astype(np.intp)
     if np.any(slots < minimum_capacity) or np.any(slots > maximum_capacity):
         raise ValueError("initial_placement violates expert capacity bounds")
-    bundle_counts = np.zeros((len(source), num_ranks), dtype=np.uint16)
+    bundle_counts = np.zeros((len(source), num_ranks), dtype=np.uint8)
     for expert, indexes in enumerate(token_indexes):
         bundle_counts[indexes, ranks[expert]] += 1
     return ranks, slots, bundle_counts
@@ -364,7 +360,7 @@ def _traffic(
 
 
 def hypergraph_expert_placement(
-    tokens: Sequence[RoutedToken],
+    tokens: Sequence[RoutedToken] | RoutedArrays,
     *,
     experts: Sequence[int],
     num_ranks: int,
@@ -376,7 +372,9 @@ def hypergraph_expert_placement(
     initial_placement: Mapping[int, int] | None = None,
     align_groups: bool = False,
     swap_rounds: int = 0,
+    cycle_rounds: int = 0,
     swap_candidate_partners: int = 4,
+    cycle_candidate_partners: int = 4,
 ) -> dict[str, object]:
     """Solve fixed-terminal hypergraph connectivity placement.
 
@@ -388,18 +386,19 @@ def hypergraph_expert_placement(
     experts = tuple(sorted(experts))
     if not tokens or not experts:
         raise ValueError("tokens and experts must not be empty")
-    if num_ranks < 1 or any(token.source_rank >= num_ranks for token in tokens):
+    arrays = as_routed_arrays(tokens)
+    if num_ranks < 1 or arrays.source_rank.max() >= num_ranks:
         raise ValueError("invalid num_ranks or source rank")
     if not 0 <= capacity_ratio < 1 or compute_imbalance_limit < 1:
         raise ValueError("invalid capacity or compute limits")
-    if starts < 1 or min(refine_rounds, swap_rounds) < 0:
+    if starts < 1 or min(refine_rounds, swap_rounds, cycle_rounds) < 0:
         raise ValueError("starts must be positive and refinement rounds non-negative")
-    if swap_candidate_partners < 1:
-        raise ValueError("swap_candidate_partners must be positive")
+    if min(swap_candidate_partners, cycle_candidate_partners) < 1:
+        raise ValueError("candidate partner counts must be positive")
     if not 0 <= remote_budget <= 1:
         raise ValueError("remote_budget must be in [0, 1]")
     source, topk, count, token_indexes, demand, source_demand = _prepare(
-        tokens, experts
+        arrays, experts
     )
     minimum, maximum = _capacity_bounds(len(experts), num_ranks, capacity_ratio)
     best = None
@@ -445,6 +444,7 @@ def hypergraph_expert_placement(
             total_tokens=int(count.sum()),
             remote_budget=remote_budget,
         )
+        traffic = _traffic(source, count, bundle_counts)
         _refine_swaps(
             source=source,
             topk=topk,
@@ -454,7 +454,7 @@ def hypergraph_expert_placement(
             ranks=ranks,
             demand=demand,
             compute_load=loads,
-            traffic=_traffic(source, count, bundle_counts),
+            traffic=traffic,
             num_ranks=num_ranks,
             rounds=swap_rounds,
             total_tokens=int(count.sum()),
@@ -462,8 +462,22 @@ def hypergraph_expert_placement(
             remote_budget=0.0,
             candidate_partners=swap_candidate_partners,
         )
+        _refine_cycles(
+            source=source,
+            topk=topk,
+            count=count,
+            token_indexes=token_indexes,
+            bundle_rank_counts=bundle_counts,
+            ranks=ranks,
+            demand=demand,
+            compute_load=loads,
+            traffic=traffic,
+            num_ranks=num_ranks,
+            rounds=cycle_rounds,
+            candidate_partners=cycle_candidate_partners,
+        )
         placement = {expert: int(ranks[i]) for i, expert in enumerate(experts)}
-        metrics = evaluate_cable_placement(tokens, placement, num_ranks=num_ranks)
+        metrics = evaluate_cable_placement(arrays, placement, num_ranks=num_ranks)
         key = (
             metrics.remote,
             metrics.max_ingress,
