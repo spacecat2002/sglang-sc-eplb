@@ -68,10 +68,11 @@ PYTHONPATH=python python benchmark/compare_grace.py \
   --input /tmp/qwen3_ep8_trace.pt \
   --num-ranks 8 --ranks-per-node 8 --grace-refine \
   --grace-refine-rounds 8 \
+  --grace-refine-swaps 2 --grace-refine-partners 8 \
   --save-grace-refine grace-refined.json
 ```
 
-增加 refinement 轮数不会提高 remote：每轮只接受精确 Top-K remote 下降，或 remote 不变但计算负载改善的 move，并在无改进时提前停止。
+该路径先根据完整 Top-K bundle 对 GRACE groups 做精确 group-to-rank assignment，再执行受限 exact pair-swap。两步均保持 remote 不增；pair-swap 还能在每个 rank 专家数严格相同时继续优化。
 
 `--optimizer-bundles 0` 表示使用完整 compact trace，但一千万 bundle 会明显变慢。`--rdma-cost 1` 适用于单机 NVLink/NVSwitch；`none` backend 仅用于采集路由，实际通信收益需要在 token A2A backend 下验证。
 

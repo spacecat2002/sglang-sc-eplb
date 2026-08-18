@@ -6,7 +6,10 @@ from typing import Mapping, Sequence
 
 import numpy as np
 
-from .cable_expert_placement import CableMetrics, evaluate_cable_placement
+from .cable_expert_placement import (
+    _refine_swaps,
+    evaluate_cable_placement,
+)
 from .expert_affinity_graph import RoutedToken
 
 
@@ -256,6 +259,110 @@ def _placement_state(
     return ranks, slots, bundle_counts
 
 
+def _linear_assignment(cost: np.ndarray) -> np.ndarray:
+    """Return the exact minimum-cost column for every row."""
+
+    size = len(cost)
+    u = np.zeros(size + 1, dtype=np.int64)
+    v = np.zeros(size + 1, dtype=np.int64)
+    matched_row = np.zeros(size + 1, dtype=np.intp)
+    previous = np.zeros(size + 1, dtype=np.intp)
+    for row in range(1, size + 1):
+        matched_row[0] = row
+        column = 0
+        minimum = np.full(size + 1, np.iinfo(np.int64).max, dtype=np.int64)
+        used = np.zeros(size + 1, dtype=bool)
+        while True:
+            used[column] = True
+            current_row = matched_row[column]
+            delta = np.iinfo(np.int64).max
+            next_column = 0
+            for candidate in range(1, size + 1):
+                if used[candidate]:
+                    continue
+                reduced = (
+                    cost[current_row - 1, candidate - 1]
+                    - u[current_row]
+                    - v[candidate]
+                )
+                if reduced < minimum[candidate]:
+                    minimum[candidate] = reduced
+                    previous[candidate] = column
+                if minimum[candidate] < delta:
+                    delta = minimum[candidate]
+                    next_column = candidate
+            for candidate in range(size + 1):
+                if used[candidate]:
+                    u[matched_row[candidate]] += delta
+                    v[candidate] -= delta
+                else:
+                    minimum[candidate] -= delta
+            column = next_column
+            if matched_row[column] == 0:
+                break
+        while True:
+            next_column = previous[column]
+            matched_row[column] = matched_row[next_column]
+            column = next_column
+            if column == 0:
+                break
+    assignment = np.empty(size, dtype=np.intp)
+    for column in range(1, size + 1):
+        assignment[matched_row[column] - 1] = column - 1
+    return assignment
+
+
+def _align_groups_to_ranks(
+    source: np.ndarray,
+    count: np.ndarray,
+    ranks: np.ndarray,
+    slots: np.ndarray,
+    bundle_counts: np.ndarray,
+) -> None:
+    """Relabel fixed expert groups to minimize exact source-aware remote."""
+
+    num_ranks = bundle_counts.shape[1]
+    totals = np.zeros(num_ranks, dtype=np.int64)
+    local = np.zeros((num_ranks, num_ranks), dtype=np.int64)
+    for group in range(num_ranks):
+        indexes = bundle_counts[:, group] != 0
+        totals[group] = count[indexes].sum(dtype=np.int64)
+        np.add.at(local[group], source[indexes], count[indexes])
+    assignment = _linear_assignment(totals[:, None] - local)
+    ranks[:] = assignment[ranks]
+    old_slots = slots.copy()
+    slots[assignment] = old_slots
+    visited = np.zeros(num_ranks, dtype=bool)
+    for start in range(num_ranks):
+        if visited[start]:
+            continue
+        current = start
+        values = bundle_counts[:, current].copy()
+        while True:
+            visited[current] = True
+            target = assignment[current]
+            if target == start:
+                bundle_counts[:, target] = values
+                break
+            next_values = bundle_counts[:, target].copy()
+            bundle_counts[:, target] = values
+            values = next_values
+            current = target
+
+
+def _traffic(
+    source: np.ndarray,
+    count: np.ndarray,
+    bundle_counts: np.ndarray,
+) -> np.ndarray:
+    num_ranks = bundle_counts.shape[1]
+    traffic = np.zeros((num_ranks, num_ranks), dtype=np.int64)
+    for rank in range(num_ranks):
+        indexes = (bundle_counts[:, rank] != 0) & (source != rank)
+        np.add.at(traffic[:, rank], source[indexes], count[indexes])
+    return traffic
+
+
 def hypergraph_expert_placement(
     tokens: Sequence[RoutedToken],
     *,
@@ -267,6 +374,9 @@ def hypergraph_expert_placement(
     refine_rounds: int = 4,
     remote_budget: float = 0.0,
     initial_placement: Mapping[int, int] | None = None,
+    align_groups: bool = False,
+    swap_rounds: int = 0,
+    swap_candidate_partners: int = 4,
 ) -> dict[str, object]:
     """Solve fixed-terminal hypergraph connectivity placement.
 
@@ -282,11 +392,15 @@ def hypergraph_expert_placement(
         raise ValueError("invalid num_ranks or source rank")
     if not 0 <= capacity_ratio < 1 or compute_imbalance_limit < 1:
         raise ValueError("invalid capacity or compute limits")
-    if starts < 1 or refine_rounds < 0:
-        raise ValueError("starts and refine_rounds must be positive")
+    if starts < 1 or min(refine_rounds, swap_rounds) < 0:
+        raise ValueError("starts must be positive and refinement rounds non-negative")
+    if swap_candidate_partners < 1:
+        raise ValueError("swap_candidate_partners must be positive")
     if not 0 <= remote_budget <= 1:
         raise ValueError("remote_budget must be in [0, 1]")
-    source, _, count, token_indexes, demand, source_demand = _prepare(tokens, experts)
+    source, topk, count, token_indexes, demand, source_demand = _prepare(
+        tokens, experts
+    )
     minimum, maximum = _capacity_bounds(len(experts), num_ranks, capacity_ratio)
     best = None
     for mode in range(1 if initial_placement is not None else starts):
@@ -313,6 +427,8 @@ def hypergraph_expert_placement(
                 minimum_capacity=minimum,
                 maximum_capacity=maximum,
             )
+        if align_groups:
+            _align_groups_to_ranks(source, count, ranks, slots, bundle_counts)
         loads = _refine_moves(
             source,
             count,
@@ -328,6 +444,23 @@ def hypergraph_expert_placement(
             rounds=refine_rounds,
             total_tokens=int(count.sum()),
             remote_budget=remote_budget,
+        )
+        _refine_swaps(
+            source=source,
+            topk=topk,
+            count=count,
+            token_indexes=token_indexes,
+            bundle_rank_counts=bundle_counts,
+            ranks=ranks,
+            demand=demand,
+            compute_load=loads,
+            traffic=_traffic(source, count, bundle_counts),
+            num_ranks=num_ranks,
+            rounds=swap_rounds,
+            total_tokens=int(count.sum()),
+            strategy="remote",
+            remote_budget=0.0,
+            candidate_partners=swap_candidate_partners,
         )
         placement = {expert: int(ranks[i]) for i, expert in enumerate(experts)}
         metrics = evaluate_cable_placement(tokens, placement, num_ranks=num_ranks)

@@ -142,3 +142,50 @@ def test_hypergraph_refinement_keeps_grace_remote_non_increasing():
     assert evaluate_primary_remote(tokens, refined["rank_by_expert"]) <= (
         evaluate_primary_remote(tokens, grace.rank_by_expert)
     )
+
+
+def test_grace_group_assignment_uses_source_locality():
+    tokens = [
+        RoutedToken(0, (2, 3), 10),
+        RoutedToken(1, (0, 1), 10),
+    ]
+    initial = {0: 0, 1: 0, 2: 1, 3: 1}
+    refined = hypergraph_expert_placement(
+        tokens,
+        experts=range(4),
+        num_ranks=2,
+        capacity_ratio=0,
+        initial_placement=initial,
+        align_groups=True,
+        refine_rounds=0,
+    )
+
+    assert evaluate_primary_remote(tokens, initial) == 20
+    assert refined["metrics"].remote == 0
+
+
+def test_grace_pair_swaps_improve_remote_at_equal_capacity():
+    tokens = [
+        RoutedToken(3, (0, 2, 6), 9),
+        RoutedToken(3, (2, 6, 7), 8),
+        RoutedToken(2, (1, 3, 4), 5),
+        RoutedToken(1, (1, 2, 4), 9),
+        RoutedToken(1, (0, 4, 5), 2),
+        RoutedToken(2, (0, 4, 7), 6),
+    ]
+    initial = {expert: expert // 2 for expert in range(8)}
+    common = dict(
+        experts=range(8),
+        num_ranks=4,
+        capacity_ratio=0,
+        initial_placement=initial,
+        align_groups=True,
+        refine_rounds=0,
+    )
+    matched = hypergraph_expert_placement(tokens, swap_rounds=0, **common)
+    swapped = hypergraph_expert_placement(
+        tokens, swap_rounds=3, swap_candidate_partners=8, **common
+    )
+
+    assert swapped["metrics"].remote < matched["metrics"].remote
+    assert {len(group) for group in swapped["experts_by_rank"].values()} == {2}

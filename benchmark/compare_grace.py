@@ -208,6 +208,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 refine_rounds=args.grace_refine_rounds,
                 remote_budget=0.0,
                 initial_placement=placement.rank_by_expert,
+                align_groups=True,
+                swap_rounds=args.grace_refine_swaps,
+                swap_candidate_partners=args.grace_refine_partners,
             )
             if args.grace_refine
             else None
@@ -317,7 +320,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     compute_load=grace_refined["metrics"].compute_load,
                 ),
                 "placement": grace_refined["rank_by_expert"],
-                "solve_seconds": grace_refine_seconds,
+                "solve_seconds": grace_seconds + grace_refine_seconds,
+                "refine_seconds": grace_refine_seconds,
             }
         results.append(result)
     return {
@@ -433,6 +437,8 @@ def main() -> None:
     parser.add_argument("--hypergraph-only", action="store_true")
     parser.add_argument("--grace-refine", action="store_true")
     parser.add_argument("--grace-refine-rounds", type=int, default=4)
+    parser.add_argument("--grace-refine-swaps", type=int, default=2)
+    parser.add_argument("--grace-refine-partners", type=int, default=8)
     parser.add_argument("--grace-refine-capacity-ratio", type=float)
     parser.add_argument("--cable-congestion-weight", type=float, default=0.25)
     parser.add_argument("--cable-load-weight", type=float, default=0.25)
@@ -478,6 +484,8 @@ def main() -> None:
         or args.hypergraph_starts < 1
         or args.hypergraph_refine_rounds < 0
         or args.grace_refine_rounds < 0
+        or args.grace_refine_swaps < 0
+        or args.grace_refine_partners < 1
         or (
             args.grace_refine_capacity_ratio is not None
             and not 0 <= args.grace_refine_capacity_ratio < 1
