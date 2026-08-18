@@ -144,17 +144,18 @@ def _metrics(
     num_ranks: int,
     ranks_per_node: int,
     rdma_cost: float,
-    demand: Mapping[int, int] | None = None,
     compute_load: Sequence[int] | None = None,
 ) -> dict[str, Any]:
-    loads = list(compute_load) if compute_load is not None else [0] * num_ranks
+    cable_metrics = evaluate_cable_placement(tokens, placement, num_ranks=num_ranks)
+    loads = (
+        list(compute_load)
+        if compute_load is not None
+        else list(cable_metrics.compute_load)
+    )
     counts = [0] * len(loads)
     for expert, rank in placement.items():
         counts[rank] += 1
-        if compute_load is None:
-            loads[rank] += demand[expert]
     average = sum(loads) / len(loads)
-    cable_metrics = evaluate_cable_placement(tokens, placement, num_ranks=num_ranks)
     return {
         "remote": evaluate_primary_remote(tokens, placement),
         "weighted_remote": evaluate_weighted_remote(
@@ -166,6 +167,13 @@ def _metrics(
         "max_pair_traffic": cable_metrics.max_pair_traffic,
         "max_ingress": cable_metrics.max_ingress,
         "max_egress": cable_metrics.max_egress,
+    }
+
+
+def _baseline_placement(experts: Sequence[int], num_ranks: int) -> dict[int, int]:
+    return {
+        expert: min(index * num_ranks // len(experts), num_ranks - 1)
+        for index, expert in enumerate(experts)
     }
 
 
@@ -192,6 +200,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             experts = tuple(
                 sorted({expert for token in tokens for expert in token.topk_experts})
             )
+        experts = tuple(experts)
+        baseline_placement = _baseline_placement(experts, args.num_ranks)
         needs_grace = not (args.cable_only or args.hypergraph_only)
         grace_started = time.perf_counter() if needs_grace else None
         graph = (
@@ -230,10 +240,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 initial_placement=placement.rank_by_expert,
                 align_groups=True,
                 swap_rounds=args.grace_refine_swaps,
-                cycle_rounds=args.grace_refine_cycles,
-                chain_rounds=args.grace_refine_chains,
                 swap_candidate_partners=args.grace_refine_partners,
-                cycle_candidate_partners=args.grace_refine_cycle_partners,
+                swap_allow_load_worsening=(
+                    args.grace_refine_allow_load_worsening
+                ),
+                swap_max_compute_imbalance=(
+                    args.grace_refine_swap_compute_limit
+                ),
+                swap_exhaustive=args.grace_refine_exhaustive_swaps,
             )
             if args.grace_refine
             else None
@@ -289,6 +303,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "tokens": total_tokens,
             "bundles": bundle_count,
             "optimizer_bundles": len(tokens),
+            "baseline": {
+                "metrics": _metrics(
+                    tokens,
+                    baseline_placement,
+                    num_ranks=args.num_ranks,
+                    ranks_per_node=args.ranks_per_node,
+                    rdma_cost=args.rdma_cost,
+                ),
+                "placement": baseline_placement,
+                "solve_seconds": 0.0,
+            },
         }
         if placement is not None:
             result.update(
@@ -299,7 +324,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         num_ranks=args.num_ranks,
                         ranks_per_node=args.ranks_per_node,
                         rdma_cost=args.rdma_cost,
-                        demand=graph.demand,
                     ),
                     "placement": placement.rank_by_expert,
                     "solve_seconds": grace_seconds,
@@ -394,13 +418,14 @@ def _print(result: Mapping[str, Any]) -> None:
             "weighted",
             "max-pair",
             "max-ingress",
+            "max-egress",
             "comp",
             "experts/rank",
             "solve-ms",
         ]
     ]
     for layer in result["layers"]:
-        metrics = []
+        metrics = [("baseline", layer["baseline"]["metrics"], 0.0)]
         if "metrics" in layer:
             metrics.append(("grace", layer["metrics"], layer["solve_seconds"]))
         if "cable" in layer:
@@ -436,6 +461,7 @@ def _print(result: Mapping[str, Any]) -> None:
                     f"{metric['weighted_remote']:.0f}",
                     str(metric["max_pair_traffic"]),
                     str(metric["max_ingress"]),
+                    str(metric["max_egress"]),
                     f"{metric['compute_imbalance']:.2f}x",
                     f"{min(metric['expert_count'])}-{max(metric['expert_count'])}",
                     f"{solve_seconds * 1000:.1f}",
@@ -462,10 +488,12 @@ def main() -> None:
     parser.add_argument("--grace-refine", action="store_true")
     parser.add_argument("--grace-refine-rounds", type=int, default=4)
     parser.add_argument("--grace-refine-swaps", type=int, default=2)
-    parser.add_argument("--grace-refine-cycles", type=int, default=1)
-    parser.add_argument("--grace-refine-chains", type=int, default=0)
     parser.add_argument("--grace-refine-partners", type=int, default=8)
-    parser.add_argument("--grace-refine-cycle-partners", type=int, default=4)
+    parser.add_argument(
+        "--grace-refine-allow-load-worsening", action="store_true"
+    )
+    parser.add_argument("--grace-refine-swap-compute-limit", type=float, default=1.25)
+    parser.add_argument("--grace-refine-exhaustive-swaps", action="store_true")
     parser.add_argument("--grace-refine-capacity-ratio", type=float)
     parser.add_argument("--cable-congestion-weight", type=float, default=0.25)
     parser.add_argument("--cable-load-weight", type=float, default=0.25)
@@ -512,10 +540,8 @@ def main() -> None:
         or args.hypergraph_refine_rounds < 0
         or args.grace_refine_rounds < 0
         or args.grace_refine_swaps < 0
-        or args.grace_refine_cycles < 0
-        or args.grace_refine_chains < 0
         or args.grace_refine_partners < 1
-        or args.grace_refine_cycle_partners < 1
+        or args.grace_refine_swap_compute_limit < 1
         or (
             args.grace_refine_capacity_ratio is not None
             and not 0 <= args.grace_refine_capacity_ratio < 1

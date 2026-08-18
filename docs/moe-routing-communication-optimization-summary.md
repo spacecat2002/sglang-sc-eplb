@@ -69,14 +69,14 @@ PYTHONPATH=python python benchmark/compare_grace.py \
   --num-ranks 8 --ranks-per-node 8 --grace-refine \
   --grace-refine-rounds 8 \
   --grace-refine-swaps 2 --grace-refine-partners 8 \
-  --grace-refine-cycles 1 --grace-refine-cycle-partners 4 \
-  --grace-refine-chains 1 \
   --save-grace-refine grace-refined.json
 ```
 
-该路径先根据完整 Top-K bundle 对 GRACE groups 做精确 group-to-rank assignment，再执行受限 exact pair-swap 和三专家 cycle。所有步骤均保持 remote 不增；remote 不变时 pair-swap 还会继续降低 `max-ingress/max-pair`。cycle 可以越过 pair-swap 的局部最优并保持每个 rank 专家数不变，其候选成本近似随 `--grace-refine-cycle-partners` 的三次方增长。
+该路径先根据完整 Top-K bundle 对 GRACE groups 做精确 group-to-rank assignment，再执行受限 exact pair-swap。默认不允许 swap 增大最大计算负载；加上 `--grace-refine-allow-load-worsening` 后，可在 `--grace-refine-swap-compute-limit`（默认 `1.25x` 平均负载）内用计算均衡换取更低的 remote。若 seed 已超过该上限，swap 不会继续恶化并可逐步降低负载。remote 不变时 pair-swap 还会继续降低 `max-ingress/max-pair`，或在通信指标完全相同时改善计算均衡。
 
-实验性 `--grace-refine-chains N` 会执行 N 轮长度 4～5 的 gain-graph ejection chain。它使用固定稀疏候选和 beam search，最终仍以完整 Top-K bundle 精确验证；默认 `0` 不启用。
+质量优先实验可加 `--grace-refine-exhaustive-swaps`。该模式会在默认稀疏候选 refinement 之后枚举全部跨 rank expert pair，精确计算完整 Top-K delta，每次只应用当前全局最佳 pair 后重新搜索；轮数足够且搜索自然收敛时可以达到 pair-swap 的 2-opt 局部最优，但成本明显高于默认模式。
+
+`compare_grace.py` 的结果表和 `--json` 输出现在都会包含 `baseline`：它是未执行 placement plan 的连续均衡 expert layout，并使用相同 trace 计算 `remote/weighted/max-pair/max-ingress/max-egress` 等指标，`solve-ms` 为 0。
 
 如需强制每个 rank 专家数相同，加上 `--grace-equal-experts`。该模式会在 node/GPU 两级 grouping 中做等量 rebalance，并在固定 group 大小下优先保留高 affinity expert；专家数必须能被 rank 数整除。
 

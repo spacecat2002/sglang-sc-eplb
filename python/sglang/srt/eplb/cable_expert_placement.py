@@ -187,6 +187,237 @@ def _refine_compute_moves(
             break
 
 
+def _exact_swap_delta(
+    *,
+    source: np.ndarray,
+    topk: np.ndarray,
+    count: np.ndarray,
+    token_indexes: Sequence[np.ndarray],
+    bundle_rank_counts: np.ndarray,
+    ranks: np.ndarray,
+    left: int,
+    right: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
+    """Return the exact bundle-connectivity delta for one expert swap."""
+
+    left_rank, right_rank = ranks[left], ranks[right]
+    indexes = np.union1d(token_indexes[left], token_indexes[right])
+    rows = topk[indexes]
+    has_left = np.any(rows == left, axis=1).astype(np.int8)
+    has_right = np.any(rows == right, axis=1).astype(np.int8)
+    sources = source[indexes]
+    old_left = bundle_rank_counts[indexes, left_rank]
+    old_right = bundle_rank_counts[indexes, right_rank]
+    new_left = old_left - has_left + has_right
+    new_right = old_right - has_right + has_left
+    delta_left = (new_left > 0).astype(np.int8) - (old_left > 0).astype(np.int8)
+    delta_right = (new_right > 0).astype(np.int8) - (old_right > 0).astype(
+        np.int8
+    )
+    delta = int(
+        (
+            count[indexes]
+            * (
+                delta_left * (sources != left_rank)
+                + delta_right * (sources != right_rank)
+            )
+        ).sum()
+    )
+    return indexes, sources, delta_left, delta_right, delta
+
+
+def _update_swap_traffic(
+    traffic: np.ndarray,
+    *,
+    count: np.ndarray,
+    indexes: np.ndarray,
+    sources: np.ndarray,
+    rank_deltas: Sequence[tuple[int, np.ndarray]],
+    num_ranks: int,
+) -> None:
+    """Update the two destination columns changed by an expert swap."""
+
+    for rank, rank_delta in rank_deltas:
+        changed = rank_delta != 0
+        traffic[:, rank] += np.bincount(
+            sources[changed],
+            weights=count[indexes][changed]
+            * rank_delta[changed]
+            * (sources[changed] != rank),
+            minlength=num_ranks,
+        ).astype(np.int64)
+
+
+def _swap_load_allowed(
+    compute_load: np.ndarray,
+    next_load: np.ndarray,
+    *,
+    allow_load_worsening: bool,
+    max_compute_imbalance: float | None,
+) -> bool:
+    current_max = int(compute_load.max())
+    next_max = int(next_load.max())
+    if not allow_load_worsening:
+        return next_max <= current_max
+    if max_compute_imbalance is None:
+        return True
+    average = float(compute_load.sum()) / len(compute_load)
+    return next_max <= max(current_max, average * max_compute_imbalance)
+
+
+def _apply_swap(
+    *,
+    count: np.ndarray,
+    token_indexes: Sequence[np.ndarray],
+    bundle_rank_counts: np.ndarray,
+    ranks: np.ndarray,
+    compute_load: np.ndarray,
+    traffic: np.ndarray,
+    num_ranks: int,
+    left: int,
+    right: int,
+    next_left: int,
+    next_right: int,
+    delta_state: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int],
+) -> None:
+    left_rank, right_rank = int(ranks[left]), int(ranks[right])
+    indexes, sources, delta_left, delta_right, _ = delta_state
+    _update_swap_traffic(
+        traffic,
+        count=count,
+        indexes=indexes,
+        sources=sources,
+        rank_deltas=((left_rank, delta_left), (right_rank, delta_right)),
+        num_ranks=num_ranks,
+    )
+    bundle_rank_counts[token_indexes[left], left_rank] -= 1
+    bundle_rank_counts[token_indexes[left], right_rank] += 1
+    bundle_rank_counts[token_indexes[right], right_rank] -= 1
+    bundle_rank_counts[token_indexes[right], left_rank] += 1
+    ranks[left], ranks[right] = right_rank, left_rank
+    compute_load[left_rank] = next_left
+    compute_load[right_rank] = next_right
+
+
+def _refine_exhaustive_swaps(
+    *,
+    source: np.ndarray,
+    topk: np.ndarray,
+    count: np.ndarray,
+    token_indexes: Sequence[np.ndarray],
+    bundle_rank_counts: np.ndarray,
+    ranks: np.ndarray,
+    demand: np.ndarray,
+    compute_load: np.ndarray,
+    traffic: np.ndarray,
+    num_ranks: int,
+    swaps: int,
+    allow_load_worsening: bool,
+    max_compute_imbalance: float | None,
+) -> None:
+    """Repeatedly apply the globally best exact pair swap."""
+
+    for _ in range(swaps):
+        best = None
+        current_traffic_key = _traffic_key(traffic)
+        current_max_load = int(compute_load.max())
+        for left in range(len(ranks)):
+            left_rank = int(ranks[left])
+            for right in range(left + 1, len(ranks)):
+                right_rank = int(ranks[right])
+                if left_rank == right_rank:
+                    continue
+                next_left = int(
+                    compute_load[left_rank] + demand[right] - demand[left]
+                )
+                next_right = int(
+                    compute_load[right_rank] + demand[left] - demand[right]
+                )
+                next_load = compute_load.copy()
+                next_load[left_rank] = next_left
+                next_load[right_rank] = next_right
+                if not _swap_load_allowed(
+                    compute_load,
+                    next_load,
+                    allow_load_worsening=allow_load_worsening,
+                    max_compute_imbalance=max_compute_imbalance,
+                ):
+                    continue
+                delta_state = _exact_swap_delta(
+                    source=source,
+                    topk=topk,
+                    count=count,
+                    token_indexes=token_indexes,
+                    bundle_rank_counts=bundle_rank_counts,
+                    ranks=ranks,
+                    left=left,
+                    right=right,
+                )
+                delta = delta_state[-1]
+                if delta > 0:
+                    continue
+                next_traffic = traffic.copy()
+                _update_swap_traffic(
+                    next_traffic,
+                    count=count,
+                    indexes=delta_state[0],
+                    sources=delta_state[1],
+                    rank_deltas=(
+                        (left_rank, delta_state[2]),
+                        (right_rank, delta_state[3]),
+                    ),
+                    num_ranks=num_ranks,
+                )
+                next_traffic_key = _traffic_key(next_traffic)
+                next_max_load = int(next_load.max())
+                if delta == 0 and not (
+                    next_traffic_key < current_traffic_key
+                    or (
+                        next_traffic_key == current_traffic_key
+                        and next_max_load < current_max_load
+                    )
+                ):
+                    continue
+                key = (
+                    delta,
+                    next_max_load,
+                    next_traffic_key,
+                    left,
+                    right,
+                    next_left,
+                    next_right,
+                )
+                if best is None or key < best:
+                    best = key
+        if best is None:
+            break
+        _, _, _, left, right, next_left, next_right = best
+        delta_state = _exact_swap_delta(
+            source=source,
+            topk=topk,
+            count=count,
+            token_indexes=token_indexes,
+            bundle_rank_counts=bundle_rank_counts,
+            ranks=ranks,
+            left=left,
+            right=right,
+        )
+        _apply_swap(
+            count=count,
+            token_indexes=token_indexes,
+            bundle_rank_counts=bundle_rank_counts,
+            ranks=ranks,
+            compute_load=compute_load,
+            traffic=traffic,
+            num_ranks=num_ranks,
+            left=left,
+            right=right,
+            next_left=next_left,
+            next_right=next_right,
+            delta_state=delta_state,
+        )
+
+
 def _refine_swaps(
     *,
     source: np.ndarray,
@@ -204,6 +435,9 @@ def _refine_swaps(
     strategy: str,
     remote_budget: float,
     candidate_partners: int = 4,
+    allow_load_worsening: bool = False,
+    max_compute_imbalance: float | None = None,
+    exhaustive: bool = False,
 ) -> None:
     """Apply bounded remote- or load-improving swaps in-place."""
 
@@ -211,6 +445,10 @@ def _refine_swaps(
         return
     if strategy not in {"remote", "balanced"}:
         raise ValueError("strategy must be 'remote' or 'balanced'")
+    if max_compute_imbalance is not None and max_compute_imbalance < 1:
+        raise ValueError("max_compute_imbalance must be at least 1")
+    if exhaustive and strategy != "remote":
+        raise ValueError("exhaustive swaps require the remote strategy")
     expert_count = len(ranks)
     remote_delta_total = 0
     remote_budget_tokens = int(total_tokens * remote_budget)
@@ -280,31 +518,25 @@ def _refine_swaps(
             next_load[left_rank] = next_left
             next_load[right_rank] = next_right
             load_improves = next_load.max() < compute_load.max()
-            if next_load.max() > compute_load.max():
+            if not _swap_load_allowed(
+                compute_load,
+                next_load,
+                allow_load_worsening=allow_load_worsening,
+                max_compute_imbalance=max_compute_imbalance,
+            ):
                 continue
 
-            indexes = np.union1d(token_indexes[left], token_indexes[right])
-            rows = topk[indexes]
-            has_left = np.any(rows == left, axis=1).astype(np.int8)
-            has_right = np.any(rows == right, axis=1).astype(np.int8)
-            sources = source[indexes]
-            old_left = bundle_rank_counts[indexes, left_rank]
-            old_right = bundle_rank_counts[indexes, right_rank]
-            new_left = old_left - has_left + has_right
-            new_right = old_right - has_right + has_left
-            delta_left = (new_left > 0).astype(np.int8) - (old_left > 0).astype(np.int8)
-            delta_right = (new_right > 0).astype(np.int8) - (old_right > 0).astype(
-                np.int8
+            delta_state = _exact_swap_delta(
+                source=source,
+                topk=topk,
+                count=count,
+                token_indexes=token_indexes,
+                bundle_rank_counts=bundle_rank_counts,
+                ranks=ranks,
+                left=left,
+                right=right,
             )
-            delta = int(
-                (
-                    count[indexes]
-                    * (
-                        delta_left * (sources != left_rank)
-                        + delta_right * (sources != right_rank)
-                    )
-                ).sum()
-            )
+            indexes, sources, delta_left, delta_right, delta = delta_state
             remote_improves = delta < 0
             budget_allows = remote_delta_total + delta <= remote_budget_tokens
             if strategy == "remote":
@@ -323,317 +555,51 @@ def _refine_swaps(
                             * (sources[changed_rows] != rank),
                             minlength=num_ranks,
                         ).astype(np.int64)
-                    accept = _traffic_key(next_traffic) < _traffic_key(traffic)
+                    next_traffic_key = _traffic_key(next_traffic)
+                    current_traffic_key = _traffic_key(traffic)
+                    accept = next_traffic_key < current_traffic_key or (
+                        next_traffic_key == current_traffic_key and load_improves
+                    )
             else:
                 accept = remote_improves or (load_improves and budget_allows)
             if not accept:
                 continue
 
-            # Only two destination columns change, so update the traffic matrix
-            # without replaying every Top-K bundle after each accepted swap.
-            traffic[:, left_rank] += np.bincount(
-                sources[delta_left != 0],
-                weights=count[indexes][delta_left != 0]
-                * delta_left[delta_left != 0]
-                * (sources[delta_left != 0] != left_rank),
-                minlength=num_ranks,
-            ).astype(np.int64)
-            traffic[:, right_rank] += np.bincount(
-                sources[delta_right != 0],
-                weights=count[indexes][delta_right != 0]
-                * delta_right[delta_right != 0]
-                * (sources[delta_right != 0] != right_rank),
-                minlength=num_ranks,
-            ).astype(np.int64)
-            bundle_rank_counts[token_indexes[left], left_rank] -= 1
-            bundle_rank_counts[token_indexes[left], right_rank] += 1
-            bundle_rank_counts[token_indexes[right], right_rank] -= 1
-            bundle_rank_counts[token_indexes[right], left_rank] += 1
-            ranks[left], ranks[right] = right_rank, left_rank
-            compute_load[left_rank] = next_left
-            compute_load[right_rank] = next_right
+            _apply_swap(
+                count=count,
+                token_indexes=token_indexes,
+                bundle_rank_counts=bundle_rank_counts,
+                ranks=ranks,
+                compute_load=compute_load,
+                traffic=traffic,
+                num_ranks=num_ranks,
+                left=left,
+                right=right,
+                next_left=next_left,
+                next_right=next_right,
+                delta_state=delta_state,
+            )
             remote_delta_total += delta
             locked[left] = locked[right] = True
             changed = True
         if not changed:
             break
-
-
-def _apply_chain(
-    *,
-    source: np.ndarray,
-    topk: np.ndarray,
-    count: np.ndarray,
-    token_indexes: Sequence[np.ndarray],
-    bundle_rank_counts: np.ndarray,
-    ranks: np.ndarray,
-    demand: np.ndarray,
-    compute_load: np.ndarray,
-    traffic: np.ndarray,
-    num_ranks: int,
-    experts: tuple[int, ...],
-    old_ranks: tuple[int, ...],
-) -> bool:
-    """Apply one exact remote-decreasing cyclic expert move."""
-
-    target_ranks = old_ranks[1:] + old_ranks[:1]
-    next_load = compute_load.copy()
-    for expert, old_rank, target_rank in zip(experts, old_ranks, target_ranks):
-        next_load[old_rank] -= demand[expert]
-        next_load[target_rank] += demand[expert]
-    if next_load.max() > compute_load.max():
-        return False
-
-    indexes = np.unique(np.concatenate([token_indexes[expert] for expert in experts]))
-    rows = topk[indexes]
-    present = [
-        np.any(rows == expert, axis=1).astype(np.int8) for expert in experts
-    ]
-    sources = source[indexes]
-    remote_delta = 0
-    traffic_deltas = []
-    for position, rank in enumerate(old_ranks):
-        rank_delta = -present[position] + present[position - 1]
-        old_count = bundle_rank_counts[indexes, rank]
-        new_count = old_count + rank_delta
-        connectivity_delta = (new_count > 0).astype(np.int8) - (
-            old_count > 0
-        ).astype(np.int8)
-        remote_delta += int(
-            (count[indexes] * connectivity_delta * (sources != rank)).sum()
+    if exhaustive:
+        _refine_exhaustive_swaps(
+            source=source,
+            topk=topk,
+            count=count,
+            token_indexes=token_indexes,
+            bundle_rank_counts=bundle_rank_counts,
+            ranks=ranks,
+            demand=demand,
+            compute_load=compute_load,
+            traffic=traffic,
+            num_ranks=num_ranks,
+            swaps=rounds,
+            allow_load_worsening=allow_load_worsening,
+            max_compute_imbalance=max_compute_imbalance,
         )
-        changed_rows = connectivity_delta != 0
-        traffic_deltas.append(
-            np.bincount(
-                sources[changed_rows],
-                weights=count[indexes][changed_rows]
-                * connectivity_delta[changed_rows]
-                * (sources[changed_rows] != rank),
-                minlength=num_ranks,
-            ).astype(np.int64)
-        )
-    if remote_delta >= 0:
-        return False
-
-    for rank, delta_by_source in zip(old_ranks, traffic_deltas):
-        traffic[:, rank] += delta_by_source
-    for expert, old_rank, target_rank in zip(experts, old_ranks, target_ranks):
-        bundle_rank_counts[token_indexes[expert], old_rank] -= 1
-        bundle_rank_counts[token_indexes[expert], target_rank] += 1
-        ranks[expert] = target_rank
-    compute_load[:] = next_load
-    return True
-
-
-def _refine_cycles(
-    *,
-    source: np.ndarray,
-    topk: np.ndarray,
-    count: np.ndarray,
-    token_indexes: Sequence[np.ndarray],
-    bundle_rank_counts: np.ndarray,
-    ranks: np.ndarray,
-    demand: np.ndarray,
-    compute_load: np.ndarray,
-    traffic: np.ndarray,
-    num_ranks: int,
-    rounds: int,
-    candidate_partners: int,
-) -> None:
-    """Apply bounded exact three-rank cycles without worsening max load."""
-
-    for _ in range(rounds):
-        move_delta = _move_deltas(
-            source,
-            count,
-            token_indexes,
-            bundle_rank_counts,
-            ranks,
-            num_ranks,
-        )
-        candidates = []
-        for first_rank in range(num_ranks):
-            for second_rank in range(first_rank + 1, num_ranks):
-                for third_rank in range(second_rank + 1, num_ranks):
-                    for middle_rank, last_rank in (
-                        (second_rank, third_rank),
-                        (third_rank, second_rank),
-                    ):
-                        pools = (
-                            (first_rank, middle_rank),
-                            (middle_rank, last_rank),
-                            (last_rank, first_rank),
-                        )
-                        choices = [
-                            sorted(
-                                np.flatnonzero(ranks == old_rank).tolist(),
-                                key=lambda expert: (
-                                    move_delta[expert, target_rank],
-                                    expert,
-                                ),
-                            )[:candidate_partners]
-                            for old_rank, target_rank in pools
-                        ]
-                        for first in choices[0]:
-                            for second in choices[1]:
-                                for third in choices[2]:
-                                    estimate = int(
-                                        move_delta[first, middle_rank]
-                                        + move_delta[second, last_rank]
-                                        + move_delta[third, first_rank]
-                                    )
-                                    if estimate <= 0:
-                                        candidates.append(
-                                            (
-                                                estimate,
-                                                first,
-                                                second,
-                                                third,
-                                                first_rank,
-                                                middle_rank,
-                                                last_rank,
-                                            )
-                                        )
-        candidates.sort()
-        locked = np.zeros(len(ranks), dtype=bool)
-        changed = False
-        for _, first, second, third, first_rank, second_rank, third_rank in candidates:
-            experts = (first, second, third)
-            old_ranks = (first_rank, second_rank, third_rank)
-            if (
-                any(locked[expert] for expert in experts)
-                or tuple(int(ranks[expert]) for expert in experts) != old_ranks
-            ):
-                continue
-            if _apply_chain(
-                source=source,
-                topk=topk,
-                count=count,
-                token_indexes=token_indexes,
-                bundle_rank_counts=bundle_rank_counts,
-                ranks=ranks,
-                demand=demand,
-                compute_load=compute_load,
-                traffic=traffic,
-                num_ranks=num_ranks,
-                experts=experts,
-                old_ranks=old_ranks,
-            ):
-                locked[list(experts)] = True
-                changed = True
-        if not changed:
-            break
-
-
-def _refine_chains(
-    *,
-    source: np.ndarray,
-    topk: np.ndarray,
-    count: np.ndarray,
-    token_indexes: Sequence[np.ndarray],
-    bundle_rank_counts: np.ndarray,
-    ranks: np.ndarray,
-    demand: np.ndarray,
-    compute_load: np.ndarray,
-    traffic: np.ndarray,
-    num_ranks: int,
-    rounds: int,
-    candidate_partners: int,
-) -> None:
-    """Search sparse gain-graph cycles of length four or five."""
-
-    if rounds < 1 or num_ranks < 4:
-        return
-    # ponytail: fixed sparse bounds keep 32-rank search cheap; expose them only
-    # if real traces show candidate generation, rather than exact checks,
-    # limiting quality.
-    target_limit = min(4, num_ranks - 1)
-    maximum_length = min(5, num_ranks)
-    beam_width = 64
-    for _ in range(rounds):
-        move_delta = _move_deltas(
-            source,
-            count,
-            token_indexes,
-            bundle_rank_counts,
-            ranks,
-            num_ranks,
-        )
-        edge_by_pair: dict[tuple[int, int], list[tuple[int, int, int]]] = {}
-        for expert, old_rank in enumerate(ranks.tolist()):
-            targets = [
-                int(target)
-                for target in np.argsort(move_delta[expert], kind="stable")
-                if target != old_rank
-            ][:target_limit]
-            for target in targets:
-                edge_by_pair.setdefault((old_rank, target), []).append(
-                    (int(move_delta[expert, target]), expert, target)
-                )
-        for pair, edges in edge_by_pair.items():
-            edge_by_pair[pair] = sorted(edges)[:candidate_partners]
-        adjacency = [[] for _ in range(num_ranks)]
-        for (old_rank, _), edges in edge_by_pair.items():
-            adjacency[old_rank].extend(edges)
-        for edges in adjacency:
-            edges.sort()
-
-        candidates = []
-        for start in range(num_ranks):
-            beams = [(0, (start,), ())]
-            for _path_length in range(2, maximum_length + 1):
-                expanded = []
-                for estimate, path, experts in beams:
-                    for delta, expert, target in adjacency[path[-1]]:
-                        if target > start and target not in path:
-                            expanded.append(
-                                (
-                                    estimate + delta,
-                                    path + (target,),
-                                    experts + (expert,),
-                                )
-                            )
-                beams = sorted(expanded)[:beam_width]
-                if not beams:
-                    break
-                if _path_length < 4:
-                    continue
-                for estimate, path, experts in beams:
-                    for delta, expert, _ in edge_by_pair.get(
-                        (path[-1], start), ()
-                    ):
-                        total = estimate + delta
-                        if total <= 0:
-                            candidates.append(
-                                (total, experts + (expert,), path)
-                            )
-        candidates.sort()
-        locked = np.zeros(len(ranks), dtype=bool)
-        changed = False
-        for _, experts, old_ranks in candidates[:beam_width]:
-            if (
-                any(locked[expert] for expert in experts)
-                or tuple(int(ranks[expert]) for expert in experts) != old_ranks
-            ):
-                continue
-            if _apply_chain(
-                source=source,
-                topk=topk,
-                count=count,
-                token_indexes=token_indexes,
-                bundle_rank_counts=bundle_rank_counts,
-                ranks=ranks,
-                demand=demand,
-                compute_load=compute_load,
-                traffic=traffic,
-                num_ranks=num_ranks,
-                experts=experts,
-                old_ranks=old_ranks,
-            ):
-                locked[list(experts)] = True
-                changed = True
-        if not changed:
-            break
 
 
 def evaluate_cable_placement(

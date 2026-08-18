@@ -50,7 +50,6 @@ def test_routed_arrays_match_token_path():
         initial_placement=initial,
         refine_rounds=2,
         swap_rounds=2,
-        cycle_rounds=1,
     )
 
     assert array_graph == token_graph
@@ -264,16 +263,18 @@ def test_grace_swaps_reduce_congestion_without_increasing_remote():
     )
 
 
-def test_grace_three_cycles_escape_pair_swap_local_minimum():
+def test_grace_swaps_can_trade_compute_balance_for_lower_remote():
     tokens = [
-        RoutedToken(1, (1, 5, 6), 6),
-        RoutedToken(2, (3, 4, 5), 7),
-        RoutedToken(1, (2, 4, 7), 7),
-        RoutedToken(2, (1, 7, 8), 3),
-        RoutedToken(2, (1, 2, 3), 2),
-        RoutedToken(1, (0, 5, 8), 4),
-        RoutedToken(2, (0, 3, 6), 6),
-        RoutedToken(1, (0, 3, 6), 2),
+        RoutedToken(0, (1, 2, 8), 14),
+        RoutedToken(0, (4, 7, 8), 4),
+        RoutedToken(2, (0, 2, 3), 11),
+        RoutedToken(1, (4, 5, 8), 8),
+        RoutedToken(2, (0, 4, 6), 1),
+        RoutedToken(1, (3, 5, 7), 7),
+        RoutedToken(2, (1, 2, 8), 4),
+        RoutedToken(0, (1, 2, 5), 3),
+        RoutedToken(2, (4, 5, 8), 11),
+        RoutedToken(2, (2, 6, 7), 7),
     ]
     common = dict(
         experts=range(9),
@@ -281,44 +282,62 @@ def test_grace_three_cycles_escape_pair_swap_local_minimum():
         capacity_ratio=0,
         initial_placement={expert: expert // 3 for expert in range(9)},
         refine_rounds=0,
-        swap_rounds=6,
+        swap_rounds=4,
         swap_candidate_partners=9,
-        cycle_candidate_partners=9,
     )
-    pair_only = hypergraph_expert_placement(tokens, cycle_rounds=0, **common)
-    cycled = hypergraph_expert_placement(tokens, cycle_rounds=3, **common)
+    guarded = hypergraph_expert_placement(
+        tokens, swap_allow_load_worsening=False, **common
+    )
+    relaxed = hypergraph_expert_placement(
+        tokens, swap_allow_load_worsening=True, **common
+    )
+    capped = hypergraph_expert_placement(
+        tokens,
+        swap_allow_load_worsening=True,
+        swap_max_compute_imbalance=1.25,
+        **common,
+    )
 
-    assert cycled["metrics"].remote < pair_only["metrics"].remote
-    assert {len(group) for group in cycled["experts_by_rank"].values()} == {3}
+    assert relaxed["metrics"].remote < guarded["metrics"].remote
+    assert max(relaxed["metrics"].compute_load) > max(
+        guarded["metrics"].compute_load
+    )
+    assert relaxed["metrics"].remote <= capped["metrics"].remote
+    assert capped["metrics"].compute_imbalance <= 1.25
+    assert {len(group) for group in relaxed["experts_by_rank"].values()} == {3}
 
 
-def test_grace_gain_graph_chain_escapes_short_cycle_local_minimum():
+def test_grace_exhaustive_swaps_polish_sparse_search_without_more_load_skew():
     tokens = [
-        RoutedToken(1, (6, 8, 11), 5),
-        RoutedToken(3, (0, 1, 2), 7),
-        RoutedToken(1, (4, 10, 12), 5),
-        RoutedToken(3, (0, 8, 12), 8),
-        RoutedToken(0, (1, 6, 11), 9),
-        RoutedToken(1, (4, 5, 14), 7),
-        RoutedToken(2, (2, 3, 13), 8),
-        RoutedToken(0, (2, 7, 9), 7),
+        RoutedToken(1, (0, 4, 5), 7),
+        RoutedToken(3, (0, 2, 6), 1),
+        RoutedToken(3, (0, 4, 6), 4),
+        RoutedToken(2, (1, 4, 6), 2),
+        RoutedToken(2, (0, 3, 5), 5),
+        RoutedToken(2, (1, 2, 3), 5),
+        RoutedToken(2, (1, 4, 6), 6),
+        RoutedToken(3, (1, 3, 6), 8),
+        RoutedToken(2, (1, 4, 6), 5),
+        RoutedToken(0, (4, 5, 7), 5),
     ]
     common = dict(
-        experts=range(15),
-        num_ranks=5,
+        experts=range(8),
+        num_ranks=4,
         capacity_ratio=0,
-        initial_placement={expert: expert // 3 for expert in range(15)},
+        initial_placement={expert: expert // 2 for expert in range(8)},
         refine_rounds=0,
-        swap_rounds=5,
-        cycle_rounds=2,
-        swap_candidate_partners=8,
-        cycle_candidate_partners=4,
+        swap_rounds=8,
+        swap_candidate_partners=1,
+        swap_allow_load_worsening=True,
+        swap_max_compute_imbalance=1.25,
     )
-    short_cycles = hypergraph_expert_placement(tokens, chain_rounds=0, **common)
-    chained = hypergraph_expert_placement(tokens, chain_rounds=1, **common)
+    sparse = hypergraph_expert_placement(tokens, swap_exhaustive=False, **common)
+    exhaustive = hypergraph_expert_placement(tokens, swap_exhaustive=True, **common)
 
-    assert chained["metrics"].remote < short_cycles["metrics"].remote
-    assert {len(group) for group in chained["experts_by_rank"].values()} == {3}
+    assert exhaustive["metrics"].remote < sparse["metrics"].remote
+    assert max(exhaustive["metrics"].compute_load) <= max(
+        sparse["metrics"].compute_load
+    )
 
 
 def test_grace_equal_experts_preserves_affinity_and_cardinality():
