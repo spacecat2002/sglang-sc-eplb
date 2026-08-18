@@ -74,6 +74,8 @@ PYTHONPATH=python python benchmark/compare_grace.py \
 
 该路径先根据完整 Top-K bundle 对 GRACE groups 做精确 group-to-rank assignment，再执行受限 exact pair-swap。两步均保持 remote 不增；pair-swap 还能在每个 rank 专家数严格相同时继续优化。
 
+如需强制每个 rank 专家数相同，加上 `--grace-equal-experts`。该模式会在 node/GPU 两级 grouping 中做等量 rebalance，并在固定 group 大小下优先保留高 affinity expert；专家数必须能被 rank 数整除。
+
 `--optimizer-bundles 0` 表示使用完整 compact trace，但一千万 bundle 会明显变慢。`--rdma-cost 1` 适用于单机 NVLink/NVSwitch；`none` backend 仅用于采集路由，实际通信收益需要在 token A2A backend 下验证。
 
 ## 后续改进方向

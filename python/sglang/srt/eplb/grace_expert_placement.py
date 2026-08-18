@@ -112,13 +112,94 @@ def _fill_minimum(graph: CoRoutingGraph, groups: list[list[int]], minimum: int) 
             groups[target].append(expert)
 
 
+def _improve_balanced_swaps(
+    graph: CoRoutingGraph, groups: list[list[int]], rounds: int = 8
+) -> None:
+    """Improve intra-group affinity without changing group sizes."""
+
+    for _ in range(rounds):
+        best = None
+        for left in range(len(groups)):
+            for right in range(left + 1, len(groups)):
+                left_group, right_group = groups[left], groups[right]
+                for left_expert in left_group:
+                    left_without = [
+                        expert for expert in left_group if expert != left_expert
+                    ]
+                    for right_expert in right_group:
+                        right_without = [
+                            expert for expert in right_group if expert != right_expert
+                        ]
+                        old = _affinity(graph, left_expert, left_without) + _affinity(
+                            graph, right_expert, right_without
+                        )
+                        new = _affinity(graph, left_expert, right_without) + _affinity(
+                            graph, right_expert, left_without
+                        )
+                        gain = new - old
+                        candidate = (gain, left_expert, right_expert, left, right)
+                        if gain > 0 and (best is None or candidate > best):
+                            best = candidate
+        if best is None:
+            return
+        _, left_expert, right_expert, left, right = best
+        groups[left].remove(left_expert)
+        groups[right].remove(right_expert)
+        groups[left].append(right_expert)
+        groups[right].append(left_expert)
+
+
+def _exact_groups(
+    graph: CoRoutingGraph, groups: list[list[int]], target: int
+) -> list[list[int]]:
+    """Rebalance spectral groups to an exact size while preserving affinity."""
+
+    overflow = []
+    for group in groups:
+        while len(group) > target:
+            expert = min(
+                group,
+                key=lambda item: (
+                    _affinity(graph, item, [other for other in group if other != item]),
+                    item,
+                ),
+            )
+            group.remove(expert)
+            overflow.append(expert)
+    for expert in sorted(
+        overflow,
+        key=lambda item: (-sum(graph.adjacency.get(item, {}).values()), item),
+    ):
+        candidates = [
+            index for index, group in enumerate(groups) if len(group) < target
+        ]
+        if not candidates:
+            raise ValueError("cannot satisfy exact group sizes")
+        target_group = min(
+            candidates,
+            key=lambda index: (
+                -_affinity(graph, expert, groups[index]),
+                len(groups[index]),
+                index,
+            ),
+        )
+        groups[target_group].append(expert)
+    _improve_balanced_swaps(graph, groups)
+    return groups
+
+
 def _controlled_groups(
     graph: CoRoutingGraph,
     experts: Sequence[int],
     num_groups: int,
     nonuniform_ratio: float,
+    equal_size: bool = False,
 ) -> list[list[int]]:
     groups = _spectral_groups(graph, experts, num_groups)
+    if equal_size:
+        if len(experts) % num_groups:
+            raise ValueError("exact group sizes require divisible expert count")
+        return _exact_groups(graph, groups, len(experts) // num_groups)
     ideal = len(experts) // num_groups
     delta = max(1, round(ideal * nonuniform_ratio))
     minimum = max(1, ideal - delta)
@@ -155,6 +236,7 @@ def grace_hierarchical_placement(
     num_ranks: int,
     ranks_per_node: int | None = None,
     nonuniform_ratio: float = 0.15,
+    equal_experts: bool = False,
 ) -> GracePlacement:
     """Apply GRACE node-level and controlled GPU-level spectral grouping."""
 
@@ -168,12 +250,22 @@ def grace_hierarchical_placement(
     if len(graph.experts) < num_ranks:
         raise ValueError("GRACE grouping requires at least one expert per rank")
 
-    node_groups = _spectral_groups(graph, graph.experts, num_ranks // ranks_per_node)
-    _fill_minimum(graph, node_groups, ranks_per_node)
+    num_nodes = num_ranks // ranks_per_node
+    node_groups = _spectral_groups(graph, graph.experts, num_nodes)
+    if equal_experts:
+        if len(graph.experts) % num_ranks:
+            raise ValueError("exact experts per rank requires divisible expert count")
+        node_groups = _exact_groups(graph, node_groups, len(graph.experts) // num_nodes)
+    else:
+        _fill_minimum(graph, node_groups, ranks_per_node)
     rank_by_expert = {}
     for node, node_experts in enumerate(node_groups):
         gpu_groups = _controlled_groups(
-            graph, node_experts, ranks_per_node, nonuniform_ratio
+            graph,
+            node_experts,
+            ranks_per_node,
+            nonuniform_ratio,
+            equal_size=equal_experts,
         )
         for local_rank, experts in enumerate(gpu_groups):
             rank = node * ranks_per_node + local_rank

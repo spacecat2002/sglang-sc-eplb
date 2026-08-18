@@ -189,3 +189,21 @@ def test_grace_pair_swaps_improve_remote_at_equal_capacity():
 
     assert swapped["metrics"].remote < matched["metrics"].remote
     assert {len(group) for group in swapped["experts_by_rank"].values()} == {2}
+
+
+def test_grace_equal_experts_preserves_affinity_and_cardinality():
+    tokens = [
+        RoutedToken(0, (0, 1, 2), 20),
+        RoutedToken(1, (0, 1, 3), 20),
+        RoutedToken(2, (4, 5, 6), 20),
+        RoutedToken(3, (4, 5, 7), 20),
+    ]
+    placement = grace_hierarchical_placement(
+        build_co_routing_graph(tokens, experts=range(8)),
+        num_ranks=4,
+        equal_experts=True,
+    )
+
+    assert {len(group) for group in placement.experts_by_rank.values()} == {2}
+    assert placement.rank_by_expert[0] == placement.rank_by_expert[1]
+    assert placement.rank_by_expert[4] == placement.rank_by_expert[5]

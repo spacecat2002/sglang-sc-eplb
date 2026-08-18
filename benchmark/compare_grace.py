@@ -190,6 +190,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 num_ranks=args.num_ranks,
                 ranks_per_node=args.ranks_per_node,
                 nonuniform_ratio=args.grace_ratio,
+                equal_experts=args.grace_equal_experts,
             )
             grace_seconds = time.perf_counter() - grace_started
         started = time.perf_counter()
@@ -199,7 +200,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 experts=tuple(placement.rank_by_expert),
                 num_ranks=args.num_ranks,
                 capacity_ratio=(
-                    args.grace_refine_capacity_ratio
+                    0.0
+                    if args.grace_equal_experts
+                    else args.grace_refine_capacity_ratio
                     if args.grace_refine_capacity_ratio is not None
                     else args.grace_ratio
                 ),
@@ -428,6 +431,7 @@ def main() -> None:
     parser.add_argument("--source-ep", type=int)
     parser.add_argument("--ranks-per-node", type=int)
     parser.add_argument("--grace-ratio", type=float, default=0.15)
+    parser.add_argument("--grace-equal-experts", action="store_true")
     parser.add_argument("--optimizer-bundles", type=int, default=20_000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--rdma-cost", type=float, default=1.0)
@@ -502,6 +506,8 @@ def main() -> None:
         parser.error("--save-hypergraph requires --hypergraph")
     if args.grace_refine and (args.cable_only or args.hypergraph_only):
         parser.error("--grace-refine requires the GRACE placement")
+    if args.grace_equal_experts and (args.cable_only or args.hypergraph_only):
+        parser.error("--grace-equal-experts requires the GRACE placement")
     if args.save_grace_refine and not args.grace_refine:
         parser.error("--save-grace-refine requires --grace-refine")
     result = run(args)
