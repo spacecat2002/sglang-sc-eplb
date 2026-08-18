@@ -70,10 +70,13 @@ PYTHONPATH=python python benchmark/compare_grace.py \
   --grace-refine-rounds 8 \
   --grace-refine-swaps 2 --grace-refine-partners 8 \
   --grace-refine-cycles 1 --grace-refine-cycle-partners 4 \
+  --grace-refine-chains 1 \
   --save-grace-refine grace-refined.json
 ```
 
 该路径先根据完整 Top-K bundle 对 GRACE groups 做精确 group-to-rank assignment，再执行受限 exact pair-swap 和三专家 cycle。所有步骤均保持 remote 不增；remote 不变时 pair-swap 还会继续降低 `max-ingress/max-pair`。cycle 可以越过 pair-swap 的局部最优并保持每个 rank 专家数不变，其候选成本近似随 `--grace-refine-cycle-partners` 的三次方增长。
+
+实验性 `--grace-refine-chains N` 会执行 N 轮长度 4～5 的 gain-graph ejection chain。它使用固定稀疏候选和 beam search，最终仍以完整 Top-K bundle 精确验证；默认 `0` 不启用。
 
 如需强制每个 rank 专家数相同，加上 `--grace-equal-experts`。该模式会在 node/GPU 两级 grouping 中做等量 rebalance，并在固定 group 大小下优先保留高 affinity expert；专家数必须能被 rank 数整除。
 

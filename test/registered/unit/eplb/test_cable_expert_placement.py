@@ -292,6 +292,35 @@ def test_grace_three_cycles_escape_pair_swap_local_minimum():
     assert {len(group) for group in cycled["experts_by_rank"].values()} == {3}
 
 
+def test_grace_gain_graph_chain_escapes_short_cycle_local_minimum():
+    tokens = [
+        RoutedToken(1, (6, 8, 11), 5),
+        RoutedToken(3, (0, 1, 2), 7),
+        RoutedToken(1, (4, 10, 12), 5),
+        RoutedToken(3, (0, 8, 12), 8),
+        RoutedToken(0, (1, 6, 11), 9),
+        RoutedToken(1, (4, 5, 14), 7),
+        RoutedToken(2, (2, 3, 13), 8),
+        RoutedToken(0, (2, 7, 9), 7),
+    ]
+    common = dict(
+        experts=range(15),
+        num_ranks=5,
+        capacity_ratio=0,
+        initial_placement={expert: expert // 3 for expert in range(15)},
+        refine_rounds=0,
+        swap_rounds=5,
+        cycle_rounds=2,
+        swap_candidate_partners=8,
+        cycle_candidate_partners=4,
+    )
+    short_cycles = hypergraph_expert_placement(tokens, chain_rounds=0, **common)
+    chained = hypergraph_expert_placement(tokens, chain_rounds=1, **common)
+
+    assert chained["metrics"].remote < short_cycles["metrics"].remote
+    assert {len(group) for group in chained["experts_by_rank"].values()} == {3}
+
+
 def test_grace_equal_experts_preserves_affinity_and_cardinality():
     tokens = [
         RoutedToken(0, (0, 1, 2), 20),

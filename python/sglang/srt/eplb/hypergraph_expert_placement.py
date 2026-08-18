@@ -7,6 +7,7 @@ from typing import Mapping, Sequence
 import numpy as np
 
 from .cable_expert_placement import (
+    _refine_chains,
     _refine_cycles,
     _refine_swaps,
     evaluate_cable_placement,
@@ -373,6 +374,7 @@ def hypergraph_expert_placement(
     align_groups: bool = False,
     swap_rounds: int = 0,
     cycle_rounds: int = 0,
+    chain_rounds: int = 0,
     swap_candidate_partners: int = 4,
     cycle_candidate_partners: int = 4,
 ) -> dict[str, object]:
@@ -391,7 +393,9 @@ def hypergraph_expert_placement(
         raise ValueError("invalid num_ranks or source rank")
     if not 0 <= capacity_ratio < 1 or compute_imbalance_limit < 1:
         raise ValueError("invalid capacity or compute limits")
-    if starts < 1 or min(refine_rounds, swap_rounds, cycle_rounds) < 0:
+    if starts < 1 or min(
+        refine_rounds, swap_rounds, cycle_rounds, chain_rounds
+    ) < 0:
         raise ValueError("starts must be positive and refinement rounds non-negative")
     if min(swap_candidate_partners, cycle_candidate_partners) < 1:
         raise ValueError("candidate partner counts must be positive")
@@ -474,6 +478,20 @@ def hypergraph_expert_placement(
             traffic=traffic,
             num_ranks=num_ranks,
             rounds=cycle_rounds,
+            candidate_partners=cycle_candidate_partners,
+        )
+        _refine_chains(
+            source=source,
+            topk=topk,
+            count=count,
+            token_indexes=token_indexes,
+            bundle_rank_counts=bundle_counts,
+            ranks=ranks,
+            demand=demand,
+            compute_load=loads,
+            traffic=traffic,
+            num_ranks=num_ranks,
+            rounds=chain_rounds,
             candidate_partners=cycle_candidate_partners,
         )
         placement = {expert: int(ranks[i]) for i, expert in enumerate(experts)}

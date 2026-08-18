@@ -231,6 +231,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 align_groups=True,
                 swap_rounds=args.grace_refine_swaps,
                 cycle_rounds=args.grace_refine_cycles,
+                chain_rounds=args.grace_refine_chains,
                 swap_candidate_partners=args.grace_refine_partners,
                 cycle_candidate_partners=args.grace_refine_cycle_partners,
             )
@@ -462,6 +463,7 @@ def main() -> None:
     parser.add_argument("--grace-refine-rounds", type=int, default=4)
     parser.add_argument("--grace-refine-swaps", type=int, default=2)
     parser.add_argument("--grace-refine-cycles", type=int, default=1)
+    parser.add_argument("--grace-refine-chains", type=int, default=0)
     parser.add_argument("--grace-refine-partners", type=int, default=8)
     parser.add_argument("--grace-refine-cycle-partners", type=int, default=4)
     parser.add_argument("--grace-refine-capacity-ratio", type=float)
@@ -511,6 +513,7 @@ def main() -> None:
         or args.grace_refine_rounds < 0
         or args.grace_refine_swaps < 0
         or args.grace_refine_cycles < 0
+        or args.grace_refine_chains < 0
         or args.grace_refine_partners < 1
         or args.grace_refine_cycle_partners < 1
         or (
