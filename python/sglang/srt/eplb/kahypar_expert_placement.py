@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 from typing import Sequence
 
@@ -19,8 +20,9 @@ def kahypar_expert_placement(
 ) -> dict[str, object]:
     """Partition bundles with KaHyPar while pinning one source terminal/rank.
 
-    KaHyPar is intentionally optional.  The fixed source terminals make the
-    connectivity cut equal to the distinct remote destination-rank metric.
+    KaHyPar is intentionally optional. Fixed source terminals make the
+    connectivity cut equal to the distinct remote destination-rank metric;
+    older bindings without fixed vertices use heavy anchors as a fallback.
     """
 
     try:
@@ -55,38 +57,32 @@ def kahypar_expert_placement(
     for token in tokens:
         for expert in token.topk_experts:
             demand[expert] += token.count
-    # KaHyPar requires strictly positive weights. Each block has exactly one
-    # fixed terminal, so its unit weight adds the same constant to every rank.
-    vertex_weights = [max(1, demand[expert]) for expert in experts] + [1] * num_ranks
-
     # KaHyPar Python wheels have used both six- and seven-argument constructors.
-    try:
-        hypergraph = kahypar.Hypergraph(
-            len(experts) + num_ranks,
-            len(tokens),
-            offsets,
-            edges,
-            num_ranks,
-            edge_weights,
-            vertex_weights,
-        )
-    except TypeError:  # pragma: no cover - version-specific API
-        hypergraph = kahypar.Hypergraph(
-            len(experts) + num_ranks,
-            len(tokens),
-            offsets,
-            edges,
-            edge_weights,
-            vertex_weights,
-        )
+    def build_hypergraph(vertex_weights: list[int]):
+        try:
+            return kahypar.Hypergraph(
+                len(experts) + num_ranks,
+                len(tokens),
+                offsets,
+                edges,
+                num_ranks,
+                edge_weights,
+                vertex_weights,
+            )
+        except TypeError:  # pragma: no cover - version-specific API
+            return kahypar.Hypergraph(
+                len(experts) + num_ranks,
+                len(tokens),
+                offsets,
+                edges,
+                edge_weights,
+                vertex_weights,
+            )
 
-    pin = getattr(hypergraph, "setFixedVertex", None) or getattr(
-        hypergraph, "fixVertex", None
-    )
-    if pin is None:  # pragma: no cover - version-specific API
-        raise RuntimeError("installed KaHyPar binding does not support fixed vertices")
-    for rank in range(num_ranks):
-        pin(terminal_base + rank, rank)
+    # KaHyPar requires strictly positive weights. Unit terminal weights are
+    # enough when the binding supports fixed vertices.
+    vertex_weights = [max(1, demand[expert]) for expert in experts] + [1] * num_ranks
+    hypergraph = build_hypergraph(vertex_weights)
 
     context = kahypar.Context()
     if config:
@@ -95,6 +91,32 @@ def kahypar_expert_placement(
         context.setK(num_ranks)
     if hasattr(context, "setSeed"):
         context.setSeed(int(seed))
+
+    pin = getattr(hypergraph, "setFixedVertex", None) or getattr(
+        hypergraph, "fixVertex", None
+    )
+    if pin is None:
+        pin = getattr(context, "setFixedVertex", None) or getattr(
+            context, "fixVertex", None
+        )
+    terminal_mode = "fixed"
+    if pin is not None:
+        for rank in range(num_ranks):
+            pin(terminal_base + rank, rank)
+    else:
+        # Older wheels omit fixed-vertex support. Equal heavy anchors force one
+        # source terminal into each block; blocks are relabelled below.
+        warnings.warn(
+            "KaHyPar binding has no fixed-vertex API; using heavy source anchors",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        anchor_weight = max(1, sum(demand.values()) + 1)
+        vertex_weights = [max(1, demand[expert]) for expert in experts] + [
+            anchor_weight
+        ] * num_ranks
+        hypergraph = build_hypergraph(vertex_weights)
+        terminal_mode = "anchor"
     kahypar.partition(hypergraph, context)
 
     block_id = getattr(hypergraph, "blockID", None) or getattr(
@@ -102,7 +124,22 @@ def kahypar_expert_placement(
     )
     if block_id is None:  # pragma: no cover - version-specific API
         raise RuntimeError("installed KaHyPar binding has no blockID accessor")
-    placement = {expert: int(block_id(index)) for index, expert in enumerate(experts)}
+    block_remap = {block: block for block in range(num_ranks)}
+    if terminal_mode == "anchor":
+        terminal_blocks = [block_id(terminal_base + rank) for rank in range(num_ranks)]
+        block_remap = {}
+        remaining_ranks = iter(
+            rank for rank in range(num_ranks) if rank not in terminal_blocks
+        )
+        for rank, block in enumerate(terminal_blocks):
+            block_remap.setdefault(block, rank)
+        for block in range(num_ranks):
+            if block not in block_remap:
+                block_remap[block] = next(remaining_ranks)
+    placement = {
+        expert: int(block_remap[int(block_id(index))])
+        for index, expert in enumerate(experts)
+    }
     metrics = evaluate_cable_placement(tokens, placement, num_ranks=num_ranks)
     return {
         "rank_by_expert": placement,
@@ -111,4 +148,5 @@ def kahypar_expert_placement(
             for rank in range(num_ranks)
         },
         "metrics": metrics,
+        "terminal_mode": terminal_mode,
     }

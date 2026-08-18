@@ -79,6 +79,8 @@ PYTHONPATH=python python benchmark/compare_grace.py \
   --save-kahypar kahypar.json
 ```
 
+若安装的 KaHyPar wheel 没有 fixed-vertex API，程序会自动退回到高权重 source anchor，并按 anchor block 对齐 rank，同时输出 warning。
+
 `--optimizer-bundles 0` 表示使用完整 compact trace，但一千万 bundle 会明显变慢。`--rdma-cost 1` 适用于单机 NVLink/NVSwitch；`none` backend 仅用于采集路由，实际通信收益需要在 token A2A backend 下验证。
 
 ## 后续改进方向
