@@ -175,7 +175,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             experts = tuple(
                 sorted({expert for token in tokens for expert in token.topk_experts})
             )
-        needs_grace = not (args.cable_only or args.hypergraph_only or args.kahypar_only)
+        needs_grace = not (args.cable_only or args.hypergraph_only)
         grace_started = time.perf_counter() if needs_grace else None
         graph = (
             build_co_routing_graph(tokens, experts=experts)
@@ -250,21 +250,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         hypergraph_seconds = (
             time.perf_counter() - started if hypergraph is not None else None
         )
-        started = time.perf_counter()
-        kahypar = None
-        if args.kahypar:
-            from sglang.srt.eplb.kahypar_expert_placement import (
-                kahypar_expert_placement,
-            )
-
-            kahypar = kahypar_expert_placement(
-                tokens,
-                experts=experts,
-                num_ranks=args.num_ranks,
-                config=args.kahypar_config,
-                seed=args.seed + position,
-            )
-        kahypar_seconds = time.perf_counter() - started if kahypar is not None else None
         total_tokens = (
             int(value["count"].sum().item())
             if compact
@@ -334,19 +319,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "placement": grace_refined["rank_by_expert"],
                 "solve_seconds": grace_refine_seconds,
             }
-        if kahypar is not None:
-            result["kahypar"] = {
-                "metrics": _metrics(
-                    tokens,
-                    kahypar["rank_by_expert"],
-                    num_ranks=args.num_ranks,
-                    ranks_per_node=args.ranks_per_node,
-                    rdma_cost=args.rdma_cost,
-                    compute_load=kahypar["metrics"].compute_load,
-                ),
-                "placement": kahypar["rank_by_expert"],
-                "solve_seconds": kahypar_seconds,
-            }
         results.append(result)
     return {
         "input": args.input,
@@ -355,15 +327,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             if args.cable_only
             else "hypergraph"
             if args.hypergraph_only
-            else "kahypar"
-            if args.kahypar_only
             else "+".join(
                 [
                     "grace",
                     *(["grace-refine"] if args.grace_refine else []),
                     *(["cable"] if args.cable else []),
                     *(["hypergraph"] if args.hypergraph else []),
-                    *(["kahypar"] if args.kahypar else []),
                 ]
             )
         ),
@@ -431,14 +400,6 @@ def _print(result: Mapping[str, Any]) -> None:
                     layer["grace_refine"]["solve_seconds"],
                 )
             )
-        if "kahypar" in layer:
-            metrics.append(
-                (
-                    "kahypar",
-                    layer["kahypar"]["metrics"],
-                    layer["kahypar"]["solve_seconds"],
-                )
-            )
         for method, metric, solve_seconds in metrics:
             rows.append(
                 [
@@ -473,9 +434,6 @@ def main() -> None:
     parser.add_argument("--grace-refine", action="store_true")
     parser.add_argument("--grace-refine-rounds", type=int, default=4)
     parser.add_argument("--grace-refine-capacity-ratio", type=float)
-    parser.add_argument("--kahypar", action="store_true")
-    parser.add_argument("--kahypar-only", action="store_true")
-    parser.add_argument("--kahypar-config")
     parser.add_argument("--cable-congestion-weight", type=float, default=0.25)
     parser.add_argument("--cable-load-weight", type=float, default=0.25)
     parser.add_argument("--cable-refine-swaps", type=int, default=2)
@@ -497,15 +455,12 @@ def main() -> None:
     parser.add_argument("--save-cable")
     parser.add_argument("--save-hypergraph")
     parser.add_argument("--save-grace-refine")
-    parser.add_argument("--save-kahypar")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
     if args.cable_only:
         args.cable = True
     if args.hypergraph_only:
         args.hypergraph = True
-    if args.kahypar_only:
-        args.kahypar = True
     args.ranks_per_node = args.ranks_per_node or args.num_ranks
     if args.num_ranks < 1 or args.num_ranks % args.ranks_per_node:
         parser.error("--ranks-per-node must be positive and divide --num-ranks")
@@ -533,20 +488,14 @@ def main() -> None:
         parser.error("invalid placement parameters")
     if args.save_cable and not args.cable:
         parser.error("--save-cable requires --cable")
-    if args.save_grace and (
-        args.cable_only or args.hypergraph_only or args.kahypar_only
-    ):
+    if args.save_grace and (args.cable_only or args.hypergraph_only):
         parser.error("--save-grace requires the GRACE placement")
     if args.save_hypergraph and not args.hypergraph:
         parser.error("--save-hypergraph requires --hypergraph")
-    if args.grace_refine and (
-        args.cable_only or args.hypergraph_only or args.kahypar_only
-    ):
+    if args.grace_refine and (args.cable_only or args.hypergraph_only):
         parser.error("--grace-refine requires the GRACE placement")
     if args.save_grace_refine and not args.grace_refine:
         parser.error("--save-grace-refine requires --grace-refine")
-    if args.save_kahypar and not args.kahypar:
-        parser.error("--save-kahypar requires --kahypar")
     result = run(args)
     if args.save_grace:
         Path(args.save_grace).write_text(
@@ -599,21 +548,6 @@ def main() -> None:
                     layer["gate"]: {
                         str(e): r
                         for e, r in sorted(layer["grace_refine"]["placement"].items())
-                    }
-                    for layer in result["layers"]
-                },
-                indent=2,
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-    if args.save_kahypar:
-        Path(args.save_kahypar).write_text(
-            json.dumps(
-                {
-                    layer["gate"]: {
-                        str(e): r
-                        for e, r in sorted(layer["kahypar"]["placement"].items())
                     }
                     for layer in result["layers"]
                 },
