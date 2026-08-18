@@ -374,7 +374,6 @@ def hypergraph_expert_placement(
     swap_candidate_partners: int = 4,
     swap_allow_load_worsening: bool = False,
     swap_max_compute_imbalance: float | None = None,
-    swap_exhaustive: bool = False,
 ) -> dict[str, object]:
     """Solve fixed-terminal hypergraph connectivity placement.
 
@@ -468,7 +467,6 @@ def hypergraph_expert_placement(
             candidate_partners=swap_candidate_partners,
             allow_load_worsening=swap_allow_load_worsening,
             max_compute_imbalance=swap_max_compute_imbalance,
-            exhaustive=swap_exhaustive,
         )
         placement = {expert: int(ranks[i]) for i, expert in enumerate(experts)}
         metrics = evaluate_cable_placement(arrays, placement, num_ranks=num_ranks)

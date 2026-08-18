@@ -26,6 +26,7 @@ from sglang.srt.eplb.expert_affinity_graph import (
 )
 from sglang.srt.eplb.grace_expert_placement import grace_hierarchical_placement
 from sglang.srt.eplb.hypergraph_expert_placement import hypergraph_expert_placement
+from sglang.srt.eplb.replicated_expert_placement import hot_expert_replication
 
 
 _LAYER_PATTERN = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
@@ -170,6 +171,27 @@ def _metrics(
     }
 
 
+def _replica_metrics(
+    metrics: Any, replicas_by_expert: Mapping[int, Sequence[int]]
+) -> dict[str, Any]:
+    loads = list(metrics.compute_load)
+    average = sum(loads) / len(loads)
+    counts = [0] * len(loads)
+    for replicas in replicas_by_expert.values():
+        for rank in replicas:
+            counts[rank] += 1
+    return {
+        "remote": metrics.remote,
+        "weighted_remote": metrics.weighted_remote,
+        "compute_imbalance": max(loads, default=0) / average if average else 0.0,
+        "compute_load": loads,
+        "expert_count": counts,
+        "max_pair_traffic": metrics.max_pair_traffic,
+        "max_ingress": metrics.max_ingress,
+        "max_egress": metrics.max_egress,
+    }
+
+
 def _baseline_placement(experts: Sequence[int], num_ranks: int) -> dict[int, int]:
     return {
         expert: min(index * num_ranks // len(experts), num_ranks - 1)
@@ -247,12 +269,35 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 swap_max_compute_imbalance=(
                     args.grace_refine_swap_compute_limit
                 ),
-                swap_exhaustive=args.grace_refine_exhaustive_swaps,
             )
             if args.grace_refine
             else None
         )
         grace_refine_seconds = time.perf_counter() - started if grace_refined else None
+        replication = None
+        replication_seconds = None
+        if args.grace_replication:
+            if placement is None:
+                raise ValueError("--grace-replication requires the GRACE placement")
+            replication_seed = (
+                grace_refined["rank_by_expert"]
+                if grace_refined is not None
+                else placement.rank_by_expert
+            )
+            started = time.perf_counter()
+            replication = hot_expert_replication(
+                tokens,
+                replication_seed,
+                num_ranks=args.num_ranks,
+                ranks_per_node=args.ranks_per_node,
+                rdma_cost=args.rdma_cost,
+                extra_copy_budget=args.grace_replication_budget,
+                hot_experts=args.grace_replication_hot_experts,
+                candidate_ranks=args.grace_replication_candidates,
+                compute_imbalance_limit=args.grace_replication_compute_limit,
+                max_extra_per_rank=args.grace_replication_max_extra_per_rank,
+            )
+            replication_seconds = time.perf_counter() - started
         started = time.perf_counter()
         cable = (
             cable_expert_placement(
@@ -370,6 +415,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "solve_seconds": grace_seconds + grace_refine_seconds,
                 "refine_seconds": grace_refine_seconds,
             }
+        if replication is not None:
+            result["grace_replicated"] = {
+                "metrics": _replica_metrics(
+                    replication.metrics, replication.replicas_by_expert
+                ),
+                "placement": replication.replicas_by_expert,
+                "extra_copies": replication.extra_copies,
+                "solve_seconds": (
+                    grace_seconds
+                    + (grace_refine_seconds or 0.0)
+                    + replication_seconds
+                ),
+                "replication_seconds": replication_seconds,
+            }
         results.append(result)
     return {
         "input": args.input,
@@ -382,6 +441,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 [
                     "grace",
                     *(["grace-refine"] if args.grace_refine else []),
+                    *(["grace-replicated"] if args.grace_replication else []),
                     *(["cable"] if args.cable else []),
                     *(["hypergraph"] if args.hypergraph else []),
                 ]
@@ -452,6 +512,14 @@ def _print(result: Mapping[str, Any]) -> None:
                     layer["grace_refine"]["solve_seconds"],
                 )
             )
+        if "grace_replicated" in layer:
+            metrics.append(
+                (
+                    "grace-replicated",
+                    layer["grace_replicated"]["metrics"],
+                    layer["grace_replicated"]["solve_seconds"],
+                )
+            )
         for method, metric, solve_seconds in metrics:
             rows.append(
                 [
@@ -492,9 +560,18 @@ def main() -> None:
     parser.add_argument(
         "--grace-refine-allow-load-worsening", action="store_true"
     )
-    parser.add_argument("--grace-refine-swap-compute-limit", type=float, default=1.25)
-    parser.add_argument("--grace-refine-exhaustive-swaps", action="store_true")
+    parser.add_argument("--grace-refine-swap-compute-limit", type=float)
     parser.add_argument("--grace-refine-capacity-ratio", type=float)
+    parser.add_argument("--grace-replication", action="store_true")
+    parser.add_argument("--grace-replication-budget", type=int, default=0)
+    parser.add_argument("--grace-replication-hot-experts", type=int, default=16)
+    parser.add_argument("--grace-replication-candidates", type=int, default=4)
+    parser.add_argument(
+        "--grace-replication-compute-limit", type=float, default=1.25
+    )
+    parser.add_argument(
+        "--grace-replication-max-extra-per-rank", type=int, default=1
+    )
     parser.add_argument("--cable-congestion-weight", type=float, default=0.25)
     parser.add_argument("--cable-load-weight", type=float, default=0.25)
     parser.add_argument("--cable-refine-swaps", type=int, default=2)
@@ -516,6 +593,7 @@ def main() -> None:
     parser.add_argument("--save-cable")
     parser.add_argument("--save-hypergraph")
     parser.add_argument("--save-grace-refine")
+    parser.add_argument("--save-grace-replication")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
     if args.cable_only:
@@ -541,7 +619,15 @@ def main() -> None:
         or args.grace_refine_rounds < 0
         or args.grace_refine_swaps < 0
         or args.grace_refine_partners < 1
-        or args.grace_refine_swap_compute_limit < 1
+        or (
+            args.grace_refine_swap_compute_limit is not None
+            and args.grace_refine_swap_compute_limit < 1
+        )
+        or args.grace_replication_budget < 0
+        or args.grace_replication_hot_experts < 0
+        or args.grace_replication_candidates < 1
+        or args.grace_replication_compute_limit < 1
+        or args.grace_replication_max_extra_per_rank < 1
         or (
             args.grace_refine_capacity_ratio is not None
             and not 0 <= args.grace_refine_capacity_ratio < 1
@@ -558,10 +644,14 @@ def main() -> None:
         parser.error("--save-hypergraph requires --hypergraph")
     if args.grace_refine and (args.cable_only or args.hypergraph_only):
         parser.error("--grace-refine requires the GRACE placement")
+    if args.grace_replication and (args.cable_only or args.hypergraph_only):
+        parser.error("--grace-replication requires the GRACE placement")
     if args.grace_equal_experts and (args.cable_only or args.hypergraph_only):
         parser.error("--grace-equal-experts requires the GRACE placement")
     if args.save_grace_refine and not args.grace_refine:
         parser.error("--save-grace-refine requires --grace-refine")
+    if args.save_grace_replication and not args.grace_replication:
+        parser.error("--save-grace-replication requires --grace-replication")
     result = run(args)
     if args.save_grace:
         Path(args.save_grace).write_text(
@@ -614,6 +704,23 @@ def main() -> None:
                     layer["gate"]: {
                         str(e): r
                         for e, r in sorted(layer["grace_refine"]["placement"].items())
+                    }
+                    for layer in result["layers"]
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    if args.save_grace_replication:
+        Path(args.save_grace_replication).write_text(
+            json.dumps(
+                {
+                    layer["gate"]: {
+                        str(expert): list(ranks)
+                        for expert, ranks in sorted(
+                            layer["grace_replicated"]["placement"].items()
+                        )
                     }
                     for layer in result["layers"]
                 },

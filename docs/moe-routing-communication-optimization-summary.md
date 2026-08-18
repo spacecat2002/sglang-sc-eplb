@@ -72,11 +72,22 @@ PYTHONPATH=python python benchmark/compare_grace.py \
   --save-grace-refine grace-refined.json
 ```
 
-该路径先根据完整 Top-K bundle 对 GRACE groups 做精确 group-to-rank assignment，再执行受限 exact pair-swap。默认不允许 swap 增大最大计算负载；加上 `--grace-refine-allow-load-worsening` 后，可在 `--grace-refine-swap-compute-limit`（默认 `1.25x` 平均负载）内用计算均衡换取更低的 remote。若 seed 已超过该上限，swap 不会继续恶化并可逐步降低负载。remote 不变时 pair-swap 还会继续降低 `max-ingress/max-pair`，或在通信指标完全相同时改善计算均衡。
-
-质量优先实验可加 `--grace-refine-exhaustive-swaps`。该模式会在默认稀疏候选 refinement 之后枚举全部跨 rank expert pair，精确计算完整 Top-K delta，每次只应用当前全局最佳 pair 后重新搜索；轮数足够且搜索自然收敛时可以达到 pair-swap 的 2-opt 局部最优，但成本明显高于默认模式。
+该路径先根据完整 Top-K bundle 对 GRACE groups 做精确 group-to-rank assignment，再执行受限 exact pair-swap。默认不允许 swap 增大最大计算负载；加上 `--grace-refine-allow-load-worsening` 后不再限制 swap 的计算负载。若还要约束均衡，可显式设置 `--grace-refine-swap-compute-limit 1.25`；seed 已超过该上限时，swap 不会继续恶化并可逐步降低负载。remote 不变时 pair-swap 还会继续降低 `max-ingress/max-pair`，或在通信指标完全相同时改善计算均衡。
 
 `compare_grace.py` 的结果表和 `--json` 输出现在都会包含 `baseline`：它是未执行 placement plan 的连续均衡 expert layout，并使用相同 trace 计算 `remote/weighted/max-pair/max-ingress/max-egress` 等指标，`solve-ms` 为 0。
+
+在 GRACE/GRACE-refine placement 上模拟受约束 hot-expert replication：
+
+```bash
+PYTHONPATH=python python benchmark/compare_grace.py \
+  --input /tmp/qwen3_ep8_trace.pt --num-ranks 8 \
+  --optimizer-bundles 0 --grace-refine --grace-replication \
+  --grace-replication-budget 8 \
+  --grace-replication-max-extra-per-rank 1 \
+  --grace-replication-compute-limit 1.25
+```
+
+模拟器逐个添加 source-local 副本，只接受能精确减少 Top-K bundle remote 且不继续恶化计算上限的候选。副本只服务同 rank 来源 token；该限制保持模拟快速、确定且无需假设在线负载预测。
 
 如需强制每个 rank 专家数相同，加上 `--grace-equal-experts`。该模式会在 node/GPU 两级 grouping 中做等量 rebalance，并在固定 group 大小下优先保留高 affinity expert；专家数必须能被 rank 数整除。
 

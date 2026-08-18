@@ -299,125 +299,6 @@ def _apply_swap(
     compute_load[right_rank] = next_right
 
 
-def _refine_exhaustive_swaps(
-    *,
-    source: np.ndarray,
-    topk: np.ndarray,
-    count: np.ndarray,
-    token_indexes: Sequence[np.ndarray],
-    bundle_rank_counts: np.ndarray,
-    ranks: np.ndarray,
-    demand: np.ndarray,
-    compute_load: np.ndarray,
-    traffic: np.ndarray,
-    num_ranks: int,
-    swaps: int,
-    allow_load_worsening: bool,
-    max_compute_imbalance: float | None,
-) -> None:
-    """Repeatedly apply the globally best exact pair swap."""
-
-    for _ in range(swaps):
-        best = None
-        current_traffic_key = _traffic_key(traffic)
-        current_max_load = int(compute_load.max())
-        for left in range(len(ranks)):
-            left_rank = int(ranks[left])
-            for right in range(left + 1, len(ranks)):
-                right_rank = int(ranks[right])
-                if left_rank == right_rank:
-                    continue
-                next_left = int(
-                    compute_load[left_rank] + demand[right] - demand[left]
-                )
-                next_right = int(
-                    compute_load[right_rank] + demand[left] - demand[right]
-                )
-                next_load = compute_load.copy()
-                next_load[left_rank] = next_left
-                next_load[right_rank] = next_right
-                if not _swap_load_allowed(
-                    compute_load,
-                    next_load,
-                    allow_load_worsening=allow_load_worsening,
-                    max_compute_imbalance=max_compute_imbalance,
-                ):
-                    continue
-                delta_state = _exact_swap_delta(
-                    source=source,
-                    topk=topk,
-                    count=count,
-                    token_indexes=token_indexes,
-                    bundle_rank_counts=bundle_rank_counts,
-                    ranks=ranks,
-                    left=left,
-                    right=right,
-                )
-                delta = delta_state[-1]
-                if delta > 0:
-                    continue
-                next_traffic = traffic.copy()
-                _update_swap_traffic(
-                    next_traffic,
-                    count=count,
-                    indexes=delta_state[0],
-                    sources=delta_state[1],
-                    rank_deltas=(
-                        (left_rank, delta_state[2]),
-                        (right_rank, delta_state[3]),
-                    ),
-                    num_ranks=num_ranks,
-                )
-                next_traffic_key = _traffic_key(next_traffic)
-                next_max_load = int(next_load.max())
-                if delta == 0 and not (
-                    next_traffic_key < current_traffic_key
-                    or (
-                        next_traffic_key == current_traffic_key
-                        and next_max_load < current_max_load
-                    )
-                ):
-                    continue
-                key = (
-                    delta,
-                    next_max_load,
-                    next_traffic_key,
-                    left,
-                    right,
-                    next_left,
-                    next_right,
-                )
-                if best is None or key < best:
-                    best = key
-        if best is None:
-            break
-        _, _, _, left, right, next_left, next_right = best
-        delta_state = _exact_swap_delta(
-            source=source,
-            topk=topk,
-            count=count,
-            token_indexes=token_indexes,
-            bundle_rank_counts=bundle_rank_counts,
-            ranks=ranks,
-            left=left,
-            right=right,
-        )
-        _apply_swap(
-            count=count,
-            token_indexes=token_indexes,
-            bundle_rank_counts=bundle_rank_counts,
-            ranks=ranks,
-            compute_load=compute_load,
-            traffic=traffic,
-            num_ranks=num_ranks,
-            left=left,
-            right=right,
-            next_left=next_left,
-            next_right=next_right,
-            delta_state=delta_state,
-        )
-
-
 def _refine_swaps(
     *,
     source: np.ndarray,
@@ -437,7 +318,6 @@ def _refine_swaps(
     candidate_partners: int = 4,
     allow_load_worsening: bool = False,
     max_compute_imbalance: float | None = None,
-    exhaustive: bool = False,
 ) -> None:
     """Apply bounded remote- or load-improving swaps in-place."""
 
@@ -447,8 +327,6 @@ def _refine_swaps(
         raise ValueError("strategy must be 'remote' or 'balanced'")
     if max_compute_imbalance is not None and max_compute_imbalance < 1:
         raise ValueError("max_compute_imbalance must be at least 1")
-    if exhaustive and strategy != "remote":
-        raise ValueError("exhaustive swaps require the remote strategy")
     expert_count = len(ranks)
     remote_delta_total = 0
     remote_budget_tokens = int(total_tokens * remote_budget)
@@ -584,22 +462,6 @@ def _refine_swaps(
             changed = True
         if not changed:
             break
-    if exhaustive:
-        _refine_exhaustive_swaps(
-            source=source,
-            topk=topk,
-            count=count,
-            token_indexes=token_indexes,
-            bundle_rank_counts=bundle_rank_counts,
-            ranks=ranks,
-            demand=demand,
-            compute_load=compute_load,
-            traffic=traffic,
-            num_ranks=num_ranks,
-            swaps=rounds,
-            allow_load_worsening=allow_load_worsening,
-            max_compute_imbalance=max_compute_imbalance,
-        )
 
 
 def evaluate_cable_placement(

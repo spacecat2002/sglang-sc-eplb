@@ -9,6 +9,7 @@ from sglang.srt.eplb.expert_affinity_graph import (
 )
 from sglang.srt.eplb.grace_expert_placement import grace_hierarchical_placement
 from sglang.srt.eplb.hypergraph_expert_placement import hypergraph_expert_placement
+from sglang.srt.eplb.replicated_expert_placement import hot_expert_replication
 
 
 def test_cable_finds_balanced_source_local_bundles_without_grace():
@@ -27,6 +28,45 @@ def test_cable_finds_balanced_source_local_bundles_without_grace():
     assert placement.metrics.remote == 0
     assert placement.metrics.max_ingress == 0
     assert placement.metrics.compute_imbalance == 1
+
+
+def test_hot_replication_reduces_remote_and_balances_compute():
+    tokens = [
+        RoutedToken(0, (0, 1), 10),
+        RoutedToken(1, (0, 2), 10),
+    ]
+    result = hot_expert_replication(
+        tokens,
+        {0: 1, 1: 0, 2: 1},
+        num_ranks=2,
+        ranks_per_node=2,
+        extra_copy_budget=1,
+        compute_imbalance_limit=1,
+    )
+
+    assert result.replicas_by_expert[0] == (1, 0)
+    assert result.metrics.remote == 0
+    assert result.metrics.compute_imbalance == 1
+
+
+def test_hot_replication_limits_extra_weights_per_rank():
+    tokens = [
+        RoutedToken(0, (0,), 10),
+        RoutedToken(0, (1,), 9),
+    ]
+    result = hot_expert_replication(
+        tokens,
+        {0: 1, 1: 1},
+        num_ranks=2,
+        ranks_per_node=2,
+        extra_copy_budget=2,
+        hot_experts=2,
+        compute_imbalance_limit=10,
+        max_extra_per_rank=1,
+    )
+
+    assert result.extra_copies == 1
+    assert sum(len(ranks) - 1 for ranks in result.replicas_by_expert.values()) == 1
 
 
 def test_routed_arrays_match_token_path():
@@ -305,39 +345,6 @@ def test_grace_swaps_can_trade_compute_balance_for_lower_remote():
     assert relaxed["metrics"].remote <= capped["metrics"].remote
     assert capped["metrics"].compute_imbalance <= 1.25
     assert {len(group) for group in relaxed["experts_by_rank"].values()} == {3}
-
-
-def test_grace_exhaustive_swaps_polish_sparse_search_without_more_load_skew():
-    tokens = [
-        RoutedToken(1, (0, 4, 5), 7),
-        RoutedToken(3, (0, 2, 6), 1),
-        RoutedToken(3, (0, 4, 6), 4),
-        RoutedToken(2, (1, 4, 6), 2),
-        RoutedToken(2, (0, 3, 5), 5),
-        RoutedToken(2, (1, 2, 3), 5),
-        RoutedToken(2, (1, 4, 6), 6),
-        RoutedToken(3, (1, 3, 6), 8),
-        RoutedToken(2, (1, 4, 6), 5),
-        RoutedToken(0, (4, 5, 7), 5),
-    ]
-    common = dict(
-        experts=range(8),
-        num_ranks=4,
-        capacity_ratio=0,
-        initial_placement={expert: expert // 2 for expert in range(8)},
-        refine_rounds=0,
-        swap_rounds=8,
-        swap_candidate_partners=1,
-        swap_allow_load_worsening=True,
-        swap_max_compute_imbalance=1.25,
-    )
-    sparse = hypergraph_expert_placement(tokens, swap_exhaustive=False, **common)
-    exhaustive = hypergraph_expert_placement(tokens, swap_exhaustive=True, **common)
-
-    assert exhaustive["metrics"].remote < sparse["metrics"].remote
-    assert max(exhaustive["metrics"].compute_load) <= max(
-        sparse["metrics"].compute_load
-    )
 
 
 def test_grace_equal_experts_preserves_affinity_and_cardinality():
