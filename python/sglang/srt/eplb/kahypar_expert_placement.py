@@ -55,7 +55,9 @@ def kahypar_expert_placement(
     for token in tokens:
         for expert in token.topk_experts:
             demand[expert] += token.count
-    vertex_weights = [demand[expert] for expert in experts] + [0] * num_ranks
+    # KaHyPar requires strictly positive weights. Each block has exactly one
+    # fixed terminal, so its unit weight adds the same constant to every rank.
+    vertex_weights = [max(1, demand[expert]) for expert in experts] + [1] * num_ranks
 
     # KaHyPar Python wheels have used both six- and seven-argument constructors.
     try:
