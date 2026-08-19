@@ -127,8 +127,12 @@ def build_co_routing_graph(
     routed_tokens: RoutingInput,
     *,
     experts: Optional[Iterable[int]] = None,
+    source_affinity_weight: float = 0.0,
 ) -> CoRoutingGraph:
-    """Build the weighted expert co-activation graph for GRACE."""
+    """Build the weighted expert affinity graph for GRACE."""
+
+    if source_affinity_weight < 0:
+        raise ValueError("source_affinity_weight must be non-negative")
 
     if isinstance(routed_tokens, RoutedArrays):
         arrays = routed_tokens
@@ -139,10 +143,20 @@ def build_co_routing_graph(
         indexed = index_topk_experts(arrays, ordered)
         size = len(ordered)
         demand_values = np.zeros(size, dtype=np.int64)
+        source_demand = np.zeros(
+            (size, int(arrays.source_rank.max()) + 1), dtype=np.int64
+        )
+        source_count = source_demand.shape[1]
         edge_values = np.zeros(size * size, dtype=np.int64)
         weights = arrays.count.astype(np.int64, copy=False)
         for column in range(indexed.shape[1]):
             np.add.at(demand_values, indexed[:, column], weights)
+            if source_affinity_weight:
+                np.add.at(
+                    source_demand,
+                    (indexed[:, column], arrays.source_rank),
+                    weights,
+                )
             for right_column in range(column + 1, indexed.shape[1]):
                 left = indexed[:, column]
                 right = indexed[:, right_column]
@@ -164,16 +178,56 @@ def build_co_routing_graph(
             raise ValueError("routed_tokens or experts must not be empty")
         demand = defaultdict(int)
         edges = defaultdict(int)
+        source_demand = defaultdict(lambda: defaultdict(int))
+        source_count = max((token.source_rank for token in tokens), default=-1) + 1
         observed = set(experts or ())
         for token in tokens:
             observed.update(token.topk_experts)
             for expert in token.topk_experts:
                 demand[expert] += token.count
+                if source_affinity_weight:
+                    source_demand[expert][token.source_rank] += token.count
             for left, right in combinations(token.topk_experts, 2):
                 edges[tuple(sorted((left, right)))] += token.count
         ordered = tuple(sorted(observed))
     if not ordered:
         raise ValueError("routed_tokens or experts must not be empty")
+    if source_affinity_weight and source_count:
+        for left_index, left in enumerate(ordered):
+            for right_index in range(left_index + 1, len(ordered)):
+                right = ordered[right_index]
+                if isinstance(routed_tokens, RoutedArrays):
+                    left_excess = np.maximum(
+                        source_demand[left_index]
+                        - demand_values[left_index] / source_count,
+                        0,
+                    )
+                    right_excess = np.maximum(
+                        source_demand[right_index]
+                        - demand_values[right_index] / source_count,
+                        0,
+                    )
+                    overlap = float(
+                        np.minimum(
+                            left_excess, right_excess
+                        ).sum()
+                    )
+                else:
+                    left_mean = demand[left] / source_count
+                    right_mean = demand[right] / source_count
+                    overlap = sum(
+                        min(
+                            max(source_demand[left].get(source, 0) - left_mean, 0),
+                            max(
+                                source_demand[right].get(source, 0) - right_mean,
+                                0,
+                            ),
+                        )
+                        for source in range(source_count)
+                    )
+                bonus = round(source_affinity_weight * overlap)
+                if bonus:
+                    edges[(left, right)] = edges.get((left, right), 0) + bonus
     adjacency: dict[int, dict[int, int]] = {expert: {} for expert in ordered}
     for expert in ordered:
         demand.setdefault(expert, 0)

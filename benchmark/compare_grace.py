@@ -227,7 +227,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         needs_grace = not (args.cable_only or args.hypergraph_only)
         grace_started = time.perf_counter() if needs_grace else None
         graph = (
-            build_co_routing_graph(tokens, experts=experts)
+            build_co_routing_graph(
+                tokens,
+                experts=experts,
+                source_affinity_weight=args.grace_source_affinity_weight,
+            )
             if needs_grace
             else None
         )
@@ -451,6 +455,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "num_ranks": args.num_ranks,
         "ranks_per_node": args.ranks_per_node,
         "grace_ratio": args.grace_ratio,
+        "grace_source_affinity_weight": args.grace_source_affinity_weight,
         "optimizer_bundles": args.optimizer_bundles,
         "layers": results,
     }
@@ -545,6 +550,7 @@ def main() -> None:
     parser.add_argument("--source-ep", type=int)
     parser.add_argument("--ranks-per-node", type=int)
     parser.add_argument("--grace-ratio", type=float, default=0.15)
+    parser.add_argument("--grace-source-affinity-weight", type=float, default=0.0)
     parser.add_argument("--grace-equal-experts", action="store_true")
     parser.add_argument("--optimizer-bundles", type=int, default=20_000)
     parser.add_argument("--seed", type=int, default=0)
@@ -606,6 +612,7 @@ def main() -> None:
     if (
         args.optimizer_bundles < 0
         or not 0 <= args.grace_ratio < 1
+        or args.grace_source_affinity_weight < 0
         or args.rdma_cost < 1
         or args.cable_refine_swaps < 0
         or args.cable_compute_moves < 0

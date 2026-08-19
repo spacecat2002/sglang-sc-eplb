@@ -82,6 +82,12 @@ def test_routed_arrays_match_token_path():
     )
     token_graph = build_co_routing_graph(tokens, experts=range(4))
     array_graph = build_co_routing_graph(arrays, experts=range(4))
+    token_source_graph = build_co_routing_graph(
+        tokens, experts=range(4), source_affinity_weight=0.5
+    )
+    array_source_graph = build_co_routing_graph(
+        arrays, experts=range(4), source_affinity_weight=0.5
+    )
     initial = {expert: expert for expert in range(4)}
     common = dict(
         experts=range(4),
@@ -93,6 +99,7 @@ def test_routed_arrays_match_token_path():
     )
 
     assert array_graph == token_graph
+    assert array_source_graph == token_source_graph
     assert hypergraph_expert_placement(arrays, **common) == (
         hypergraph_expert_placement(tokens, **common)
     )
@@ -239,6 +246,44 @@ def test_grace_group_assignment_uses_source_locality():
 
     assert evaluate_primary_remote(tokens, initial) == 20
     assert refined["metrics"].remote == 0
+
+
+def test_source_aware_grace_grouping_improves_fixed_group_assignment():
+    tokens = [
+        RoutedToken(0, (0, 5, 7), 3),
+        RoutedToken(0, (3, 4, 5), 2),
+        RoutedToken(0, (0, 4, 7), 5),
+        RoutedToken(1, (1, 2, 6), 8),
+        RoutedToken(1, (3, 5, 6), 3),
+        RoutedToken(1, (1, 2, 6), 9),
+        RoutedToken(2, (0, 5, 6), 2),
+        RoutedToken(2, (2, 5, 7), 1),
+        RoutedToken(2, (0, 6, 7), 5),
+        RoutedToken(3, (4, 5, 7), 7),
+        RoutedToken(3, (3, 5, 7), 8),
+        RoutedToken(3, (0, 2, 3), 1),
+    ]
+
+    def assigned_remote(source_weight):
+        graph = build_co_routing_graph(
+            tokens, experts=range(8), source_affinity_weight=source_weight
+        )
+        grace = grace_hierarchical_placement(
+            graph, num_ranks=4, equal_experts=True
+        )
+        result = hypergraph_expert_placement(
+            tokens,
+            experts=range(8),
+            num_ranks=4,
+            capacity_ratio=0,
+            initial_placement=grace.rank_by_expert,
+            align_groups=True,
+            refine_rounds=0,
+            swap_rounds=0,
+        )
+        return result["metrics"].remote
+
+    assert assigned_remote(0.5) < assigned_remote(0)
 
 
 def test_grace_pair_swaps_improve_remote_at_equal_capacity():
