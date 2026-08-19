@@ -212,6 +212,14 @@ max(max-ingress, max-egress)
 
 最终 `remote` 不超过 remote-first 基线的 `1 + remote budget`。这是整个第二阶段共用的一次性上限，不会在三个步骤中重复累加。默认 objective 仍是 `remote`，因此原有结果不变。
 
+如果希望从 group-to-rank assignment 的第一步就直接以链路瓶颈为目标，可以使用：
+
+```bash
+--grace-refine-objective congestion-direct
+```
+
+该模式对固定 GRACE groups 直接求最小的 `max(max-ingress, max-egress)`，再最小化 `max-pair` 和 total remote，然后执行同一目标的 move/swap refinement。它不设置 remote ceiling，可能用少量额外 remote 换取更低的最大链路，适合直接对比真实 A2A 时间。
+
 ## 6. 受约束 Hot-Expert Replication
 
 `--grace-replication` 在单副本 placement 之后增加少量权重副本：
@@ -431,7 +439,7 @@ Replication 保存 primary 和额外副本 rank；数组第一个元素为 prima
 | `--grace-refine-rounds` | `4` | 单专家 move 轮数 |
 | `--grace-refine-swaps` | `2` | pair-swap 轮数 |
 | `--grace-refine-partners` | `8` | 每个目标 rank 的候选 partner 数 |
-| `--grace-refine-objective` | `remote` | `remote` 或瓶颈优先的 `congestion` |
+| `--grace-refine-objective` | `remote` | `remote`、`congestion` 或 `congestion-direct` |
 | `--grace-refine-remote-budget` | `0` | congestion 相对 remote-first 允许增加的 remote 比例 |
 | `--grace-refine-capacity-ratio` | GRACE ratio | move 的专家容量比例 |
 | `--grace-refine-allow-load-worsening` | false | 允许通信改善的 swap 增加最大负载 |

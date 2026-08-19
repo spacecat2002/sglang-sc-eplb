@@ -45,15 +45,13 @@ def _traffic_key(traffic: np.ndarray) -> tuple[int, int, int]:
     )
 
 
-def _congestion_key(traffic: np.ndarray) -> tuple[int, int, int, int, int]:
+def _congestion_key(traffic: np.ndarray) -> tuple[int, int, int]:
     ingress = int(traffic.sum(axis=0).max())
     egress = int(traffic.sum(axis=1).max())
     return (
         max(ingress, egress),
         int(traffic.max()),
         int(traffic.sum()),
-        egress,
-        ingress,
     )
 
 
@@ -328,8 +326,6 @@ def _refine_swaps(
         return
     if strategy not in {"remote", "balanced", "congestion"}:
         raise ValueError("invalid refinement strategy")
-    if strategy == "congestion" and remote_limit is None:
-        raise ValueError("congestion refinement requires remote_limit")
     if max_compute_imbalance is not None and max_compute_imbalance < 1:
         raise ValueError("max_compute_imbalance must be at least 1")
     expert_count = len(ranks)
@@ -434,9 +430,9 @@ def _refine_swaps(
                     rank_deltas=((left_rank, delta_left), (right_rank, delta_right)),
                     num_ranks=num_ranks,
                 )
-                if int(next_traffic.sum()) <= int(remote_limit) and _congestion_key(
-                    next_traffic
-                ) < _congestion_key(traffic):
+                if (
+                    remote_limit is None or int(next_traffic.sum()) <= remote_limit
+                ) and _congestion_key(next_traffic) < _congestion_key(traffic):
                     candidate = (
                         _congestion_key(next_traffic),
                         int(next_load.max()),

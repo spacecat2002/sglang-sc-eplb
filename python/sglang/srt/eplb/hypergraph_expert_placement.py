@@ -344,6 +344,55 @@ def _align_groups_to_ranks(
             current = target
 
 
+def _align_groups_to_congestion(
+    source: np.ndarray,
+    count: np.ndarray,
+    ranks: np.ndarray,
+    slots: np.ndarray,
+    bundle_counts: np.ndarray,
+) -> None:
+    """Exactly minimize bottleneck, max-pair, then remote for fixed groups."""
+
+    num_ranks = bundle_counts.shape[1]
+    local = np.zeros((num_ranks, num_ranks), dtype=np.int64)
+    for group in range(num_ranks):
+        indexes = bundle_counts[:, group] != 0
+        np.add.at(local[group], source[indexes], count[indexes])
+    ingress = local.sum(axis=1)[:, None] - local
+    egress = local.sum(axis=0)[None, :] - local
+    bottleneck = np.maximum(ingress, egress)
+    pair = np.empty_like(local)
+    for rank in range(num_ranks):
+        values = local.copy()
+        values[:, rank] = 0
+        pair[:, rank] = values.max(axis=1)
+
+    def feasible(allowed: np.ndarray) -> bool:
+        assignment = _linear_assignment((~allowed).astype(np.int64))
+        return bool(np.all(allowed[np.arange(num_ranks), assignment]))
+
+    allowed = np.ones_like(local, dtype=bool)
+    for values in (bottleneck, pair):
+        candidates = np.unique(values[allowed])
+        low, high = 0, len(candidates) - 1
+        while low < high:
+            middle = (low + high) // 2
+            if feasible(allowed & (values <= candidates[middle])):
+                high = middle
+            else:
+                low = middle + 1
+        allowed &= values <= candidates[low]
+    cost = ingress.copy()
+    cost[~allowed] = int(cost.max()) * num_ranks + 1
+    assignment = _linear_assignment(cost)
+
+    ranks[:] = assignment[ranks]
+    old_slots = slots.copy()
+    slots[assignment] = old_slots
+    old_bundle_counts = bundle_counts.copy()
+    bundle_counts[:, assignment] = old_bundle_counts
+
+
 def _traffic(
     source: np.ndarray,
     count: np.ndarray,
@@ -363,7 +412,7 @@ def _refine_rank_labels(
     ranks: np.ndarray,
     slots: np.ndarray,
     bundle_counts: np.ndarray,
-    remote_limit: int,
+    remote_limit: int | None,
 ) -> None:
     """Swap whole rank groups to reduce the communication bottleneck."""
 
@@ -463,9 +512,9 @@ def _refine_congestion_moves(
                         minlength=num_ranks,
                     ).astype(np.int64)
                 key = _congestion_key(next_traffic)
-                if int(next_traffic.sum()) <= remote_limit and key < _congestion_key(
-                    traffic
-                ):
+                if (
+                    remote_limit is None or int(next_traffic.sum()) <= remote_limit
+                ) and key < _congestion_key(traffic):
                     choice = (
                         key,
                         int(next_loads.max()),
@@ -531,8 +580,8 @@ def hypergraph_expert_placement(
         raise ValueError("swap compute imbalance limit must be at least 1")
     if not 0 <= remote_budget <= 1:
         raise ValueError("remote_budget must be in [0, 1]")
-    if objective not in {"remote", "congestion"}:
-        raise ValueError("objective must be 'remote' or 'congestion'")
+    if objective not in {"remote", "congestion", "congestion-direct"}:
+        raise ValueError("invalid placement objective")
     if not 0 <= congestion_remote_budget <= 1:
         raise ValueError("congestion_remote_budget must be in [0, 1]")
     source, topk, count, token_indexes, demand, source_demand = _prepare(
@@ -564,24 +613,47 @@ def hypergraph_expert_placement(
                 minimum_capacity=minimum,
                 maximum_capacity=maximum,
             )
-        if align_groups:
+        if objective == "congestion-direct":
+            _align_groups_to_congestion(source, count, ranks, slots, bundle_counts)
+        elif align_groups:
             _align_groups_to_ranks(source, count, ranks, slots, bundle_counts)
-        loads = _refine_moves(
-            source,
-            count,
-            token_indexes,
-            ranks,
-            slots,
-            bundle_counts,
-            demand,
-            num_ranks=num_ranks,
-            minimum_capacity=minimum,
-            maximum_capacity=maximum,
-            compute_limit=compute_imbalance_limit,
-            rounds=refine_rounds,
-            total_tokens=int(count.sum()),
-            remote_budget=remote_budget,
-        )
+        if objective == "congestion-direct":
+            loads = np.bincount(ranks, weights=demand, minlength=num_ranks).astype(
+                np.int64
+            )
+            _refine_congestion_moves(
+                source,
+                count,
+                token_indexes,
+                ranks,
+                slots,
+                bundle_counts,
+                demand,
+                loads,
+                num_ranks=num_ranks,
+                minimum_capacity=minimum,
+                maximum_capacity=maximum,
+                compute_limit=compute_imbalance_limit,
+                rounds=refine_rounds,
+                remote_limit=None,
+            )
+        else:
+            loads = _refine_moves(
+                source,
+                count,
+                token_indexes,
+                ranks,
+                slots,
+                bundle_counts,
+                demand,
+                num_ranks=num_ranks,
+                minimum_capacity=minimum,
+                maximum_capacity=maximum,
+                compute_limit=compute_imbalance_limit,
+                rounds=refine_rounds,
+                total_tokens=int(count.sum()),
+                remote_budget=remote_budget,
+            )
         traffic = _traffic(source, count, bundle_counts)
         _refine_swaps(
             source=source,
@@ -596,11 +668,12 @@ def hypergraph_expert_placement(
             num_ranks=num_ranks,
             rounds=swap_rounds,
             total_tokens=int(count.sum()),
-            strategy="remote",
+            strategy=("congestion" if objective == "congestion-direct" else "remote"),
             remote_budget=0.0,
             candidate_partners=swap_candidate_partners,
             allow_load_worsening=swap_allow_load_worsening,
             max_compute_imbalance=swap_max_compute_imbalance,
+            remote_limit=None,
         )
         if objective == "congestion":
             remote_limit = int(
@@ -660,7 +733,7 @@ def hypergraph_expert_placement(
                 metrics.max_pair_traffic,
                 metrics.remote,
             )
-            if objective == "congestion"
+            if objective in {"congestion", "congestion-direct"}
             else (
                 metrics.remote,
                 metrics.max_ingress,

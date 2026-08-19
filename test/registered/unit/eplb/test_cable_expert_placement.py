@@ -398,6 +398,50 @@ def test_grace_congestion_objective_reduces_the_bottleneck():
     assert congestion_metrics.remote <= int(np.ceil(remote_metrics.remote * 1.01))
 
 
+def test_grace_congestion_direct_starts_from_bottleneck_assignment():
+    tokens = [
+        RoutedToken(3, (8, 7, 10), 17),
+        RoutedToken(1, (2, 8, 7), 6),
+        RoutedToken(0, (7, 4, 2), 3),
+        RoutedToken(0, (9, 6, 7), 6),
+        RoutedToken(0, (8, 1, 0), 2),
+        RoutedToken(1, (3, 9, 0), 15),
+        RoutedToken(2, (7, 9, 3), 17),
+        RoutedToken(1, (10, 4, 7), 1),
+        RoutedToken(0, (7, 10, 4), 14),
+        RoutedToken(0, (11, 4, 5), 8),
+        RoutedToken(2, (0, 1, 9), 4),
+        RoutedToken(3, (1, 4, 6), 3),
+        RoutedToken(0, (10, 0, 3), 7),
+        RoutedToken(0, (7, 6, 10), 14),
+        RoutedToken(0, (9, 10, 3), 9),
+        RoutedToken(2, (1, 4, 5), 1),
+        RoutedToken(3, (1, 2, 3), 4),
+        RoutedToken(0, (0, 7, 10), 6),
+        RoutedToken(1, (7, 8, 3), 5),
+        RoutedToken(3, (10, 6, 1), 13),
+    ]
+    common = dict(
+        experts=range(12),
+        num_ranks=4,
+        capacity_ratio=0,
+        initial_placement={expert: expert // 3 for expert in range(12)},
+        align_groups=True,
+        refine_rounds=2,
+        swap_rounds=2,
+        swap_candidate_partners=8,
+    )
+    remote = hypergraph_expert_placement(tokens, objective="remote", **common)
+    direct = hypergraph_expert_placement(
+        tokens, objective="congestion-direct", **common
+    )
+    remote_metrics = remote["metrics"]
+    direct_metrics = direct["metrics"]
+    assert max(direct_metrics.max_ingress, direct_metrics.max_egress) < max(
+        remote_metrics.max_ingress, remote_metrics.max_egress
+    )
+
+
 def test_grace_swaps_can_trade_compute_balance_for_lower_remote():
     tokens = [
         RoutedToken(0, (1, 2, 8), 14),

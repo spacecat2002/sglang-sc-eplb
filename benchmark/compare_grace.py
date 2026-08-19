@@ -561,7 +561,7 @@ def main() -> None:
     parser.add_argument("--grace-refine-partners", type=int, default=8)
     parser.add_argument(
         "--grace-refine-objective",
-        choices=("remote", "congestion"),
+        choices=("remote", "congestion", "congestion-direct"),
         default="remote",
     )
     parser.add_argument("--grace-refine-remote-budget", type=float, default=0.0)
