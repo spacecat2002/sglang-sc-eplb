@@ -323,6 +323,18 @@ PYTHONPATH=python python benchmark/compare_grace.py \
 --grace-refine-swap-compute-limit 1.25
 ```
 
+使用 SGLang 的 DeepEP normal all-to-all 对同一层、同一批采样 token 测量 plan 前后的真实通信时间：
+
+```bash
+PYTHONPATH=python python benchmark/benchmark_a2a_plan.py \
+  --input /tmp/qwen3_ep8_trace.pt \
+  --plan grace-refined.json \
+  --layer 0 --num-ranks 8 \
+  --hidden 2048 --tokens-per-rank 1024
+```
+
+脚本测量 `get_dispatch_layout + dispatch + combine` 的 CUDA 时间，并分别输出 layout、dispatch、combine、总时间和按 remote destination 估算的双向 BF16 A2A 字节数。`--hidden` 必须填写被测模型的实际 hidden size。Baseline 与 plan 使用相同的 token 样本、hidden size、DeepEP config 和物理 slot 上限；非均匀 placement 会用空 slot 填齐，replication plan 按 source-local 规则选择副本。可先用 `--dry-run` 在无 GPU 环境检查 plan、层名、slot 数和理论 remote。
+
 ## 8. 输出 Placement 格式
 
 GRACE 和 GRACE-refine 保存单 rank：
