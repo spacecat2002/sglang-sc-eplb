@@ -10,6 +10,23 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 
+def _config_hidden_size(config: object) -> int:
+    hidden_size = getattr(config, "hidden_size", None)
+    if not isinstance(hidden_size, int) or hidden_size < 1:
+        raise ValueError(f"model config has invalid hidden_size: {hidden_size!r}")
+    return hidden_size
+
+
+def _model_hidden_size(model: str, trust_remote_code: bool) -> int:
+    from sglang.srt.utils.hf_transformers_utils import (
+        get_config,
+        get_hf_text_config,
+    )
+
+    config = get_hf_text_config(get_config(model, trust_remote_code))
+    return _config_hidden_size(config)
+
+
 def _layer(trace: Mapping[str, object], selector: str) -> Mapping[str, object]:
     layers = trace.get("layers")
     if not isinstance(layers, list) or not layers:
@@ -298,9 +315,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", required=True, help="compact routing trace (.pt)")
     parser.add_argument("--plan", required=True, help="saved placement JSON")
+    parser.add_argument(
+        "--model",
+        "--model-path",
+        dest="model",
+        required=True,
+        help="Hugging Face model id or local path",
+    )
+    parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--layer", default="0", help="layer index or exact gate name")
     parser.add_argument("--num-ranks", type=int)
-    parser.add_argument("--hidden", type=int, required=True)
     parser.add_argument("--tokens-per-rank", type=int, default=1024)
     parser.add_argument("--warmups", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=30)
@@ -316,6 +340,10 @@ def main() -> None:
     parser.add_argument("--master-port", type=int, default=8361)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    try:
+        args.hidden = _model_hidden_size(args.model, args.trust_remote_code)
+    except Exception as error:
+        parser.error(f"could not read model hidden_size: {error}")
     if min(
         args.hidden,
         args.tokens_per_rank,

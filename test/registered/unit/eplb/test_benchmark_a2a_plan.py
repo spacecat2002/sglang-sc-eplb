@@ -1,11 +1,21 @@
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 
 _PATH = Path(__file__).parents[4] / "benchmark" / "benchmark_a2a_plan.py"
 _SPEC = importlib.util.spec_from_file_location("benchmark_a2a_plan", _PATH)
 _MODULE = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_MODULE)
+
+
+def test_model_hidden_size():
+    assert _MODULE._config_hidden_size(SimpleNamespace(hidden_size=4096)) == 4096
+
+    with pytest.raises(ValueError, match="invalid hidden_size"):
+        _MODULE._config_hidden_size(SimpleNamespace())
 
 
 def test_physical_maps_pad_layouts_and_select_source_local_replicas():

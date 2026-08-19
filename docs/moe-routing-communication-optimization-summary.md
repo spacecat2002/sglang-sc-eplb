@@ -330,10 +330,10 @@ PYTHONPATH=python python benchmark/benchmark_a2a_plan.py \
   --input /tmp/qwen3_ep8_trace.pt \
   --plan grace-refined.json \
   --layer 0 --num-ranks 8 \
-  --hidden 2048 --tokens-per-rank 1024
+  --model Qwen/Qwen3-30B-A3B --tokens-per-rank 1024
 ```
 
-脚本测量 `get_dispatch_layout + dispatch + combine` 的 CUDA 时间，并分别输出 layout、dispatch、combine、总时间和按 remote destination 估算的双向 BF16 A2A 字节数。`--hidden` 必须填写被测模型的实际 hidden size。Baseline 与 plan 使用相同的 token 样本、hidden size、DeepEP config 和物理 slot 上限；非均匀 placement 会用空 slot 填齐，replication plan 按 source-local 规则选择副本。可先用 `--dry-run` 在无 GPU 环境检查 plan、层名、slot 数和理论 remote。
+脚本测量 `get_dispatch_layout + dispatch + combine` 的 CUDA 时间，并分别输出 layout、dispatch、combine、总时间和按 remote destination 估算的双向 BF16 A2A 字节数。`--model` 接受 Hugging Face 模型名称或本地路径，并从下载的文本模型 config 读取 `hidden_size`。Baseline 与 plan 使用相同的 token 样本、hidden size、DeepEP config 和物理 slot 上限；非均匀 placement 会用空 slot 填齐，replication plan 按 source-local 规则选择副本。可先用 `--dry-run` 在无 GPU 环境检查 plan、层名、slot 数和理论 remote。
 
 ## 8. 输出 Placement 格式
 
