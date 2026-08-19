@@ -46,6 +46,8 @@ def _normalize_plan(
     raw: Mapping[str, object], gate: str, num_experts: int, num_ranks: int
 ) -> dict[int, tuple[int, ...]]:
     values = raw.get(gate, raw)
+    if isinstance(values, Mapping) and "replicas" in values:
+        values = values["replicas"]
     if not isinstance(values, Mapping):
         raise ValueError("plan must contain an expert-to-rank mapping")
     result = {}
@@ -62,6 +64,27 @@ def _normalize_plan(
     return result
 
 
+def _normalize_routing(
+    raw: Mapping[str, object], gate: str, num_experts: int, num_ranks: int
+) -> list[list[int]] | None:
+    values = raw.get(gate, raw)
+    if not isinstance(values, Mapping) or "routing" not in values:
+        return None
+    routing = values["routing"]
+    if (
+        not isinstance(routing, list)
+        or len(routing) != num_ranks
+        or any(not isinstance(row, list) or len(row) != num_experts for row in routing)
+        or any(
+            not isinstance(rank, int) or not 0 <= rank < num_ranks
+            for row in routing
+            for rank in row
+        )
+    ):
+        raise ValueError("plan contains invalid source-specific routing")
+    return routing
+
+
 def _baseline(num_experts: int, num_ranks: int) -> dict[int, tuple[int, ...]]:
     return {
         expert: (min(expert * num_ranks // num_experts, num_ranks - 1),)
@@ -73,6 +96,7 @@ def _physical_maps(
     layouts: Mapping[str, Mapping[int, Sequence[int]]],
     num_experts: int,
     num_ranks: int,
+    routes: Mapping[str, Sequence[Sequence[int]] | None] | None = None,
 ) -> tuple[int, dict[str, list[list[int]]]]:
     slots = max(
         sum(rank in ranks for ranks in layout.values())
@@ -92,7 +116,9 @@ def _physical_maps(
         mapping = [[0] * num_experts for _ in range(num_ranks)]
         for source in range(num_ranks):
             for expert, ranks in layout.items():
-                replica = ranks.index(source) if source in ranks else 0
+                selected = routes and routes.get(name)
+                target = selected[source][expert] if selected is not None else source
+                replica = ranks.index(target) if target in ranks else 0
                 mapping[source][expert] = physical_by_expert[expert][replica]
         maps[name] = mapping
     return slots, maps
@@ -130,8 +156,20 @@ def _load(args: argparse.Namespace):
     num_experts = int(layer["topk_experts"].max()) + 1
     raw_plan = json.loads(Path(args.plan).read_text(encoding="utf-8"))
     plan = _normalize_plan(raw_plan, gate, num_experts, num_ranks)
+    routing = _normalize_routing(raw_plan, gate, num_experts, num_ranks)
+    if routing is not None and any(
+        routing[source][expert] not in plan[expert]
+        for source in range(num_ranks)
+        for expert in range(num_experts)
+    ):
+        raise ValueError("routing selects a rank without that expert replica")
     layouts = {"baseline": _baseline(num_experts, num_ranks), "plan": plan}
-    slots, maps = _physical_maps(layouts, num_experts, num_ranks)
+    slots, maps = _physical_maps(
+        layouts,
+        num_experts,
+        num_ranks,
+        routes={"baseline": None, "plan": routing},
+    )
     return layer, gate, num_experts, num_ranks, slots, maps
 
 

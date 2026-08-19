@@ -30,3 +30,20 @@ def test_physical_maps_pad_layouts_and_select_source_local_replicas():
     assert maps["plan"][0][0] // slots == 0
     assert maps["plan"][1][0] // slots == 1
     assert [value // slots for value in maps["baseline"][0]] == [0, 0, 1, 1]
+
+
+def test_physical_maps_use_source_specific_routing():
+    layouts = {
+        "plan": {0: (0, 1), 1: (0,), 2: (1,), 3: (1,)},
+    }
+    routing = [[1, 0, 1, 1], [0, 0, 1, 1]]
+
+    slots, maps = _MODULE._physical_maps(
+        layouts,
+        num_experts=4,
+        num_ranks=2,
+        routes={"plan": routing},
+    )
+
+    assert maps["plan"][0][0] // slots == 1
+    assert maps["plan"][1][0] // slots == 0

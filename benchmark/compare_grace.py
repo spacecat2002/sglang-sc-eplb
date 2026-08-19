@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run GRACE and optional CABLE offline expert placement on a routing trace."""
+"""Compare baseline, GRACE, and GRACE+ on an offline routing trace."""
 
 from __future__ import annotations
 
@@ -13,10 +13,6 @@ from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 
-from sglang.srt.eplb.cable_expert_placement import (
-    cable_expert_placement,
-    evaluate_cable_placement,
-)
 from sglang.srt.eplb.expert_affinity_graph import (
     RoutedArrays,
     RoutedToken,
@@ -25,8 +21,14 @@ from sglang.srt.eplb.expert_affinity_graph import (
     evaluate_weighted_remote,
 )
 from sglang.srt.eplb.grace_expert_placement import grace_hierarchical_placement
-from sglang.srt.eplb.hypergraph_expert_placement import hypergraph_expert_placement
-from sglang.srt.eplb.replicated_expert_placement import hot_expert_replication
+from sglang.srt.eplb.grace_plus_expert_placement import (
+    grace_plus_expert_placement,
+)
+from sglang.srt.eplb.grace_plus_refinement import evaluate_placement
+from sglang.srt.eplb.grace_plus_replication import (
+    balance_replica_compute,
+    replicate_hot_experts,
+)
 
 
 _LAYER_PATTERN = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
@@ -100,8 +102,10 @@ def _tokens(
 def _reshard(
     tokens: Sequence[RoutedToken] | RoutedArrays, source_ep: int, target_ep: int
 ) -> list[RoutedToken] | RoutedArrays:
+    if source_ep < 1:
+        raise ValueError("source EP must be positive")
     if isinstance(tokens, RoutedArrays):
-        if source_ep < 1 or tokens.source_rank.max() >= source_ep:
+        if tokens.source_rank.max() >= source_ep:
             raise ValueError("trace contains a source rank outside source EP")
         if source_ep == target_ep:
             return tokens
@@ -117,7 +121,7 @@ def _reshard(
             np.repeat(tokens.topk_experts, fanout, axis=0)[keep],
             counts[keep],
         )
-    if source_ep < 1 or any(token.source_rank >= source_ep for token in tokens):
+    if any(token.source_rank >= source_ep for token in tokens):
         raise ValueError("trace contains a source rank outside source EP")
     if source_ep == target_ep:
         return list(tokens)
@@ -138,6 +142,13 @@ def _reshard(
     return result
 
 
+def _baseline_placement(experts: Sequence[int], num_ranks: int) -> dict[int, int]:
+    return {
+        expert: min(index * num_ranks // len(experts), num_ranks - 1)
+        for index, expert in enumerate(experts)
+    }
+
+
 def _metrics(
     tokens: Sequence[RoutedToken] | RoutedArrays,
     placement: Mapping[int, int],
@@ -147,16 +158,12 @@ def _metrics(
     rdma_cost: float,
     compute_load: Sequence[int] | None = None,
 ) -> dict[str, Any]:
-    cable_metrics = evaluate_cable_placement(tokens, placement, num_ranks=num_ranks)
-    loads = (
-        list(compute_load)
-        if compute_load is not None
-        else list(cable_metrics.compute_load)
-    )
-    counts = [0] * len(loads)
-    for expert, rank in placement.items():
+    placement_metrics = evaluate_placement(tokens, placement, num_ranks=num_ranks)
+    loads = list(compute_load or placement_metrics.compute_load)
+    counts = [0] * num_ranks
+    for rank in placement.values():
         counts[rank] += 1
-    average = sum(loads) / len(loads)
+    average = sum(loads) / num_ranks
     return {
         "remote": evaluate_primary_remote(tokens, placement),
         "weighted_remote": evaluate_weighted_remote(
@@ -165,21 +172,21 @@ def _metrics(
         "compute_imbalance": max(loads, default=0) / average if average else 0.0,
         "compute_load": loads,
         "expert_count": counts,
-        "max_pair_traffic": cable_metrics.max_pair_traffic,
-        "max_ingress": cable_metrics.max_ingress,
-        "max_egress": cable_metrics.max_egress,
+        "max_pair_traffic": placement_metrics.max_pair_traffic,
+        "max_ingress": placement_metrics.max_ingress,
+        "max_egress": placement_metrics.max_egress,
     }
 
 
 def _replica_metrics(
-    metrics: Any, replicas_by_expert: Mapping[int, Sequence[int]]
+    metrics: Any, placement: Mapping[int, Sequence[int]]
 ) -> dict[str, Any]:
     loads = list(metrics.compute_load)
-    average = sum(loads) / len(loads)
     counts = [0] * len(loads)
-    for replicas in replicas_by_expert.values():
-        for rank in replicas:
+    for ranks in placement.values():
+        for rank in ranks:
             counts[rank] += 1
+    average = sum(loads) / len(loads)
     return {
         "remote": metrics.remote,
         "weighted_remote": metrics.weighted_remote,
@@ -192,19 +199,13 @@ def _replica_metrics(
     }
 
 
-def _baseline_placement(experts: Sequence[int], num_ranks: int) -> dict[int, int]:
-    return {
-        expert: min(index * num_ranks // len(experts), num_ranks - 1)
-        for index, expert in enumerate(experts)
-    }
-
-
 def run(args: argparse.Namespace) -> dict[str, Any]:
     raw, layers = _load(args.input)
-    source_ep = args.source_ep
-    if source_ep is None and isinstance(raw, dict):
-        source_ep = raw.get("num_ranks")
-    source_ep = int(source_ep or args.num_ranks)
+    source_ep = int(
+        args.source_ep
+        or (raw.get("num_ranks") if isinstance(raw, dict) else args.num_ranks)
+        or args.num_ranks
+    )
     results = []
     for position, (gate, value, compact) in enumerate(layers):
         tokens, bundle_count = _tokens(
@@ -216,127 +217,66 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
         tokens = _reshard(tokens, source_ep, args.num_ranks)
         experts = (
-            range(int(value["topk_experts"].max().item()) + 1) if compact else None
-        )
-        if experts is None:
-            experts = tuple(
+            tuple(range(int(value["topk_experts"].max().item()) + 1))
+            if compact
+            else tuple(
                 sorted({expert for token in tokens for expert in token.topk_experts})
             )
-        experts = tuple(experts)
+        )
         baseline_placement = _baseline_placement(experts, args.num_ranks)
-        needs_grace = not (args.cable_only or args.hypergraph_only)
-        grace_started = time.perf_counter() if needs_grace else None
-        graph = (
-            build_co_routing_graph(
-                tokens,
-                experts=experts,
-                source_affinity_weight=args.grace_source_affinity_weight,
-            )
-            if needs_grace
-            else None
-        )
-        placement = None
-        grace_seconds = None
-        if needs_grace:
-            placement = grace_hierarchical_placement(
-                graph,
-                num_ranks=args.num_ranks,
-                ranks_per_node=args.ranks_per_node,
-                nonuniform_ratio=args.grace_ratio,
-                equal_experts=args.grace_equal_experts,
-            )
-            grace_seconds = time.perf_counter() - grace_started
         started = time.perf_counter()
-        grace_refined = (
-            hypergraph_expert_placement(
-                tokens,
-                experts=tuple(placement.rank_by_expert),
-                num_ranks=args.num_ranks,
-                capacity_ratio=(
-                    0.0
-                    if args.grace_equal_experts
-                    else args.grace_refine_capacity_ratio
-                    if args.grace_refine_capacity_ratio is not None
-                    else args.grace_ratio
-                ),
-                compute_imbalance_limit=args.hypergraph_compute_limit,
-                starts=1,
-                refine_rounds=args.grace_refine_rounds,
-                remote_budget=0.0,
-                initial_placement=placement.rank_by_expert,
-                align_groups=True,
-                swap_rounds=args.grace_refine_swaps,
-                swap_candidate_partners=args.grace_refine_partners,
-                swap_allow_load_worsening=(args.grace_refine_allow_load_worsening),
-                swap_max_compute_imbalance=(args.grace_refine_swap_compute_limit),
-                objective=args.grace_refine_objective,
-                congestion_remote_budget=args.grace_refine_remote_budget,
-            )
-            if args.grace_refine
-            else None
+        graph = build_co_routing_graph(
+            tokens, experts=experts, source_affinity_weight=args.source_affinity_weight
         )
-        grace_refine_seconds = time.perf_counter() - started if grace_refined else None
-        replication = None
-        replication_seconds = None
-        if args.grace_replication:
-            if placement is None:
-                raise ValueError("--grace-replication requires the GRACE placement")
-            replication_seed = (
-                grace_refined["rank_by_expert"]
-                if grace_refined is not None
-                else placement.rank_by_expert
-            )
-            started = time.perf_counter()
-            replication = hot_expert_replication(
-                tokens,
-                replication_seed,
-                num_ranks=args.num_ranks,
-                ranks_per_node=args.ranks_per_node,
-                rdma_cost=args.rdma_cost,
-                extra_copy_budget=args.grace_replication_budget,
-                hot_experts=args.grace_replication_hot_experts,
-                candidate_ranks=args.grace_replication_candidates,
-                compute_imbalance_limit=args.grace_replication_compute_limit,
-                max_extra_per_rank=args.grace_replication_max_extra_per_rank,
-            )
-            replication_seconds = time.perf_counter() - started
+        grace = grace_hierarchical_placement(
+            graph,
+            num_ranks=args.num_ranks,
+            ranks_per_node=args.ranks_per_node,
+            nonuniform_ratio=args.grace_ratio,
+            equal_experts=args.equal_experts,
+        )
+        grace_seconds = time.perf_counter() - started
         started = time.perf_counter()
-        cable = (
-            cable_expert_placement(
-                tokens,
-                experts=graph.experts if graph is not None else experts,
-                num_ranks=args.num_ranks,
-                congestion_weight=args.cable_congestion_weight,
-                load_weight=args.cable_load_weight,
-                refine_swaps=args.cable_refine_swaps,
-                refine_strategy=args.cable_refine_strategy,
-                remote_budget=args.cable_remote_budget,
-                capacity_ratio=args.cable_capacity_ratio,
-                compute_refine_moves=args.cable_compute_moves,
-                compute_imbalance_limit=args.cable_compute_limit,
-            )
-            if args.cable
-            else None
+        grace_plus = grace_plus_expert_placement(
+            tokens,
+            experts=experts,
+            num_ranks=args.num_ranks,
+            capacity_ratio=0.0 if args.equal_experts else args.capacity_ratio,
+            compute_imbalance_limit=args.compute_limit,
+            refine_rounds=args.rounds,
+            initial_placement=grace.rank_by_expert,
+            align_groups=True,
+            swap_rounds=args.swaps,
+            swap_candidate_partners=args.partners,
+            swap_allow_load_worsening=args.allow_load_worsening,
+            swap_max_compute_imbalance=args.swap_compute_limit,
+            objective=args.objective,
         )
-        cable_seconds = time.perf_counter() - started if cable is not None else None
-        started = time.perf_counter()
-        hypergraph = (
-            hypergraph_expert_placement(
-                tokens,
-                experts=experts,
-                num_ranks=args.num_ranks,
-                capacity_ratio=args.hypergraph_capacity_ratio,
-                compute_imbalance_limit=args.hypergraph_compute_limit,
-                starts=args.hypergraph_starts,
-                refine_rounds=args.hypergraph_refine_rounds,
-                remote_budget=args.hypergraph_remote_budget,
-            )
-            if args.hypergraph
-            else None
+        refinement_seconds = time.perf_counter() - started
+        replication = replicate_hot_experts(
+            tokens,
+            grace_plus["rank_by_expert"],
+            num_ranks=args.num_ranks,
+            ranks_per_node=args.ranks_per_node,
+            objective=args.objective,
+            rdma_cost=args.rdma_cost,
+            hot_experts=args.hot_experts,
+            candidate_ranks=args.replica_candidates,
+            compute_imbalance_limit=args.replica_compute_limit,
+            max_extra_per_rank=args.max_comm_expert_per_rank,
+            max_replicas_per_expert=args.max_replicas_per_expert,
         )
-        hypergraph_seconds = (
-            time.perf_counter() - started if hypergraph is not None else None
+        balanced = balance_replica_compute(
+            tokens,
+            replication,
+            num_ranks=args.num_ranks,
+            ranks_per_node=args.ranks_per_node,
+            objective=args.objective,
+            rdma_cost=args.rdma_cost,
+            max_extra_per_rank=args.max_comp_expert_per_rank,
+            max_replicas_per_expert=args.max_replicas_per_expert,
         )
+        plus_seconds = time.perf_counter() - started
         total_tokens = (
             int(value["count"].sum().item())
             if compact
@@ -350,108 +290,47 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "tokens": total_tokens,
             "bundles": bundle_count,
             "optimizer_bundles": len(tokens),
-            "baseline": {
-                "metrics": _metrics(
-                    tokens,
-                    baseline_placement,
-                    num_ranks=args.num_ranks,
-                    ranks_per_node=args.ranks_per_node,
-                    rdma_cost=args.rdma_cost,
-                ),
-                "placement": baseline_placement,
-                "solve_seconds": 0.0,
-            },
         }
-        if placement is not None:
-            result.update(
-                {
-                    "metrics": _metrics(
-                        tokens,
-                        placement.rank_by_expert,
-                        num_ranks=args.num_ranks,
-                        ranks_per_node=args.ranks_per_node,
-                        rdma_cost=args.rdma_cost,
-                    ),
-                    "placement": placement.rank_by_expert,
-                    "solve_seconds": grace_seconds,
-                }
-            )
-        if cable is not None:
-            result["cable"] = {
-                "objective": cable.objective,
-                "metrics": _metrics(
-                    tokens,
-                    cable.rank_by_expert,
-                    num_ranks=args.num_ranks,
-                    ranks_per_node=args.ranks_per_node,
-                    rdma_cost=args.rdma_cost,
-                    compute_load=cable.metrics.compute_load,
-                ),
-                "placement": cable.rank_by_expert,
-                "solve_seconds": cable_seconds,
-            }
-        if hypergraph is not None:
-            result["hypergraph"] = {
-                "metrics": _metrics(
-                    tokens,
-                    hypergraph["rank_by_expert"],
-                    num_ranks=args.num_ranks,
-                    ranks_per_node=args.ranks_per_node,
-                    rdma_cost=args.rdma_cost,
-                    compute_load=hypergraph["metrics"].compute_load,
-                ),
-                "placement": hypergraph["rank_by_expert"],
-                "solve_seconds": hypergraph_seconds,
-            }
-        if grace_refined is not None:
-            result["grace_refine"] = {
-                "metrics": _metrics(
-                    tokens,
-                    grace_refined["rank_by_expert"],
-                    num_ranks=args.num_ranks,
-                    ranks_per_node=args.ranks_per_node,
-                    rdma_cost=args.rdma_cost,
-                    compute_load=grace_refined["metrics"].compute_load,
-                ),
-                "placement": grace_refined["rank_by_expert"],
-                "solve_seconds": grace_seconds + grace_refine_seconds,
-                "refine_seconds": grace_refine_seconds,
-            }
-        if replication is not None:
-            result["grace_replicated"] = {
-                "metrics": _replica_metrics(
-                    replication.metrics, replication.replicas_by_expert
-                ),
-                "placement": replication.replicas_by_expert,
-                "extra_copies": replication.extra_copies,
-                "solve_seconds": (
-                    grace_seconds + (grace_refine_seconds or 0.0) + replication_seconds
-                ),
-                "replication_seconds": replication_seconds,
-            }
+        result["baseline"] = {
+            "metrics": _metrics(
+                tokens,
+                baseline_placement,
+                num_ranks=args.num_ranks,
+                ranks_per_node=args.ranks_per_node,
+                rdma_cost=args.rdma_cost,
+            ),
+            "placement": baseline_placement,
+            "solve_seconds": 0.0,
+        }
+        result["grace"] = {
+            "metrics": _metrics(
+                tokens,
+                grace.rank_by_expert,
+                num_ranks=args.num_ranks,
+                ranks_per_node=args.ranks_per_node,
+                rdma_cost=args.rdma_cost,
+            ),
+            "placement": grace.rank_by_expert,
+            "solve_seconds": grace_seconds,
+        }
+        result["grace+"] = {
+            "metrics": _replica_metrics(balanced.metrics, balanced.replicas_by_expert),
+            "placement": balanced.replicas_by_expert,
+            "routing": balanced.routing_by_source,
+            "extra_copies": replication.extra_copies,
+            "balance_copies": balanced.balance_copies,
+            "solve_seconds": grace_seconds + plus_seconds,
+            "refine_seconds": refinement_seconds,
+            "replication_seconds": plus_seconds - refinement_seconds,
+        }
         results.append(result)
     return {
         "input": args.input,
-        "method": (
-            "cable"
-            if args.cable_only
-            else "hypergraph"
-            if args.hypergraph_only
-            else "+".join(
-                [
-                    "grace",
-                    *(["grace-refine"] if args.grace_refine else []),
-                    *(["grace-replicated"] if args.grace_replication else []),
-                    *(["cable"] if args.cable else []),
-                    *(["hypergraph"] if args.hypergraph else []),
-                ]
-            )
-        ),
+        "method": "baseline+grace+grace+",
+        "objective": args.objective,
         "source_ep": source_ep,
         "num_ranks": args.num_ranks,
         "ranks_per_node": args.ranks_per_node,
-        "grace_ratio": args.grace_ratio,
-        "grace_source_affinity_weight": args.grace_source_affinity_weight,
         "optimizer_bundles": args.optimizer_bundles,
         "layers": results,
     }
@@ -468,8 +347,7 @@ def _table(rows: Iterable[Sequence[str]]) -> str:
 def _print(result: Mapping[str, Any]) -> None:
     if any(layer["optimizer_bundles"] < layer["bundles"] for layer in result["layers"]):
         print(
-            f"[trace] placements optimized on at most "
-            f"{result['optimizer_bundles']} bundles/layer"
+            f"[trace] placements optimized on at most {result['optimizer_bundles']} bundles/layer"
         )
     rows = [
         [
@@ -486,42 +364,8 @@ def _print(result: Mapping[str, Any]) -> None:
         ]
     ]
     for layer in result["layers"]:
-        metrics = [("baseline", layer["baseline"]["metrics"], 0.0)]
-        if "metrics" in layer:
-            metrics.append(("grace", layer["metrics"], layer["solve_seconds"]))
-        if "cable" in layer:
-            metrics.append(
-                (
-                    "cable",
-                    layer["cable"]["metrics"],
-                    layer["cable"]["solve_seconds"],
-                )
-            )
-        if "hypergraph" in layer:
-            metrics.append(
-                (
-                    "hypergraph",
-                    layer["hypergraph"]["metrics"],
-                    layer["hypergraph"]["solve_seconds"],
-                )
-            )
-        if "grace_refine" in layer:
-            metrics.append(
-                (
-                    "grace-refine",
-                    layer["grace_refine"]["metrics"],
-                    layer["grace_refine"]["solve_seconds"],
-                )
-            )
-        if "grace_replicated" in layer:
-            metrics.append(
-                (
-                    "grace-replicated",
-                    layer["grace_replicated"]["metrics"],
-                    layer["grace_replicated"]["solve_seconds"],
-                )
-            )
-        for method, metric, solve_seconds in metrics:
+        for method in ("baseline", "grace", "grace+"):
+            metric = layer[method]["metrics"]
             rows.append(
                 [
                     str(layer["layer"]),
@@ -533,7 +377,7 @@ def _print(result: Mapping[str, Any]) -> None:
                     str(metric["max_egress"]),
                     f"{metric['compute_imbalance']:.2f}x",
                     f"{min(metric['expert_count'])}-{max(metric['expert_count'])}",
-                    f"{solve_seconds * 1000:.1f}",
+                    f"{layer[method]['solve_seconds'] * 1000:.1f}",
                 ]
             )
     print(_table(rows))
@@ -546,138 +390,60 @@ def main() -> None:
     parser.add_argument("--source-ep", type=int)
     parser.add_argument("--ranks-per-node", type=int)
     parser.add_argument("--grace-ratio", type=float, default=0.15)
-    parser.add_argument("--grace-source-affinity-weight", type=float, default=0.0)
-    parser.add_argument("--grace-equal-experts", action="store_true")
+    parser.add_argument("--source-affinity-weight", type=float, default=0.0)
+    parser.add_argument("--equal-experts", action="store_true")
     parser.add_argument("--optimizer-bundles", type=int, default=20_000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--rdma-cost", type=float, default=1.0)
-    parser.add_argument("--cable", action="store_true")
-    parser.add_argument("--cable-only", action="store_true")
-    parser.add_argument("--hypergraph", action="store_true")
-    parser.add_argument("--hypergraph-only", action="store_true")
-    parser.add_argument("--grace-refine", action="store_true")
-    parser.add_argument("--grace-refine-rounds", type=int, default=4)
-    parser.add_argument("--grace-refine-swaps", type=int, default=2)
-    parser.add_argument("--grace-refine-partners", type=int, default=8)
     parser.add_argument(
-        "--grace-refine-objective",
-        choices=("remote", "congestion", "congestion-direct"),
-        default="remote",
+        "--objective", choices=("remote", "ingress-egress"), default="ingress-egress"
     )
-    parser.add_argument("--grace-refine-remote-budget", type=float, default=0.0)
-    parser.add_argument("--grace-refine-allow-load-worsening", action="store_true")
-    parser.add_argument("--grace-refine-swap-compute-limit", type=float)
-    parser.add_argument("--grace-refine-capacity-ratio", type=float)
-    parser.add_argument("--grace-replication", action="store_true")
-    parser.add_argument("--grace-replication-budget", type=int, default=0)
-    parser.add_argument("--grace-replication-hot-experts", type=int, default=16)
-    parser.add_argument("--grace-replication-candidates", type=int, default=4)
-    parser.add_argument("--grace-replication-compute-limit", type=float, default=1.25)
-    parser.add_argument("--grace-replication-max-extra-per-rank", type=int, default=1)
-    parser.add_argument("--cable-congestion-weight", type=float, default=0.25)
-    parser.add_argument("--cable-load-weight", type=float, default=0.25)
-    parser.add_argument("--cable-refine-swaps", type=int, default=2)
-    parser.add_argument(
-        "--cable-refine-strategy",
-        choices=("remote", "balanced"),
-        default="balanced",
-    )
-    parser.add_argument("--cable-remote-budget", type=float, default=0.03)
-    parser.add_argument("--cable-capacity-ratio", type=float, default=0.15)
-    parser.add_argument("--cable-compute-moves", type=int, default=2)
-    parser.add_argument("--cable-compute-limit", type=float, default=2.0)
-    parser.add_argument("--hypergraph-capacity-ratio", type=float, default=0.15)
-    parser.add_argument("--hypergraph-compute-limit", type=float, default=2.0)
-    parser.add_argument("--hypergraph-starts", type=int, default=4)
-    parser.add_argument("--hypergraph-refine-rounds", type=int, default=4)
-    parser.add_argument("--hypergraph-remote-budget", type=float, default=0.01)
+    parser.add_argument("--rounds", type=int, default=4)
+    parser.add_argument("--swaps", type=int, default=1)
+    parser.add_argument("--partners", type=int, default=8)
+    parser.add_argument("--capacity-ratio", type=float, default=0.15)
+    parser.add_argument("--compute-limit", type=float, default=2.0)
+    parser.add_argument("--allow-load-worsening", action="store_true")
+    parser.add_argument("--swap-compute-limit", type=float)
+    parser.add_argument("--hot-experts", type=int, default=16)
+    parser.add_argument("--replica-candidates", type=int, default=4)
+    parser.add_argument("--replica-compute-limit", type=float, default=1.25)
+    parser.add_argument("--max-comm-expert-per-rank", type=int, default=0)
+    parser.add_argument("--max-comp-expert-per-rank", type=int, default=0)
+    parser.add_argument("--max-replicas-per-expert", type=int, default=2)
     parser.add_argument("--save-grace")
-    parser.add_argument("--save-cable")
-    parser.add_argument("--save-hypergraph")
-    parser.add_argument("--save-grace-refine")
-    parser.add_argument("--save-grace-replication")
+    parser.add_argument("--save-grace-plus")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
-    if args.cable_only:
-        args.cable = True
-    if args.hypergraph_only:
-        args.hypergraph = True
     args.ranks_per_node = args.ranks_per_node or args.num_ranks
     if args.num_ranks < 1 or args.num_ranks % args.ranks_per_node:
         parser.error("--ranks-per-node must be positive and divide --num-ranks")
     if (
         args.optimizer_bundles < 0
         or not 0 <= args.grace_ratio < 1
-        or args.grace_source_affinity_weight < 0
+        or args.source_affinity_weight < 0
         or args.rdma_cost < 1
-        or args.cable_refine_swaps < 0
-        or args.cable_compute_moves < 0
-        or not 0 <= args.cable_remote_budget <= 1
-        or not 0 <= args.cable_capacity_ratio < 1
-        or args.cable_compute_limit < 1
-        or not 0 <= args.hypergraph_capacity_ratio < 1
-        or args.hypergraph_compute_limit < 1
-        or args.hypergraph_starts < 1
-        or args.hypergraph_refine_rounds < 0
-        or args.grace_refine_rounds < 0
-        or args.grace_refine_swaps < 0
-        or args.grace_refine_partners < 1
-        or not 0 <= args.grace_refine_remote_budget <= 1
-        or (
-            args.grace_refine_swap_compute_limit is not None
-            and args.grace_refine_swap_compute_limit < 1
-        )
-        or args.grace_replication_budget < 0
-        or args.grace_replication_hot_experts < 0
-        or args.grace_replication_candidates < 1
-        or args.grace_replication_compute_limit < 1
-        or args.grace_replication_max_extra_per_rank < 1
-        or (
-            args.grace_refine_capacity_ratio is not None
-            and not 0 <= args.grace_refine_capacity_ratio < 1
-        )
-        or not 0 <= args.hypergraph_remote_budget <= 1
-        or min(args.cable_congestion_weight, args.cable_load_weight) < 0
+        or args.rounds < 0
+        or args.swaps < 0
+        or args.partners < 1
+        or not 0 <= args.capacity_ratio < 1
+        or args.compute_limit < 1
+        or args.hot_experts < 0
+        or min(args.replica_candidates, args.max_replicas_per_expert) < 1
+        or args.max_comm_expert_per_rank < 0
+        or args.max_comp_expert_per_rank < 0
+        or args.replica_compute_limit < 1
+        or (args.swap_compute_limit is not None and args.swap_compute_limit < 1)
     ):
         parser.error("invalid placement parameters")
-    if args.save_cable and not args.cable:
-        parser.error("--save-cable requires --cable")
-    if args.save_grace and (args.cable_only or args.hypergraph_only):
-        parser.error("--save-grace requires the GRACE placement")
-    if args.save_hypergraph and not args.hypergraph:
-        parser.error("--save-hypergraph requires --hypergraph")
-    if args.grace_refine and (args.cable_only or args.hypergraph_only):
-        parser.error("--grace-refine requires the GRACE placement")
-    if args.grace_replication and (args.cable_only or args.hypergraph_only):
-        parser.error("--grace-replication requires the GRACE placement")
-    if args.grace_equal_experts and (args.cable_only or args.hypergraph_only):
-        parser.error("--grace-equal-experts requires the GRACE placement")
-    if args.save_grace_refine and not args.grace_refine:
-        parser.error("--save-grace-refine requires --grace-refine")
-    if args.save_grace_replication and not args.grace_replication:
-        parser.error("--save-grace-replication requires --grace-replication")
     result = run(args)
     if args.save_grace:
         Path(args.save_grace).write_text(
             json.dumps(
                 {
                     layer["gate"]: {
-                        str(e): r for e, r in sorted(layer["placement"].items())
-                    }
-                    for layer in result["layers"]
-                },
-                indent=2,
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-    if args.save_cable:
-        Path(args.save_cable).write_text(
-            json.dumps(
-                {
-                    layer["gate"]: {
                         str(e): r
-                        for e, r in sorted(layer["cable"]["placement"].items())
+                        for e, r in sorted(layer["grace"]["placement"].items())
                     }
                     for layer in result["layers"]
                 },
@@ -686,45 +452,18 @@ def main() -> None:
             + "\n",
             encoding="utf-8",
         )
-    if args.save_hypergraph:
-        Path(args.save_hypergraph).write_text(
+    if args.save_grace_plus:
+        Path(args.save_grace_plus).write_text(
             json.dumps(
                 {
                     layer["gate"]: {
-                        str(e): r
-                        for e, r in sorted(layer["hypergraph"]["placement"].items())
-                    }
-                    for layer in result["layers"]
-                },
-                indent=2,
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-    if args.save_grace_refine:
-        Path(args.save_grace_refine).write_text(
-            json.dumps(
-                {
-                    layer["gate"]: {
-                        str(e): r
-                        for e, r in sorted(layer["grace_refine"]["placement"].items())
-                    }
-                    for layer in result["layers"]
-                },
-                indent=2,
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-    if args.save_grace_replication:
-        Path(args.save_grace_replication).write_text(
-            json.dumps(
-                {
-                    layer["gate"]: {
-                        str(expert): list(ranks)
-                        for expert, ranks in sorted(
-                            layer["grace_replicated"]["placement"].items()
-                        )
+                        "replicas": {
+                            str(e): list(ranks)
+                            for e, ranks in sorted(
+                                layer["grace+"]["placement"].items()
+                            )
+                        },
+                        "routing": [list(row) for row in layer["grace+"]["routing"]],
                     }
                     for layer in result["layers"]
                 },

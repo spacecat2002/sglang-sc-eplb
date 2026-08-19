@@ -1,498 +1,337 @@
-# GRACE-Refine 与受约束专家复制
+# GRACE+ MoE 专家放置
 
-本文档描述当前仓库中面向 MoE Expert Parallelism（EP）的离线专家放置方案。主路径从 GRACE placement 出发，用完整 Top-K bundle 做 source-aware refinement，最后可选地增加少量 hot-expert 副本。
+本文对应当前实现，不包含已经删除的 CABLE 和独立 Hypergraph 实验路径。`benchmark/compare_grace.py` 每层固定输出三种 placement：
 
-当前主路径是：
+1. `baseline`：按 expert id 连续、均匀地映射到 rank。
+2. `grace`：GRACE co-activation grouping，按聚类生成顺序映射到 rank。
+3. `grace+`：以原始 GRACE placement 为起点，执行目标感知 group assignment、move、swap 和受约束复制。
 
-```text
-routing trace
-    -> expert affinity graph
-    -> GRACE hierarchical grouping
-    -> exact group-to-rank assignment
-    -> constrained single-expert moves
-    -> sparse exact pair-swaps
-    -> optional constrained hot-expert replication
-    -> communication/congestion/compute metrics
-```
+## 1. 输入与通信模型
 
-该方案是离线模拟和 placement 生成器，不会自动把保存的副本 placement 接入在线推理。实际收益还需要在线权重加载、token dispatch 和副本结果合并逻辑配合。
-
-## 1. 输入模型
-
-每条路由记录表示一组具有相同来源和 Top-K 专家的 token：
+一条压缩 bundle 由三个字段组成：
 
 ```text
-(source_rank, topk_experts, count)
+source_rank: 产生 token 的 rank
+topk_experts: token 选择的完整 Top-K expert 集合
+count: 相同 source 和 Top-K 组合的 token 数量
 ```
 
-- `source_rank`：token 发起 MoE 请求的 EP rank。
-- `topk_experts`：该 token 选择的完整 Top-K 专家集合。
-- `count`：相同 bundle 的聚合次数。
+内部使用 `RoutedArrays` 保存三个 NumPy 数组。`--optimizer-bundles N` 对 compact `.pt` trace 的每层做固定 seed 采样；`0` 使用所有 bundle。JSON 输入不采样。
 
-compact `.pt` trace 直接以 NumPy array 进入求解器，避免为每个 bundle 创建 Python 对象。`--optimizer-bundles 0` 使用全部 bundle；大于 0 时，对 compact trace 做固定随机种子的可复现采样。
-
-如果采集 trace 的 EP size 与目标 EP size 不同，`compare_grace.py` 会在目标 EP 是源 EP 整数倍时重分 source rank 和 count。
-
-## 2. 优化指标
-
-设 bundle `b` 的来源为 `s_b`，其 Top-K 专家最终访问的 rank 集合为 `D_b`。主要通信目标为：
+单副本 placement 为 `expert -> rank`。一个 bundle 只向 Top-K 涉及的每个不同目标 rank 发送一次，目标等于 source 时不计通信。因此 traffic matrix 为：
 
 ```text
-remote = sum_b count_b * |D_b - {s_b}|
+T[source, destination] = 发送到该 destination 的 bundle count
+T[r, r] = 0
 ```
 
-同一 bundle 在同一个 remote rank 上访问多个专家只产生一个 remote destination，因此只计一次。这个定义比逐专家统计 remote 更接近实际 Top-K token dispatch。
+输出指标：
 
-输出指标包括：
+| 指标 | 定义 |
+|---|---|
+| `remote` | `sum(T)`，所有远端目标 rank 的总 token-bundle 数 |
+| `weighted` | 节点内代价 1、跨节点代价 `--rdma-cost` 的加权 remote |
+| `max-pair` | `max(T)` |
+| `max-ingress` | `max(sum(T, axis=0))` |
+| `max-egress` | `max(sum(T, axis=1))` |
+| `comp` | 最大 expert demand rank load / 平均 load |
 
-| 指标 | 含义 |
-| --- | --- |
-| `remote` | 所有 bundle 的 remote destination 总量 |
-| `weighted` | 按节点内/节点间代价加权后的 remote |
-| `max-pair` | 任意 source-destination rank pair 的最大流量 |
-| `max-ingress` | 任意目标 rank 的最大总入站流量 |
-| `max-egress` | 任意来源 rank 的最大总出站流量 |
-| `comp` | 最大计算负载 / 平均计算负载 |
-| `experts/rank` | 各 rank 权重数量的最小值和最大值 |
-| `solve-ms` | 生成该结果所需的累计求解时间 |
+单 NVLink/NVSwitch 超节点通常设置 `--ranks-per-node == --num-ranks` 和 `--rdma-cost 1`。
 
-在单个 NVLink/NVSwitch 超节点中通常设置 `--ranks-per-node` 等于 `--num-ranks`，并使用 `--rdma-cost 1`。此时 `remote` 与 `weighted` 相同，但 `max-pair` 和 `max-ingress` 仍可反映链路及端口热点。
+## 2. 两种统一目标
+
+所有目标感知阶段都接受同一个 `--objective`：
+
+```text
+ingress-egress（默认）:
+  min max(max-ingress, max-egress)
+  -> min max-pair
+  -> min remote
+
+remote:
+  min remote
+  -> min max-ingress
+  -> min max-pair
+```
+
+比较采用字典序，不使用需要调参的加权和。计算不均衡作为通信指标完全相同时的最后 tie-break，并受显式 compute limit 约束。
+
+GRACE 的 spectral grouping 本身只有 co-activation cut，并不接受该 objective。`--objective` 从 GRACE+ 的 group-to-rank assignment 开始生效，并统一用于 move、swap 和 replication。
 
 ## 3. Baseline
 
-Baseline 按专家编号连续、尽量等量地分配专家，不执行图聚类或 trace 优化。它用于回答“不应用 placement plan 时通信量是多少”。
+`_baseline_placement()` 按 expert 排序位置计算：
 
-Baseline 的 `solve-ms` 固定为 0，其他指标使用与优化方案相同的 trace 和计算方法。
+```python
+rank = floor(expert_index * num_ranks / num_experts)
+```
 
-## 4. GRACE 初始 Placement
+它不求解，`solve-ms` 固定为 0，用于表示不应用 plan 时的原始权重顺序。
+
+## 4. GRACE
 
 ### 4.1 Affinity graph
 
-每个专家是一个顶点。两个专家同时出现在一个 Top-K bundle 中时连接一条边，边权累加该 bundle 的 `count`：
+`build_co_routing_graph()` 遍历每个 bundle：
 
-```text
-affinity(i, j) = sum count of bundles containing both i and j
+- 每个 Top-K expert 的 `demand += count`。
+- 每一对共同激活 expert 的无向边权 `edge[e1, e2] += count`。
+- 可选 `--source-affinity-weight` 会增加具有相似 source-demand excess 的 expert pair 权重；默认 0。
+
+compact 路径直接在 NumPy 数组上用 `np.add.at` 聚合，不创建逐 bundle Python 对象。
+
+### 4.2 Hierarchical spectral grouping
+
+`grace_hierarchical_placement()` 先把 experts 聚成 node groups，再在每个 node 中聚成 rank groups：
+
+1. 构造对称 affinity matrix `A`。
+2. 计算 normalized affinity `D^-1/2 A D^-1/2`。
+3. 取最大的 `num_groups` 个特征向量作为 embedding。
+4. 用确定性的 farthest-first 初始化中心。
+5. 最多执行 32 轮 k-means，并修复空 group。
+6. 按 `--grace-ratio` 限制每组 expert 数量；`--equal-experts` 则强制完全相等。
+7. equal 模式通过正 affinity gain 的 pair-swap 改善组内亲密度，同时不改变组大小。
+
+### 4.3 按顺序映射 rank
+
+GRACE 不读取 source-to-destination traffic matrix，也不求解 group-to-rank assignment。代码按 `gpu_groups` 返回顺序映射：
+
+```python
+rank = node * ranks_per_node + local_rank
 ```
 
-因此，高 affinity 表示两个专家经常被同一批 token 同时访问。把它们放在同一个 rank，可以合并 remote destination。
+表格中的 `grace` 到此结束，因此不会把 GRACE+ 的 source-aware 优化计入论文基线。
 
-### 4.2 两级谱聚类
+## 5. GRACE+
 
-GRACE 使用归一化 affinity matrix 的谱嵌入进行层级分组：
+入口是 `grace_plus_expert_placement()`。benchmark 必须传入 GRACE 的 `rank_by_expert`，不会从随机 seed 或独立 greedy placement 开始。
 
-1. 所有专家先聚类到 node groups。
-2. 每个 node group 内再次聚类到 GPU/rank groups。
+### 5.1 索引与状态
 
-在单超节点中，第一层只有一个 node group，核心工作发生在 GPU/rank 分组阶段。
-
-默认允许每个 rank 的专家数在理想数量附近非均匀变化，范围由 `--grace-ratio` 控制。非均匀分组可以给 affinity 较密集的 group 更多容量。
-
-使用 `--grace-equal-experts` 时：
-
-- 专家总数必须能被 rank 数整除。
-- 每个 rank 的专家数量严格相同。
-- 谱聚类后通过移出低组内 affinity 专家、补齐不足 group 和等量 pair-swap 恢复固定大小。
-
-默认 GRACE 只利用专家共同激活关系。设置 `--grace-source-affinity-weight` 后，聚类矩阵还会加入同 source 需求重叠：
+`_prepare()` 一次性构建：
 
 ```text
-A(i,j) = coactivation(i,j) + weight * source_overlap(i,j)
-
-source_excess(i,s) = max(demand(i,s) - mean_source_demand(i), 0)
-source_overlap(i,j) = sum_s min(source_excess(i,s), source_excess(j,s))
+source[B]                 bundle source rank
+topk[B, K]                expert 的连续内部索引
+count[B]                  bundle count
+token_indexes[E]          每个 expert 出现在哪些 bundle
+demand[E]                 每个 expert 的总计算需求
 ```
 
-这使经常由同一个 source rank 偏好、但不一定出现在同一个 Top-K bundle 中的专家也倾向进入同组。减去每个专家的 source 平均需求可以避免把在所有 rank 上均匀热门的专家误判成具有 locality。`weight=0` 完全保持原 GRACE；该项只改善 group 成员选择，后续 Exact group-to-rank assignment 仍负责把固定 groups 映射到物理 rank。
-
-## 5. GRACE-Refine
-
-`--grace-refine` 以 GRACE placement 为 seed，不从头重新做 hypergraph placement。它依次执行 group-to-rank assignment、单专家 move 和 pair-swap。
-
-### 5.1 Exact group-to-rank assignment
-
-首先保持每个 GRACE group 的成员完全不变，只决定每个 group 对应哪个物理 rank。
-
-对 group `g` 和物理 rank `r` 构造精确 source-aware cost：
+`_placement_state()` 从 GRACE placement 构造：
 
 ```text
-cost[g, r] = group g 放到 r 后产生的 bundle remote
+ranks[E]                  expert 当前 rank
+slots[R]                  每个 rank 的 expert 数
+bundle_rank_counts[B, R]  bundle 的 Top-K 中有多少 expert 位于该 rank
 ```
 
-然后用 Hungarian assignment 求一对一最小成本匹配。这一步只是整体重命名 group：
+`bundle_rank_counts[b, r] > 0` 表示 bundle `b` 必须发送到 rank `r`。move/swap 只更新受影响 bundle 的两列，不重新路由全 trace。
 
-- 不拆分 group。
-- 不改变每个 rank 的专家数量。
-- 不改变每个 group 的计算需求。
-- 可以降低 source-aware remote。
+### 5.2 容量和计算约束
 
-### 5.2 受约束单专家 move
+`_capacity_bounds()` 根据 `--capacity-ratio` 计算每个 rank 可容纳 expert 数的 `[minimum, maximum]`。`--equal-experts` 会把 ratio 设为 0。
 
-接下来允许一个专家从旧 rank 移到目标 rank：
+expert demand 是所有选择该 expert 的 `count` 之和。move 后的最大 rank load 不能超过：
 
 ```text
-old rank: expert count - 1, compute load - demand(expert)
-new rank: expert count + 1, compute load + demand(expert)
+max(--compute-limit * average_load, current_max_load)
 ```
 
-这不是复制，旧 rank 不再保留该专家。
+因此 refinement 不会被迫修复 GRACE 已存在的负载峰值，但默认不会继续把最大值推得更坏。swap 默认也要求最大 load 不增加；`--allow-load-worsening` 可放宽，`--swap-compute-limit` 可设置硬上限。
 
-候选 move 必须满足：
+### 5.3 Group-to-rank assignment
 
-1. 旧 rank 移出后不低于最小专家容量。
-2. 新 rank 移入后不超过最大专家容量。
-3. 最大计算负载不超过当前值与配置上限中的较大者。
-4. remote 精确下降；或者在允许的 remote budget 内改善计算负载。
+GRACE groups 已固定，但 group 编号不等于物理 rank。
 
-GRACE-refine 当前传入 `remote_budget=0`，所以不会用更多 remote 换计算均衡。`--grace-refine-rounds` 控制 move refinement 轮数。
+`remote` 调用 `_align_groups_to_ranks()`：计算每个 `group -> rank` 的精确 total remote 成本，用 Hungarian assignment 找最小总代价的一一映射。
 
-容量范围由以下规则决定：
+`ingress-egress` 调用 `_align_groups_to_congestion()`：
 
-- `--grace-equal-experts`：capacity ratio 强制为 0，每个 rank 数量固定，单专家 move 实际不可行。
-- 显式设置 `--grace-refine-capacity-ratio`：使用该值。
-- 否则沿用 `--grace-ratio`。
+1. 为每个 `group -> rank` 计算 ingress、source egress、max-pair 和 remote。
+2. 用 perfect-matching feasibility + 二分阈值，找全局最小可行 bottleneck。
+3. 在该阈值内继续找最小可行 max-pair。
+4. 在允许边上用 Hungarian assignment 最小化 total remote。
 
-例如 64 个专家、8 个 rank，平均 8 个专家。`capacity_ratio=0` 要求每 rank 恰好 8 个；较大的 ratio 才允许一个 rank 少一个、另一个 rank 多一个。
+该阶段不会拆散 GRACE group，也不会改变每 rank expert 数。
 
-### 5.3 稀疏 exact pair-swap
+### 5.4 单专家 move
 
-Pair-swap 交换两个不同 rank 上的专家，因此不改变各 rank 的专家数量：
+每轮按 expert demand 从高到低检查候选目标 rank。
+
+`remote` 的 `_refine_moves()` 通过 `bundle_rank_counts` 精确计算：
+
+- 从旧 rank 移除 expert 后，旧列从 1 变 0 的 bundle 减少 remote。
+- 加到新 rank 后，新列从 0 变 1 的 bundle 增加 remote。
+- 只接受 total remote 改善，并满足容量与计算限制。
+
+一轮可锁定并应用多个互不冲突的改善 move，最多执行 `--rounds` 轮。
+
+`ingress-egress` 的 `_refine_congestion_moves()` 为候选更新 traffic 的旧/新目标列，按统一 congestion key 选择一轮中最佳 move。每轮只应用一个全局最佳改善，最多执行 `--rounds` 轮。
+
+### 5.5 两专家 swap
+
+`_refine_swaps()` 为每个 expert、每个目标 rank 只保留 `--partners` 个候选 partner。候选预排序使用两个单向 move delta 的和；最终接受仍调用 `_exact_swap_delta()` 扫描两个 expert 涉及的 bundle union，计算 exact delta。
+
+- `remote`：接受 remote 降低；remote 相同时可接受更低 traffic key 或 compute load。
+- `ingress-egress`：为每个候选精确更新 traffic matrix，按 congestion key 选择本轮唯一最佳交换。
+
+最多执行 `--swaps` 轮。默认从历史的 2 降为 1，因为完整 trace 上 congestion swap 是主要耗时。
+
+### 5.6 受约束 hot-expert replication
+
+`replicate_hot_experts()` 接收 move/swap 后的单副本 placement，并采用确定性的 source-local-first 路由：如果 source rank 有该 expert 的副本，则在本地执行；否则使用列表中的第一个 rank，即 primary。
+
+第一次 trace 扫描同时构造：
 
 ```text
-rank A: remove expert x, add expert y
-rank B: remove expert y, add expert x
+source_demand[E, R]  每个 expert 来自各 source rank 的计算需求
+traffic[R, R]        当前 source-to-destination bundle traffic
+gains[E, R]          将 expert E 复制到 source R 后可精确消除的 remote
 ```
 
-为了限制求解时间，算法不是枚举所有跨 rank expert pair：
+`gains` 只统计旧 destination 在完整 Top-K destination set 中彻底消失的 bundle。如果同一 bundle 的另一个 expert 仍使用旧 destination，复制不会被误算为通信收益。
 
-1. 先计算每个专家移动到各 rank 的近似 remote delta。
-2. 对每个目标 rank，只保留 `--grace-refine-partners` 个候选 partner。
-3. 对候选 pair 使用完整 Top-K bundle 重新计算 exact delta。
-4. 每轮对未被锁定的专家应用可接受 swap。
-5. 最多执行 `--grace-refine-swaps` 轮。
+每轮在 demand 最高的 `--hot-experts` 中枚举 `(expert, target rank)`，并要求：
 
-接受顺序为：
+- target 尚无该 expert；
+- expert 副本数小于 `--max-replicas-per-expert`；
+- target 新增权重数小于 `--max-comm-expert-per-rank`；
+- gain 大于 0 且统一 objective 严格改善；
+- source-local demand 从 primary 转到 target 后，计算不均衡满足 `--replica-compute-limit`。
 
-- 优先接受 `remote` 严格下降的 swap。
-- `remote` 相同时，接受降低 `max-ingress/max-pair/max-egress` 的 swap。
-- 通信指标完全相同时，可以接受改善最大计算负载的 swap。
+`remote` 依次比较 total remote、ingress/egress bottleneck、max-pair；`ingress-egress` 依次比较 bottleneck、max-pair、remote。每轮添加全局最佳候选，并增量更新受影响 gain，直到每个 rank 都达到 `--max-comm-expert-per-rank`，或者没有可行改善。全局最多新增 `num_ranks * max_comm_expert_per_rank` 个副本，不需要单独的全局预算参数。
 
-默认不允许 swap 增加最大计算负载。加上：
+GRACE+ JSON 保存：
+
+```json
+{"0": [2, 0], "1": [1]}
+```
+
+第一个 rank 是 primary，后续为 source-local secondary。`--max-comm-expert-per-rank 0` 时不复制，仍输出单元素列表，便于同一 A2A benchmark 直接读取。
+
+### 5.7 计算均衡复制与静态分发
+
+通信复制完成后，`balance_replica_compute()` 再执行计算优先的第二阶段。它不把通信复制的上限和计算复制混用：
+
+```text
+--max-comm-expert-per-rank  通信收益复制阶段的每 rank 上限
+--max-comp-expert-per-rank  计算均衡复制阶段的每 rank 上限
+```
+
+第二阶段把每个 `(source_rank, expert)` 的需求作为可迁移单元。对候选迁移：
+
+1. 计算旧 rank 和目标 rank 的 load 变化；
+2. 只有 `(max_load, sum(load^2))` 严格改善才接受；
+3. 如果目标 rank 没有该专家，则新增一个副本并检查副本上限；
+4. 精确更新受影响 bundle 的 destination set；
+5. 在计算改善相同的候选中，优先复用 bundle 已访问的 destination，再按 `remote` 或 `ingress-egress` 比较通信。
+
+因此计算阶段不会为了降低通信而接受更差的计算峰值，也尽量不产生新的 remote destination。最终每个 source/expert 都有一个确定目标，保存为 `routing[R][E]`。A2A benchmark 优先使用这个 source-specific routing；没有 routing 字段的旧 plan 仍使用 local-first 兼容逻辑。
+
+### 5.8 最终选择与输出
+
+最终 placement 用 `evaluate_placement()` 重算完整指标。benchmark 输出：
+
+```text
+layer method    remote weighted max-pair max-ingress max-egress comp experts/rank solve-ms
+0     baseline  ...
+0     grace     ...
+0     grace+    ...
+```
+
+`grace+ solve-ms` 包含 GRACE 图构造、聚类、GRACE+ assignment/refinement 和 replication。JSON 中分别记录 `refine_seconds` 与 `replication_seconds`。
+
+## 6. 命令行
+
+默认优化 ingress/egress bottleneck：
 
 ```bash
---grace-refine-allow-load-worsening
-```
-
-后，remote 下降的 swap 可以增大计算负载。这个参数只是取消负载否决条件，不会为了让负载变差而接受没有通信收益的 swap。
-
-如果仍需要计算上限，可以显式指定：
-
-```bash
---grace-refine-swap-compute-limit 1.25
-```
-
-未指定时，`allow-load-worsening` 没有隐含的 `1.25x` 上限。指定上限后，如果当前 seed 已经超过上限，swap 不得继续增加当前最大负载，但仍可以逐步改善它。
-
-该阶段是有界稀疏局部搜索，不包含三专家 cycle、ejection chain 或 exhaustive all-pair search，因此不保证全局最优。
-
-### 5.4 可选 congestion objective
-
-```bash
---grace-refine-objective congestion \
---grace-refine-remote-budget 0.01
-```
-
-该模式先完整运行默认的 remote-first assignment、move 和 swap，再把结果作为基线执行第二阶段：重新做 exact group-to-rank assignment，并依次尝试降低瓶颈的 group-label swap、单专家 move 和 pair-swap。第二阶段按以下 key 比较：
-
-```text
-max(max-ingress, max-egress)
--> max-pair
--> total remote
--> compute imbalance
-```
-
-最终 `remote` 不超过 remote-first 基线的 `1 + remote budget`。这是整个第二阶段共用的一次性上限，不会在三个步骤中重复累加。默认 objective 仍是 `remote`，因此原有结果不变。
-
-如果希望从 group-to-rank assignment 的第一步就直接以链路瓶颈为目标，可以使用：
-
-```bash
---grace-refine-objective congestion-direct
-```
-
-该模式对固定 GRACE groups 直接求最小的 `max(max-ingress, max-egress)`，再最小化 `max-pair` 和 total remote，然后执行同一目标的 move/swap refinement。它不设置 remote ceiling，可能用少量额外 remote 换取更低的最大链路，适合直接对比真实 A2A 时间。
-
-## 6. 受约束 Hot-Expert Replication
-
-`--grace-replication` 在单副本 placement 之后增加少量权重副本：
-
-- 启用 `grace-refine` 时，以 refined placement 为 primary seed。
-- 否则以 GRACE placement 为 primary seed。
-
-### 6.1 路由模型
-
-当前模拟器使用确定性的 source-local-secondary 策略：
-
-```text
-if source rank has a replica of expert:
-    route to the source-local replica
-else:
-    route to the expert's primary rank
-```
-
-第一个 rank 始终是 primary。新增副本只服务来自自身 rank 的请求，不使用 weighted-random、least-load 或跨 rank 副本选择。
-
-这个限制带来三个性质：
-
-- 新副本不会增加 bundle remote。
-- 计算迁移量可由 `demand[expert, source_rank]` 精确得到。
-- 求解和最终路由是确定性的，不依赖在线负载预测。
-
-### 6.2 候选和 exact gain
-
-首先统计：
-
-```text
-source_demand[expert, rank]
-```
-
-并选择单次复制后通信瓶颈最小的 `--grace-replication-hot-experts` 个专家。对于候选 `expert e @ source rank s`，exact gain 是新增本地副本后从 bundle destination set 中消失的 remote rank 数量。
-
-只有当 `e` 当前所在的 destination rank 在该 bundle 中只出现一次时，把 `e` 路由到本地才会减少 remote；如果同一个 bundle 的另一个 Top-K 专家仍在该 remote rank，remote destination 不会消失。因此算法计算完整 bundle-level gain，而不是简单使用 expert token 数。
-
-第一次通过分块 NumPy 扫描计算全部候选的 exact gain。每增加一个副本，只对受影响的同 source、同 primary bundle 增量更新 gain，不为每个候选重放完整 trace。
-
-### 6.3 约束
-
-候选必须同时满足：
-
-1. `gain > 0`，即 remote 严格降低。
-2. 总副本数不超过 `--grace-replication-budget`。
-3. 目标 rank 的额外权重数不超过 `--grace-replication-max-extra-per-rank`。
-4. 目标位于该专家按通信瓶颈目标排名前 `--grace-replication-candidates` 的 rank 中。
-5. 新的最大计算负载不超过：
-
-```text
-max(current max load, average load * replication compute limit)
-```
-
-其中计算上限由 `--grace-replication-compute-limit` 设置。
-
-### 6.4 贪心选择
-
-每一步按以下顺序选择最佳副本：
-
-```text
-1. 新的 `max-egress` 更低
-2. 新的 `max-ingress` 更低
-3. 新的 `max-pair` 更低
-4. remote gain 更大
-5. 新的最大计算负载更低
-6. 搬移到本地的 source demand 更大
-7. expert id 和 rank id，保证结果确定
-```
-
-添加副本后：
-
-- primary 权重仍然保留。
-- 该 source rank 的此专家请求改由本地副本处理。
-- primary rank 的计算负载减少相同 demand。
-- replica rank 的计算负载增加相同 demand。
-- remote 只减不增。
-
-达到总预算或不存在满足约束的正收益候选时停止，因此实际增加的副本数可能小于预算。
-
-## 7. 完整运行示例
-
-采集单机 8 卡 trace：
-
-```bash
-PYTHONPATH=python python benchmark/benchmark_ep_trace.py \
-  --model Qwen/Qwen3-30B-A3B \
-  --tp-size 8 --dp-size 8 --ep-size 8 \
-  --enable-dp-attention \
-  --moe-a2a-backend none \
-  --dataset sharegpt --num-samples 128 \
-  --batch-size 8 --max-new-tokens 1 \
-  --output /tmp/qwen3_ep8_trace.pt
-```
-
-使用完整 trace 运行 GRACE、refine 和 replication：
-
-```bash
-PYTHONPATH=python python benchmark/compare_grace.py \
-  --input /tmp/qwen3_ep8_trace.pt \
-  --num-ranks 8 --ranks-per-node 8 --rdma-cost 1 \
-  --optimizer-bundles 0 \
-  --grace-ratio 0.15 \
-  --grace-source-affinity-weight 1.0 \
-  --grace-refine \
-  --grace-refine-rounds 8 \
-  --grace-refine-swaps 2 \
-  --grace-refine-partners 8 \
-  --grace-refine-objective congestion \
-  --grace-refine-remote-budget 0.01 \
-  --grace-replication \
-  --grace-replication-budget 8 \
-  --grace-replication-hot-experts 16 \
-  --grace-replication-candidates 4 \
-  --grace-replication-max-extra-per-rank 1 \
-  --grace-replication-compute-limit 1.25 \
+python benchmark/compare_grace.py \
+  --input trace.pt \
+  --num-ranks 8 \
+  --ranks-per-node 8 \
+  --optimizer-bundles 20000 \
+  --objective ingress-egress \
+  --rounds 4 \
+  --swaps 1 \
+  --partners 8 \
+  --max-comm-expert-per-rank 1 \
+  --max-comp-expert-per-rank 1 \
   --save-grace grace.json \
-  --save-grace-refine grace-refined.json \
-  --save-grace-replication grace-replicated.json
+  --save-grace-plus grace-plus.json
 ```
 
-若想观察通信优先、允许计算变差的 pair-swap：
+以 total remote 为目标：
 
 ```bash
---grace-refine-allow-load-worsening
+python benchmark/compare_grace.py \
+  --input trace.pt --num-ranks 8 \
+  --objective remote
 ```
 
-若需要同时限制其计算负载：
+使用全部 bundle：
 
 ```bash
---grace-refine-allow-load-worsening \
---grace-refine-swap-compute-limit 1.25
+--optimizer-bundles 0
 ```
 
-使用 SGLang 的 DeepEP normal all-to-all 对同一层、同一批采样 token 测量 plan 前后的真实通信时间：
+核心参数：
+
+| 参数 | 默认值 | 含义 |
+|---|---:|---|
+| `--objective` | `ingress-egress` | 所有目标感知阶段的统一目标 |
+| `--optimizer-bundles` | `20000` | 每层求解 bundle 数；0 为全部 |
+| `--grace-ratio` | `0.15` | GRACE group expert 数浮动比例 |
+| `--equal-experts` | false | 强制每 rank expert 数相同 |
+| `--source-affinity-weight` | `0` | affinity graph 的 source overlap bonus |
+| `--capacity-ratio` | `0.15` | GRACE+ move 的 expert 容量浮动 |
+| `--compute-limit` | `2.0` | move 最大计算不均衡上限 |
+| `--rounds` | `4` | 单专家 move 轮数 |
+| `--swaps` | `1` | pair-swap 轮数 |
+| `--partners` | `8` | 每个 expert/目标 rank 的候选 partner 数 |
+| `--allow-load-worsening` | false | 允许 swap 增大最大 compute load |
+| `--swap-compute-limit` | 无 | 放宽 swap 时的计算不均衡硬上限 |
+| `--hot-experts` | `16` | 复制候选中的热门 expert 数 |
+| `--replica-candidates` | `4` | 每个 expert 保留的候选 target rank 数 |
+| `--replica-compute-limit` | `1.25` | 复制路由的最大计算不均衡 |
+| `--max-comm-expert-per-rank` | `0` | 通信优化阶段单 rank 最多新增的专家权重数；0 禁用该阶段 |
+| `--max-replicas-per-expert` | `2` | 单 expert 的总副本数，包含 primary |
+| `--max-comp-expert-per-rank` | `0` | 计算均衡阶段单 rank 最多新增的专家权重数；0 禁用该阶段 |
+
+## 7. DeepEP 实测
+
+保存 GRACE+ plan 后，用 `benchmark/benchmark_a2a_plan.py` 对比 baseline 与 plan：
 
 ```bash
-PYTHONPATH=python python benchmark/benchmark_a2a_plan.py \
-  --input /tmp/qwen3_ep8_trace.pt \
-  --plan grace-refined.json \
-  --layer 0 --num-ranks 8 \
-  --model Qwen/Qwen3-30B-A3B --tokens-per-rank 1024 \
-  --num-sms 24
+torchrun --standalone --nproc-per-node=8 benchmark/benchmark_a2a_plan.py \
+  --input trace.pt \
+  --plan grace-plus.json \
+  --model MODEL_OR_PATH \
+  --layer 0 \
+  --tokens-per-rank 1024 \
+  --num-sms 0
 ```
 
-脚本测量 `get_dispatch_layout + dispatch + combine` 的 CUDA 时间，并分别输出 layout、dispatch、combine、总时间和按 remote destination 估算的双向 BF16 A2A 字节数。`--model` 接受 Hugging Face 模型名称或本地路径，并从下载的文本模型 config 读取 `hidden_size`；`--num-sms` 设置 DeepEP normal dispatch/combine 的通信 SM 数，`0` 使用默认值。Baseline 与 plan 使用相同的 token 样本、hidden size、DeepEP config 和物理 slot 上限；非均匀 placement 会用空 slot 填齐，replication plan 按 source-local 规则选择副本。可先用 `--dry-run` 在无 GPU 环境检查 plan、层名、slot 数和理论 remote。
+该 benchmark 从模型 config 读取 `hidden_size`，用相同 sampled logical Top-K 构造 baseline 和 plan 的 physical expert id，然后交替测量 DeepEP layout、dispatch、combine 和 total 时间。
 
-## 8. 输出 Placement 格式
+## 8. 复杂度与性能边界
 
-GRACE 和 GRACE-refine 保存单 rank：
+affinity graph 构造约为 `O(B * K^2)`；GRACE spectral decomposition 主要依赖 expert 数，而不是 bundle 数。
 
-```json
-{
-  "layer.name": {
-    "0": 3,
-    "1": 7
-  }
-}
-```
+GRACE+ move 约为 `O(rounds * E * R * average_occurrence)`。pair-swap 对候选 expert pair 的 bundle union 做 exact 扫描；`ingress-egress` 还要复制并更新 `R x R` traffic matrix，因此通常是最大热点。Replication 初始 gain 构造约为 `O(B * (R + K^2))`，每增加一个副本只重扫来自目标 source 且包含该 expert 的相关 bundle。计算均衡阶段按 source-expert 需求枚举迁移，并只扫描受影响 bundle；它比全量运行时 least-load 更可复现，但仍随热点 expert 数和 Top-K occurrence 增长。
 
-Replication 保存 primary 和额外副本 rank；数组第一个元素为 primary：
+20M bundles 不建议在每次调参时全量求解。先用默认 20k 或更大样本选参数，再用 `--optimizer-bundles 0` 做最终 placement/评估。若 full-trace solve latency 成为硬约束，下一步应缓存 expert-pair traffic delta，而不是增加更多启发式模式。
 
-```json
-{
-  "layer.name": {
-    "0": [3, 0],
-    "1": [7]
-  }
-}
-```
-
-表格中的 `grace-replicated solve-ms` 是 GRACE、可选 refine 和 replication 的累计时间。JSON 结果还包含纯副本阶段的 `replication_seconds`。
-
-## 9. 复杂度与大 Trace
-
-设：
-
-- `B`：bundle 数量。
-- `K`：Top-K。
-- `E`：专家数量。
-- `R`：rank 数量。
-- `H`：参与复制的 hot expert 数。
-- `P`：每个目标 rank 的 pair-swap partner 数。
-
-主要成本为：
-
-| 阶段 | 主要时间成本 | 备注 |
-| --- | --- | --- |
-| affinity graph | 约 `O(B*K^2)` | 构造共同激活边 |
-| source affinity | `O(B*K + E^2*R)` | 可选；统计 source demand 并补充偏好重叠边 |
-| spectral grouping | 主要由 `E` 的矩阵分解决定 | 通常 `E` 远小于 `B` |
-| group assignment | `O(R^3)` | Hungarian assignment |
-| move refinement | 与候选专家、rank 和其倒排 bundle 数相关 | 使用 expert-to-bundle index |
-| sparse pair-swap | 约受 `E*R*P` 候选控制 | 候选再做 exact bundle delta |
-| replication initial gain | `O(B*K^2)` | 只做一次完整分块扫描 |
-| replication incremental update | 每个副本约 `O(B*K)` 过滤 | 只更新受影响 source/primary bundle |
-| final metrics | 约 `O(B*(K+R))` | 分块计算 traffic 和 compute |
-
-所有 replication 全量扫描使用固定大小的 NumPy chunk，峰值临时内存不随 `B` 线性增长。实测合成的 100 万 bundle、Top-K=8、128 experts、8 ranks、8 个副本，副本阶段约 1 秒；两千万 bundle 应近似线性增长，但真实耗时取决于 Top-K 分布、CPU 和内存带宽。
-
-大 trace 的建议：
-
-- 最终结论使用 `--optimizer-bundles 0`。
-- 参数搜索可先用 2 万到 20 万 bundle 样本。
-- 建议先比较 source-affinity weight `0/0.25/0.5/1.0`，再对最优值使用全量 trace。
-- 在相同采样和 seed 下比较不同方法。
-- replication budget 通常不要超过实际可加载的额外权重数量。
-
-## 10. 参数速查
-
-| 参数 | 默认值 | 作用 |
-| --- | ---: | --- |
-| `--optimizer-bundles` | `20000` | 求解使用的 compact bundles；0 表示全部 |
-| `--grace-ratio` | `0.15` | GRACE 非均匀 group 容量比例 |
-| `--grace-source-affinity-weight` | `0` | 聚类中的同 source 需求重叠权重 |
-| `--grace-equal-experts` | false | 强制各 rank 专家数相同 |
-| `--grace-refine-rounds` | `4` | 单专家 move 轮数 |
-| `--grace-refine-swaps` | `2` | pair-swap 轮数 |
-| `--grace-refine-partners` | `8` | 每个目标 rank 的候选 partner 数 |
-| `--grace-refine-objective` | `remote` | `remote`、`congestion` 或 `congestion-direct` |
-| `--grace-refine-remote-budget` | `0` | congestion 相对 remote-first 允许增加的 remote 比例 |
-| `--grace-refine-capacity-ratio` | GRACE ratio | move 的专家容量比例 |
-| `--grace-refine-allow-load-worsening` | false | 允许通信改善的 swap 增加最大负载 |
-| `--grace-refine-swap-compute-limit` | 无 | allow-load-worsening 的可选负载上限 |
-| `--grace-replication-budget` | `0` | 每层最多额外副本数 |
-| `--grace-replication-hot-experts` | `16` | 按通信瓶颈筛选的 expert 数 |
-| `--grace-replication-candidates` | `4` | 每个 expert 按通信瓶颈保留的目标 rank 数 |
-| `--grace-replication-max-extra-per-rank` | `1` | 每个 rank 最多新增的权重数 |
-| `--grace-replication-compute-limit` | `1.25` | 副本路由的最大计算不均衡约束 |
-
-## 11. 方法之间的关系
-
-`compare_grace.py` 还保留两条独立实验路径：
-
-- `CABLE`：不从 GRACE 出发，直接使用 source-aware Top-K bundle 做贪心 placement 和 refinement。
-- `hypergraph`：不使用 GRACE seed，从多个 greedy seed 出发直接优化 fixed-terminal hypergraph connectivity。
-
-它们用于对照实验，不属于 `GRACE -> GRACE-refine -> replication` 主链。`--cable-only` 或 `--hypergraph-only` 会跳过 GRACE；此时不能启用 grace-refine 或 grace-replication。
-
-## 12. 当前边界
-
-1. GRACE-refine 和 replication 都是启发式算法，不保证全局最优。
-2. Pair-swap 使用稀疏 partner pool，没有 exhaustive all-pair search。
-3. Replication 只模拟 source-local secondary，不模拟 least-load 或 weighted-random 在线选择。
-4. Replication 的 compute 模型假设该 source 的全部专家请求转移到本地副本。
-5. 离线 trace 可能与在线 workload 漂移，需要重新采集或周期性更新 placement。
-6. 单超节点中 `remote` 代表跨 GPU/NVLink 通信，不等同于跨节点 RDMA。
-7. 保存 replication JSON 不等于运行时已经支持该 placement，需要单独完成权重加载和 dispatch 接入。
-
-## 13. 测试与实现位置
-
-相关实现：
+## 9. 代码位置
 
 ```text
 benchmark/compare_grace.py
 python/sglang/srt/eplb/expert_affinity_graph.py
 python/sglang/srt/eplb/grace_expert_placement.py
-python/sglang/srt/eplb/hypergraph_expert_placement.py
-python/sglang/srt/eplb/cable_expert_placement.py
-python/sglang/srt/eplb/replicated_expert_placement.py
-```
-
-相关测试：
-
-```text
-test/registered/unit/eplb/test_cable_expert_placement.py
-test/registered/unit/eplb/test_moe_bundle_trace.py
-```
-
-运行：
-
-```bash
-PYTHONPATH=python python -m pytest -q \
-  test/registered/unit/eplb/test_cable_expert_placement.py \
-  test/registered/unit/eplb/test_moe_bundle_trace.py
+python/sglang/srt/eplb/grace_plus_expert_placement.py
+python/sglang/srt/eplb/grace_plus_refinement.py
+python/sglang/srt/eplb/grace_plus_replication.py
+benchmark/benchmark_a2a_plan.py
+test/registered/unit/eplb/test_grace_plus_expert_placement.py
 ```
