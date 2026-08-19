@@ -164,16 +164,20 @@ def _replica_gains(
     primary: np.ndarray,
     replica_mask: np.ndarray,
     num_ranks: int,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     """Exact remote reduction from adding every possible source-local copy."""
 
     gains = np.zeros((len(primary), num_ranks), dtype=np.int64)
+    traffic = np.zeros((num_ranks, num_ranks), dtype=np.int64)
     for start in range(0, len(arrays), _CHUNK_SIZE):
         end = min(start + _CHUNK_SIZE, len(arrays))
         source = arrays.source_rank[start:end]
         topk = arrays.topk_experts[start:end]
         count = arrays.count[start:end]
         destinations = _destinations(source, topk, primary, replica_mask)
+        for rank in range(num_ranks):
+            routed = np.any(destinations == rank, axis=1) & (source != rank)
+            np.add.at(traffic[:, rank], source[routed], count[routed])
         unique = np.ones(topk.shape, dtype=bool)
         for left in range(topk.shape[1]):
             for right in range(left + 1, topk.shape[1]):
@@ -188,7 +192,20 @@ def _replica_gains(
                 (topk[useful, column], source[useful]),
                 count[useful],
             )
-    return gains
+    return gains, traffic
+
+
+def _communication_key(
+    traffic: np.ndarray, source: int, destination: int, gain: int
+) -> tuple[int, int, int, int]:
+    next_traffic = traffic.copy()
+    next_traffic[source, destination] -= gain
+    return (
+        int(next_traffic.sum(axis=1).max()),
+        int(next_traffic.sum(axis=0).max()),
+        int(next_traffic.max()),
+        -gain,
+    )
 
 
 def _update_replica_gains(
@@ -264,16 +281,31 @@ def hot_expert_replication(
     primary, replica_mask = _replica_arrays(arrays, replicas, num_ranks)
     source_demand = _source_demand(arrays, len(primary), num_ranks)
     total_demand = source_demand.sum(axis=1)
-    hot = sorted(replicas, key=lambda expert: (-int(total_demand[expert]), expert))[
-        :hot_experts
-    ]
     compute_load = np.zeros(num_ranks, dtype=np.int64)
     observed = primary >= 0
     np.add.at(compute_load, primary[observed], total_demand[observed])
     extra_by_rank = np.zeros(num_ranks, dtype=np.int64)
     average_load = float(compute_load.sum()) / num_ranks
     extra = 0
-    gains = _replica_gains(arrays, primary, replica_mask, num_ranks)
+    gains, traffic = _replica_gains(arrays, primary, replica_mask, num_ranks)
+    worst_key = (np.iinfo(np.int64).max,) * 4
+    hot = sorted(
+        replicas,
+        key=lambda expert: min(
+            (
+                _communication_key(
+                    traffic,
+                    rank,
+                    int(primary[expert]),
+                    int(gains[expert, rank]),
+                )
+                for rank in range(num_ranks)
+                if gains[expert, rank] > 0
+            ),
+            default=worst_key,
+        )
+        + (expert,),
+    )[:hot_experts]
 
     while extra < extra_copy_budget:
         best: tuple[tuple[int, ...], int, int, int] | None = None
@@ -286,11 +318,13 @@ def hot_expert_replication(
                     and source_demand[expert, rank] > 0
                     and extra_by_rank[rank] < max_extra_per_rank
                 ),
-                key=lambda rank: (
-                    -int(gains[expert, rank]),
-                    -int(source_demand[expert, rank]),
+                key=lambda rank: _communication_key(
+                    traffic,
                     rank,
-                ),
+                    int(primary[expert]),
+                    int(gains[expert, rank]),
+                )
+                + (rank,),
             )[:candidate_ranks]
             for target in targets:
                 gain = int(gains[expert, target])
@@ -306,18 +340,22 @@ def hot_expert_replication(
                     int(compute_load.max()), average_load * compute_imbalance_limit
                 ):
                     continue
-                key = (-gain, next_max, -moved, expert, target)
+                key = _communication_key(
+                    traffic, target, old_rank, gain
+                ) + (next_max, -moved, expert, target)
                 if best is None or key < best[0]:
                     best = (key, expert, target, moved)
         if best is None:
             break
         _, expert, target, moved = best
         old_rank = int(primary[expert])
+        gain = int(gains[expert, target])
         _update_replica_gains(
             arrays, primary, replica_mask, gains, expert, target
         )
         replicas[expert] += (target,)
         replica_mask[expert, target] = True
+        traffic[target, old_rank] -= gain
         compute_load[old_rank] -= moved
         compute_load[target] += moved
         extra_by_rank[target] += 1

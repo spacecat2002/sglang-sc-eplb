@@ -228,7 +228,7 @@ else:
 source_demand[expert, rank]
 ```
 
-并选择总 demand 最高的 `--grace-replication-hot-experts` 个专家。对于候选 `expert e @ source rank s`，exact gain 是新增本地副本后从 bundle destination set 中消失的 remote rank 数量。
+并选择单次复制后通信瓶颈最小的 `--grace-replication-hot-experts` 个专家。对于候选 `expert e @ source rank s`，exact gain 是新增本地副本后从 bundle destination set 中消失的 remote rank 数量。
 
 只有当 `e` 当前所在的 destination rank 在该 bundle 中只出现一次时，把 `e` 路由到本地才会减少 remote；如果同一个 bundle 的另一个 Top-K 专家仍在该 remote rank，remote destination 不会消失。因此算法计算完整 bundle-level gain，而不是简单使用 expert token 数。
 
@@ -241,7 +241,7 @@ source_demand[expert, rank]
 1. `gain > 0`，即 remote 严格降低。
 2. 总副本数不超过 `--grace-replication-budget`。
 3. 目标 rank 的额外权重数不超过 `--grace-replication-max-extra-per-rank`。
-4. 目标位于该专家按 exact gain 排名前 `--grace-replication-candidates` 的 rank 中。
+4. 目标位于该专家按通信瓶颈目标排名前 `--grace-replication-candidates` 的 rank 中。
 5. 新的最大计算负载不超过：
 
 ```text
@@ -255,10 +255,13 @@ max(current max load, average load * replication compute limit)
 每一步按以下顺序选择最佳副本：
 
 ```text
-1. remote gain 最大
-2. 新的最大计算负载更低
-3. 搬移到本地的 source demand 更大
-4. expert id 和 rank id，保证结果确定
+1. 新的 `max-egress` 更低
+2. 新的 `max-ingress` 更低
+3. 新的 `max-pair` 更低
+4. remote gain 更大
+5. 新的最大计算负载更低
+6. 搬移到本地的 source demand 更大
+7. expert id 和 rank id，保证结果确定
 ```
 
 添加副本后：
@@ -411,8 +414,8 @@ Replication 保存 primary 和额外副本 rank；数组第一个元素为 prima
 | `--grace-refine-allow-load-worsening` | false | 允许通信改善的 swap 增加最大负载 |
 | `--grace-refine-swap-compute-limit` | 无 | allow-load-worsening 的可选负载上限 |
 | `--grace-replication-budget` | `0` | 每层最多额外副本数 |
-| `--grace-replication-hot-experts` | `16` | 参与副本搜索的 hottest experts 数 |
-| `--grace-replication-candidates` | `4` | 每个 expert 保留的目标 rank 数 |
+| `--grace-replication-hot-experts` | `16` | 按通信瓶颈筛选的 expert 数 |
+| `--grace-replication-candidates` | `4` | 每个 expert 按通信瓶颈保留的目标 rank 数 |
 | `--grace-replication-max-extra-per-rank` | `1` | 每个 rank 最多新增的权重数 |
 | `--grace-replication-compute-limit` | `1.25` | 副本路由的最大计算不均衡约束 |
 

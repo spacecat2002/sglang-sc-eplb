@@ -69,6 +69,27 @@ def test_hot_replication_limits_extra_weights_per_rank():
     assert sum(len(ranks) - 1 for ranks in result.replicas_by_expert.values()) == 1
 
 
+def test_hot_replication_prioritizes_egress_bottleneck_over_total_remote():
+    tokens = [
+        RoutedToken(0, (0,), 60),
+        RoutedToken(0, (1,), 60),
+        RoutedToken(1, (2,), 100),
+    ]
+    result = hot_expert_replication(
+        tokens,
+        {0: 2, 1: 2, 2: 2},
+        num_ranks=3,
+        ranks_per_node=3,
+        extra_copy_budget=1,
+        hot_experts=3,
+        compute_imbalance_limit=10,
+    )
+
+    assert result.replicas_by_expert[0] == (2, 0)
+    assert result.metrics.remote == 160
+    assert result.metrics.max_egress == 100
+
+
 def test_routed_arrays_match_token_path():
     tokens = [
         RoutedToken(0, (0, 1, 2), 7),
