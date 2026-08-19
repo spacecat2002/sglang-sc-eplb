@@ -194,6 +194,24 @@ rank B: remove expert y, add expert x
 
 该阶段是有界稀疏局部搜索，不包含三专家 cycle、ejection chain 或 exhaustive all-pair search，因此不保证全局最优。
 
+### 5.4 可选 congestion objective
+
+```bash
+--grace-refine-objective congestion \
+--grace-refine-remote-budget 0.01
+```
+
+该模式先完整运行默认的 remote-first assignment、move 和 swap，再把结果作为基线执行第二阶段：重新做 exact group-to-rank assignment，并依次尝试降低瓶颈的 group-label swap、单专家 move 和 pair-swap。第二阶段按以下 key 比较：
+
+```text
+max(max-ingress, max-egress)
+-> max-pair
+-> total remote
+-> compute imbalance
+```
+
+最终 `remote` 不超过 remote-first 基线的 `1 + remote budget`。这是整个第二阶段共用的一次性上限，不会在三个步骤中重复累加。默认 objective 仍是 `remote`，因此原有结果不变。
+
 ## 6. 受约束 Hot-Expert Replication
 
 `--grace-replication` 在单副本 placement 之后增加少量权重副本：
@@ -302,6 +320,8 @@ PYTHONPATH=python python benchmark/compare_grace.py \
   --grace-refine-rounds 8 \
   --grace-refine-swaps 2 \
   --grace-refine-partners 8 \
+  --grace-refine-objective congestion \
+  --grace-refine-remote-budget 0.01 \
   --grace-replication \
   --grace-replication-budget 8 \
   --grace-replication-hot-experts 16 \
@@ -333,10 +353,11 @@ PYTHONPATH=python python benchmark/benchmark_a2a_plan.py \
   --input /tmp/qwen3_ep8_trace.pt \
   --plan grace-refined.json \
   --layer 0 --num-ranks 8 \
-  --model Qwen/Qwen3-30B-A3B --tokens-per-rank 1024
+  --model Qwen/Qwen3-30B-A3B --tokens-per-rank 1024 \
+  --num-sms 24
 ```
 
-脚本测量 `get_dispatch_layout + dispatch + combine` 的 CUDA 时间，并分别输出 layout、dispatch、combine、总时间和按 remote destination 估算的双向 BF16 A2A 字节数。`--model` 接受 Hugging Face 模型名称或本地路径，并从下载的文本模型 config 读取 `hidden_size`。Baseline 与 plan 使用相同的 token 样本、hidden size、DeepEP config 和物理 slot 上限；非均匀 placement 会用空 slot 填齐，replication plan 按 source-local 规则选择副本。可先用 `--dry-run` 在无 GPU 环境检查 plan、层名、slot 数和理论 remote。
+脚本测量 `get_dispatch_layout + dispatch + combine` 的 CUDA 时间，并分别输出 layout、dispatch、combine、总时间和按 remote destination 估算的双向 BF16 A2A 字节数。`--model` 接受 Hugging Face 模型名称或本地路径，并从下载的文本模型 config 读取 `hidden_size`；`--num-sms` 设置 DeepEP normal dispatch/combine 的通信 SM 数，`0` 使用默认值。Baseline 与 plan 使用相同的 token 样本、hidden size、DeepEP config 和物理 slot 上限；非均匀 placement 会用空 slot 填齐，replication plan 按 source-local 规则选择副本。可先用 `--dry-run` 在无 GPU 环境检查 plan、层名、slot 数和理论 remote。
 
 ## 8. 输出 Placement 格式
 
@@ -410,6 +431,8 @@ Replication 保存 primary 和额外副本 rank；数组第一个元素为 prima
 | `--grace-refine-rounds` | `4` | 单专家 move 轮数 |
 | `--grace-refine-swaps` | `2` | pair-swap 轮数 |
 | `--grace-refine-partners` | `8` | 每个目标 rank 的候选 partner 数 |
+| `--grace-refine-objective` | `remote` | `remote` 或瓶颈优先的 `congestion` |
+| `--grace-refine-remote-budget` | `0` | congestion 相对 remote-first 允许增加的 remote 比例 |
 | `--grace-refine-capacity-ratio` | GRACE ratio | move 的专家容量比例 |
 | `--grace-refine-allow-load-worsening` | false | 允许通信改善的 swap 增加最大负载 |
 | `--grace-refine-swap-compute-limit` | 无 | allow-load-worsening 的可选负载上限 |

@@ -45,6 +45,18 @@ def _traffic_key(traffic: np.ndarray) -> tuple[int, int, int]:
     )
 
 
+def _congestion_key(traffic: np.ndarray) -> tuple[int, int, int, int, int]:
+    ingress = int(traffic.sum(axis=0).max())
+    egress = int(traffic.sum(axis=1).max())
+    return (
+        max(ingress, egress),
+        int(traffic.max()),
+        int(traffic.sum()),
+        egress,
+        ingress,
+    )
+
+
 def _move_deltas(
     source: np.ndarray,
     count: np.ndarray,
@@ -106,9 +118,7 @@ def _refine_compute_moves(
             indexes = token_indexes[expert]
             sources = source[indexes]
             old_counts = bundle_rank_counts[indexes, old_rank]
-            remove = -count[indexes] * (
-                (old_counts == 1) & (sources != old_rank)
-            )
+            remove = -count[indexes] * ((old_counts == 1) & (sources != old_rank))
             for target in range(num_ranks):
                 if target == old_rank or slots_used[target] >= maximum_capacity:
                     continue
@@ -118,8 +128,7 @@ def _refine_compute_moves(
                 if next_load.max() > max(load_limit, compute_load.max()):
                     continue
                 add = count[indexes] * (
-                    (bundle_rank_counts[indexes, target] == 0)
-                    & (sources != target)
+                    (bundle_rank_counts[indexes, target] == 0) & (sources != target)
                 )
                 delta = int((remove + add).sum())
                 if remote_delta_total + delta > remote_budget_tokens:
@@ -144,12 +153,8 @@ def _refine_compute_moves(
             sources = source[indexes]
             old_counts = bundle_rank_counts[indexes, old_rank]
             target_counts = bundle_rank_counts[indexes, target]
-            remove = -count[indexes] * (
-                (old_counts == 1) & (sources != old_rank)
-            )
-            add = count[indexes] * (
-                (target_counts == 0) & (sources != target)
-            )
+            remove = -count[indexes] * ((old_counts == 1) & (sources != old_rank))
+            add = count[indexes] * ((target_counts == 0) & (sources != target))
             delta = int((remove + add).sum())
             if remote_delta_total + delta > remote_budget_tokens:
                 continue
@@ -164,8 +169,7 @@ def _refine_compute_moves(
 
             traffic[:, old_rank] += np.bincount(
                 sources[remove != 0],
-                weights=remove[remove != 0]
-                * (sources[remove != 0] != old_rank),
+                weights=remove[remove != 0] * (sources[remove != 0] != old_rank),
                 minlength=num_ranks,
             ).astype(np.int64)
             traffic[:, target] += np.bincount(
@@ -211,9 +215,7 @@ def _exact_swap_delta(
     new_left = old_left - has_left + has_right
     new_right = old_right - has_right + has_left
     delta_left = (new_left > 0).astype(np.int8) - (old_left > 0).astype(np.int8)
-    delta_right = (new_right > 0).astype(np.int8) - (old_right > 0).astype(
-        np.int8
-    )
+    delta_right = (new_right > 0).astype(np.int8) - (old_right > 0).astype(np.int8)
     delta = int(
         (
             count[indexes]
@@ -318,13 +320,16 @@ def _refine_swaps(
     candidate_partners: int = 4,
     allow_load_worsening: bool = False,
     max_compute_imbalance: float | None = None,
+    remote_limit: int | None = None,
 ) -> None:
     """Apply bounded remote- or load-improving swaps in-place."""
 
     if rounds < 1:
         return
-    if strategy not in {"remote", "balanced"}:
-        raise ValueError("strategy must be 'remote' or 'balanced'")
+    if strategy not in {"remote", "balanced", "congestion"}:
+        raise ValueError("invalid refinement strategy")
+    if strategy == "congestion" and remote_limit is None:
+        raise ValueError("congestion refinement requires remote_limit")
     if max_compute_imbalance is not None and max_compute_imbalance < 1:
         raise ValueError("max_compute_imbalance must be at least 1")
     expert_count = len(ranks)
@@ -371,6 +376,7 @@ def _refine_swaps(
                         estimate < 0
                         or (strategy == "remote" and estimate == 0)
                         or (strategy == "balanced" and load_gain > 0)
+                        or strategy == "congestion"
                     ):
                         candidates.append(
                             (
@@ -386,6 +392,7 @@ def _refine_swaps(
         candidates.sort()
         locked = np.zeros(expert_count, dtype=bool)
         changed = False
+        best_congestion = None
         for _, _, _, left, right in candidates:
             if locked[left] or locked[right] or ranks[left] == ranks[right]:
                 continue
@@ -417,6 +424,31 @@ def _refine_swaps(
             indexes, sources, delta_left, delta_right, delta = delta_state
             remote_improves = delta < 0
             budget_allows = remote_delta_total + delta <= remote_budget_tokens
+            if strategy == "congestion":
+                next_traffic = traffic.copy()
+                _update_swap_traffic(
+                    next_traffic,
+                    count=count,
+                    indexes=indexes,
+                    sources=sources,
+                    rank_deltas=((left_rank, delta_left), (right_rank, delta_right)),
+                    num_ranks=num_ranks,
+                )
+                if int(next_traffic.sum()) <= int(remote_limit) and _congestion_key(
+                    next_traffic
+                ) < _congestion_key(traffic):
+                    candidate = (
+                        _congestion_key(next_traffic),
+                        int(next_load.max()),
+                        left,
+                        right,
+                        next_left,
+                        next_right,
+                        delta_state,
+                    )
+                    if best_congestion is None or candidate[:4] < best_congestion[:4]:
+                        best_congestion = candidate
+                continue
             if strategy == "remote":
                 accept = remote_improves
                 if delta == 0:
@@ -459,6 +491,23 @@ def _refine_swaps(
             )
             remote_delta_total += delta
             locked[left] = locked[right] = True
+            changed = True
+        if best_congestion is not None:
+            _, _, left, right, next_left, next_right, delta_state = best_congestion
+            _apply_swap(
+                count=count,
+                token_indexes=token_indexes,
+                bundle_rank_counts=bundle_rank_counts,
+                ranks=ranks,
+                compute_load=compute_load,
+                traffic=traffic,
+                num_ranks=num_ranks,
+                left=left,
+                right=right,
+                next_left=next_left,
+                next_right=next_right,
+                delta_state=delta_state,
+            )
             changed = True
         if not changed:
             break
@@ -621,9 +670,9 @@ def cable_expert_placement(
     offsets = np.concatenate(([0], np.cumsum(expert_counts)))
     index_dtype = np.int32 if len(arrays) <= np.iinfo(np.int32).max else np.intp
     token_indexes = [
-        (
-            sorted_positions[offsets[expert] : offsets[expert + 1]] // top_k
-        ).astype(index_dtype)
+        (sorted_positions[offsets[expert] : offsets[expert + 1]] // top_k).astype(
+            index_dtype
+        )
         for expert in range(len(experts))
     ]
 
@@ -657,9 +706,7 @@ def cable_expert_placement(
         for rank in range(num_ranks):
             if slots_used[rank] >= maximum_capacity:
                 continue
-            needed_after = minimum_needed - int(
-                slots_used[rank] < minimum_capacity
-            )
+            needed_after = minimum_needed - int(slots_used[rank] < minimum_capacity)
             if needed_after > len(experts) - position - 1:
                 continue
             new_remote = (sources != rank) & (bundle_rank_counts[indexes, rank] == 0)

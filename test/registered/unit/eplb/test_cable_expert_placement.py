@@ -126,9 +126,7 @@ def test_routed_arrays_match_token_path():
     )
     assert cable_expert_placement(
         arrays, experts=range(4), num_ranks=4, capacity_ratio=0
-    ) == cable_expert_placement(
-        tokens, experts=range(4), num_ranks=4, capacity_ratio=0
-    )
+    ) == cable_expert_placement(tokens, experts=range(4), num_ranks=4, capacity_ratio=0)
 
 
 def test_cable_remote_refinement_accepts_only_improving_swaps():
@@ -289,9 +287,7 @@ def test_source_aware_grace_grouping_improves_fixed_group_assignment():
         graph = build_co_routing_graph(
             tokens, experts=range(8), source_affinity_weight=source_weight
         )
-        grace = grace_hierarchical_placement(
-            graph, num_ranks=4, equal_experts=True
-        )
+        grace = grace_hierarchical_placement(graph, num_ranks=4, equal_experts=True)
         result = hypergraph_expert_placement(
             tokens,
             experts=range(8),
@@ -369,6 +365,39 @@ def test_grace_swaps_reduce_congestion_without_increasing_remote():
     )
 
 
+def test_grace_congestion_objective_reduces_the_bottleneck():
+    tokens = [
+        RoutedToken(3, (6, 1, 2), 6),
+        RoutedToken(1, (0, 2, 9), 15),
+        RoutedToken(1, (9, 11, 7), 12),
+        RoutedToken(0, (11, 10, 1), 17),
+    ]
+    common = dict(
+        experts=range(12),
+        num_ranks=4,
+        capacity_ratio=0,
+        initial_placement={expert: expert // 3 for expert in range(12)},
+        align_groups=True,
+        refine_rounds=2,
+        swap_rounds=2,
+        swap_candidate_partners=8,
+    )
+    remote = hypergraph_expert_placement(tokens, objective="remote", **common)
+    congestion = hypergraph_expert_placement(
+        tokens,
+        objective="congestion",
+        congestion_remote_budget=0.01,
+        **common,
+    )
+
+    remote_metrics = remote["metrics"]
+    congestion_metrics = congestion["metrics"]
+    assert max(congestion_metrics.max_ingress, congestion_metrics.max_egress) < max(
+        remote_metrics.max_ingress, remote_metrics.max_egress
+    )
+    assert congestion_metrics.remote <= int(np.ceil(remote_metrics.remote * 1.01))
+
+
 def test_grace_swaps_can_trade_compute_balance_for_lower_remote():
     tokens = [
         RoutedToken(0, (1, 2, 8), 14),
@@ -405,9 +434,7 @@ def test_grace_swaps_can_trade_compute_balance_for_lower_remote():
     )
 
     assert relaxed["metrics"].remote < guarded["metrics"].remote
-    assert max(relaxed["metrics"].compute_load) > max(
-        guarded["metrics"].compute_load
-    )
+    assert max(relaxed["metrics"].compute_load) > max(guarded["metrics"].compute_load)
     assert relaxed["metrics"].remote <= capped["metrics"].remote
     assert capped["metrics"].compute_imbalance <= 1.25
     assert {len(group) for group in relaxed["experts_by_rank"].values()} == {3}

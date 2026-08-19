@@ -7,6 +7,7 @@ from typing import Mapping, Sequence
 import numpy as np
 
 from .cable_expert_placement import (
+    _congestion_key,
     _refine_swaps,
     evaluate_cable_placement,
 )
@@ -276,9 +277,7 @@ def _linear_assignment(cost: np.ndarray) -> np.ndarray:
                 if used[candidate]:
                     continue
                 reduced = (
-                    cost[current_row - 1, candidate - 1]
-                    - u[current_row]
-                    - v[candidate]
+                    cost[current_row - 1, candidate - 1] - u[current_row] - v[candidate]
                 )
                 if reduced < minimum[candidate]:
                     minimum[candidate] = reduced
@@ -358,6 +357,138 @@ def _traffic(
     return traffic
 
 
+def _refine_rank_labels(
+    source: np.ndarray,
+    count: np.ndarray,
+    ranks: np.ndarray,
+    slots: np.ndarray,
+    bundle_counts: np.ndarray,
+    remote_limit: int,
+) -> None:
+    """Swap whole rank groups to reduce the communication bottleneck."""
+
+    num_ranks = bundle_counts.shape[1]
+    source_traffic = np.zeros((num_ranks, num_ranks), dtype=np.int64)
+    for group in range(num_ranks):
+        indexes = bundle_counts[:, group] != 0
+        np.add.at(source_traffic[group], source[indexes], count[indexes])
+
+    totals = source_traffic.sum(axis=1)
+    assignment = _linear_assignment(totals[:, None] - source_traffic)
+    aligned_source_traffic = np.empty_like(source_traffic)
+    aligned_source_traffic[assignment] = source_traffic
+    source_traffic = aligned_source_traffic
+    old_bundle_counts = bundle_counts.copy()
+    bundle_counts[:, assignment] = old_bundle_counts
+    old_slots = slots.copy()
+    slots[assignment] = old_slots
+    ranks[:] = assignment[ranks]
+
+    def traffic() -> np.ndarray:
+        value = source_traffic.T.copy()
+        np.fill_diagonal(value, 0)
+        return value
+
+    current = traffic()
+    while True:
+        best = None
+        for left in range(num_ranks):
+            for right in range(left + 1, num_ranks):
+                source_traffic[[left, right]] = source_traffic[[right, left]]
+                candidate = traffic()
+                source_traffic[[left, right]] = source_traffic[[right, left]]
+                key = _congestion_key(candidate)
+                if int(candidate.sum()) <= remote_limit and key < _congestion_key(
+                    current
+                ):
+                    choice = (key, left, right, candidate)
+                    if best is None or choice[:3] < best[:3]:
+                        best = choice
+        if best is None:
+            return
+        _, left, right, current = best
+        source_traffic[[left, right]] = source_traffic[[right, left]]
+        bundle_counts[:, [left, right]] = bundle_counts[:, [right, left]]
+        slots[[left, right]] = slots[[right, left]]
+        left_experts = ranks == left
+        right_experts = ranks == right
+        ranks[left_experts], ranks[right_experts] = right, left
+
+
+def _refine_congestion_moves(
+    source: np.ndarray,
+    count: np.ndarray,
+    token_indexes: Sequence[np.ndarray],
+    ranks: np.ndarray,
+    slots: np.ndarray,
+    bundle_counts: np.ndarray,
+    demand: np.ndarray,
+    loads: np.ndarray,
+    *,
+    num_ranks: int,
+    minimum_capacity: int,
+    maximum_capacity: int,
+    compute_limit: float,
+    rounds: int,
+    remote_limit: int,
+) -> None:
+    traffic = _traffic(source, count, bundle_counts)
+    average = demand.sum() / num_ranks
+    for _ in range(rounds):
+        best = None
+        for expert in np.argsort(-demand, kind="stable"):
+            old = int(ranks[expert])
+            if slots[old] <= minimum_capacity:
+                continue
+            indexes = token_indexes[expert]
+            sources = source[indexes]
+            old_counts = bundle_counts[indexes, old]
+            remove = -count[indexes] * ((old_counts == 1) & (sources != old))
+            for target in range(num_ranks):
+                if target == old or slots[target] >= maximum_capacity:
+                    continue
+                next_loads = loads.copy()
+                next_loads[old] -= demand[expert]
+                next_loads[target] += demand[expert]
+                if next_loads.max() > max(compute_limit * average, loads.max()):
+                    continue
+                target_counts = bundle_counts[indexes, target]
+                add = count[indexes] * ((target_counts == 0) & (sources != target))
+                next_traffic = traffic.copy()
+                for rank, delta in ((old, remove), (target, add)):
+                    changed = delta != 0
+                    next_traffic[:, rank] += np.bincount(
+                        sources[changed],
+                        weights=delta[changed],
+                        minlength=num_ranks,
+                    ).astype(np.int64)
+                key = _congestion_key(next_traffic)
+                if int(next_traffic.sum()) <= remote_limit and key < _congestion_key(
+                    traffic
+                ):
+                    choice = (
+                        key,
+                        int(next_loads.max()),
+                        int(expert),
+                        target,
+                        next_traffic,
+                    )
+                    if best is None or choice[:4] < best[:4]:
+                        best = choice
+        if best is None:
+            return
+        _, _, expert, target, traffic = best
+        old = int(ranks[expert])
+        indexes = token_indexes[expert]
+        bundle_counts[indexes, old] -= 1
+        bundle_counts[indexes, target] += 1
+        ranks[expert] = target
+        slots[old] -= 1
+        slots[target] += 1
+        loads[old] -= demand[expert]
+        loads[target] += demand[expert]
+
+
 def hypergraph_expert_placement(
     tokens: Sequence[RoutedToken] | RoutedArrays,
     *,
@@ -374,6 +505,8 @@ def hypergraph_expert_placement(
     swap_candidate_partners: int = 4,
     swap_allow_load_worsening: bool = False,
     swap_max_compute_imbalance: float | None = None,
+    objective: str = "remote",
+    congestion_remote_budget: float = 0.0,
 ) -> dict[str, object]:
     """Solve fixed-terminal hypergraph connectivity placement.
 
@@ -394,13 +527,14 @@ def hypergraph_expert_placement(
         raise ValueError("starts must be positive and refinement rounds non-negative")
     if swap_candidate_partners < 1:
         raise ValueError("swap candidate partner count must be positive")
-    if (
-        swap_max_compute_imbalance is not None
-        and swap_max_compute_imbalance < 1
-    ):
+    if swap_max_compute_imbalance is not None and swap_max_compute_imbalance < 1:
         raise ValueError("swap compute imbalance limit must be at least 1")
     if not 0 <= remote_budget <= 1:
         raise ValueError("remote_budget must be in [0, 1]")
+    if objective not in {"remote", "congestion"}:
+        raise ValueError("objective must be 'remote' or 'congestion'")
+    if not 0 <= congestion_remote_budget <= 1:
+        raise ValueError("congestion_remote_budget must be in [0, 1]")
     source, topk, count, token_indexes, demand, source_demand = _prepare(
         arrays, experts
     )
@@ -468,14 +602,71 @@ def hypergraph_expert_placement(
             allow_load_worsening=swap_allow_load_worsening,
             max_compute_imbalance=swap_max_compute_imbalance,
         )
+        if objective == "congestion":
+            remote_limit = int(
+                np.ceil(
+                    _traffic(source, count, bundle_counts).sum()
+                    * (1 + congestion_remote_budget)
+                )
+            )
+            _refine_rank_labels(
+                source, count, ranks, slots, bundle_counts, remote_limit
+            )
+            loads[:] = np.bincount(ranks, weights=demand, minlength=num_ranks).astype(
+                np.int64
+            )
+            _refine_congestion_moves(
+                source,
+                count,
+                token_indexes,
+                ranks,
+                slots,
+                bundle_counts,
+                demand,
+                loads,
+                num_ranks=num_ranks,
+                minimum_capacity=minimum,
+                maximum_capacity=maximum,
+                compute_limit=compute_imbalance_limit,
+                rounds=refine_rounds,
+                remote_limit=remote_limit,
+            )
+            traffic = _traffic(source, count, bundle_counts)
+            _refine_swaps(
+                source=source,
+                topk=topk,
+                count=count,
+                token_indexes=token_indexes,
+                bundle_rank_counts=bundle_counts,
+                ranks=ranks,
+                demand=demand,
+                compute_load=loads,
+                traffic=traffic,
+                num_ranks=num_ranks,
+                rounds=swap_rounds,
+                total_tokens=int(count.sum()),
+                strategy="congestion",
+                remote_budget=0.0,
+                candidate_partners=swap_candidate_partners,
+                allow_load_worsening=swap_allow_load_worsening,
+                max_compute_imbalance=swap_max_compute_imbalance,
+                remote_limit=remote_limit,
+            )
         placement = {expert: int(ranks[i]) for i, expert in enumerate(experts)}
         metrics = evaluate_cable_placement(arrays, placement, num_ranks=num_ranks)
         key = (
-            metrics.remote,
-            metrics.max_ingress,
-            metrics.max_pair_traffic,
-            metrics.compute_imbalance,
-        )
+            (
+                max(metrics.max_ingress, metrics.max_egress),
+                metrics.max_pair_traffic,
+                metrics.remote,
+            )
+            if objective == "congestion"
+            else (
+                metrics.remote,
+                metrics.max_ingress,
+                metrics.max_pair_traffic,
+            )
+        ) + (metrics.compute_imbalance,)
         if best is None or key < best[0]:
             best = (key, placement, metrics, loads)
     _, placement, metrics, _ = best

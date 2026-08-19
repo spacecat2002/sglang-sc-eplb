@@ -109,11 +109,7 @@ def _remote(
     count = layer["count"].long()
     destinations = mapping[source[:, None], topk] // slots
     return sum(
-        int(
-            count[
-                torch.any(destinations == rank, dim=1) & (source != rank)
-            ].sum()
-        )
+        int(count[torch.any(destinations == rank, dim=1) & (source != rank)].sum())
         for rank in range(mapping.shape[0])
     )
 
@@ -204,8 +200,7 @@ def _measure(
                 layout.elapsed_time(dispatch) for _, layout, dispatch, _ in samples
             ),
             statistics.mean(
-                dispatch.elapsed_time(combine)
-                for _, _, dispatch, combine in samples
+                dispatch.elapsed_time(combine) for _, _, dispatch, combine in samples
             ),
             statistics.mean(
                 start.elapsed_time(combine) for start, _, _, combine in samples
@@ -233,6 +228,8 @@ def _worker(local_rank: int, args: argparse.Namespace) -> None:
     )
     group = dist.new_group(list(range(num_ranks)))
     physical_experts = slots * num_ranks
+    if args.num_sms:
+        deep_ep.Buffer.set_num_sms(args.num_sms)
     dispatch_config = deep_ep.Buffer.get_dispatch_config(num_ranks)
     combine_config = deep_ep.Buffer.get_combine_config(num_ranks)
     hidden_bytes = args.hidden * 2
@@ -245,21 +242,17 @@ def _worker(local_rank: int, args: argparse.Namespace) -> None:
         nvl_bytes,
         0,
         low_latency_mode=False,
-        num_qps_per_rank=args.num_qps_per_rank or deep_ep.Buffer.num_sms,
+        num_qps_per_rank=deep_ep.Buffer.num_sms,
     )
     maps = {
         name: torch.tensor(mapping, dtype=torch.int64, device="cuda")
         for name, mapping in maps.items()
     }
-    logical_topk = _sample(
-        layer, local_rank, args.tokens_per_rank, args.seed
-    ).cuda()
+    logical_topk = _sample(layer, local_rank, args.tokens_per_rank, args.seed).cuda()
     x = torch.randn(
         (args.tokens_per_rank, args.hidden), dtype=torch.bfloat16, device="cuda"
     )
-    weights = torch.ones(
-        logical_topk.shape, dtype=torch.float32, device="cuda"
-    )
+    weights = torch.ones(logical_topk.shape, dtype=torch.float32, device="cuda")
     results = {name: [] for name in maps}
     remote = {}
     for repeat in range(args.repeats):
@@ -304,7 +297,7 @@ def _worker(local_rank: int, args: argparse.Namespace) -> None:
             )
         print(
             f"[result] gate={gate} slots/rank={slots} "
-            f"qps/rank={args.num_qps_per_rank or deep_ep.Buffer.num_sms} "
+            f"num-sms={deep_ep.Buffer.num_sms} "
             f"communication-speedup={summary['baseline'][3] / summary['plan'][3]:.3f}x",
             flush=True,
         )
@@ -331,10 +324,10 @@ def main() -> None:
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument(
-        "--num-qps-per-rank",
+        "--num-sms",
         type=int,
         default=0,
-        help="DeepEP QPs per rank; 0 uses SGLang's Buffer.num_sms default",
+        help="DeepEP communication SMs; 0 uses the DeepEP default",
     )
     parser.add_argument("--master-addr", default="127.0.0.1")
     parser.add_argument("--master-port", type=int, default=8361)
@@ -344,12 +337,16 @@ def main() -> None:
         args.hidden = _model_hidden_size(args.model, args.trust_remote_code)
     except Exception as error:
         parser.error(f"could not read model hidden_size: {error}")
-    if min(
-        args.hidden,
-        args.tokens_per_rank,
-        args.iterations,
-        args.repeats,
-    ) < 1 or min(args.warmups, args.num_qps_per_rank) < 0:
+    if (
+        min(
+            args.hidden,
+            args.tokens_per_rank,
+            args.iterations,
+            args.repeats,
+        )
+        < 1
+        or min(args.warmups, args.num_sms) < 0
+    ):
         parser.error("invalid benchmark parameters")
     layer, gate, num_experts, num_ranks, slots, maps = _load(args)
     if args.dry_run:

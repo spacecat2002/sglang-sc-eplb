@@ -267,12 +267,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 align_groups=True,
                 swap_rounds=args.grace_refine_swaps,
                 swap_candidate_partners=args.grace_refine_partners,
-                swap_allow_load_worsening=(
-                    args.grace_refine_allow_load_worsening
-                ),
-                swap_max_compute_imbalance=(
-                    args.grace_refine_swap_compute_limit
-                ),
+                swap_allow_load_worsening=(args.grace_refine_allow_load_worsening),
+                swap_max_compute_imbalance=(args.grace_refine_swap_compute_limit),
+                objective=args.grace_refine_objective,
+                congestion_remote_budget=args.grace_refine_remote_budget,
             )
             if args.grace_refine
             else None
@@ -427,9 +425,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "placement": replication.replicas_by_expert,
                 "extra_copies": replication.extra_copies,
                 "solve_seconds": (
-                    grace_seconds
-                    + (grace_refine_seconds or 0.0)
-                    + replication_seconds
+                    grace_seconds + (grace_refine_seconds or 0.0) + replication_seconds
                 ),
                 "replication_seconds": replication_seconds,
             }
@@ -564,20 +560,20 @@ def main() -> None:
     parser.add_argument("--grace-refine-swaps", type=int, default=2)
     parser.add_argument("--grace-refine-partners", type=int, default=8)
     parser.add_argument(
-        "--grace-refine-allow-load-worsening", action="store_true"
+        "--grace-refine-objective",
+        choices=("remote", "congestion"),
+        default="remote",
     )
+    parser.add_argument("--grace-refine-remote-budget", type=float, default=0.0)
+    parser.add_argument("--grace-refine-allow-load-worsening", action="store_true")
     parser.add_argument("--grace-refine-swap-compute-limit", type=float)
     parser.add_argument("--grace-refine-capacity-ratio", type=float)
     parser.add_argument("--grace-replication", action="store_true")
     parser.add_argument("--grace-replication-budget", type=int, default=0)
     parser.add_argument("--grace-replication-hot-experts", type=int, default=16)
     parser.add_argument("--grace-replication-candidates", type=int, default=4)
-    parser.add_argument(
-        "--grace-replication-compute-limit", type=float, default=1.25
-    )
-    parser.add_argument(
-        "--grace-replication-max-extra-per-rank", type=int, default=1
-    )
+    parser.add_argument("--grace-replication-compute-limit", type=float, default=1.25)
+    parser.add_argument("--grace-replication-max-extra-per-rank", type=int, default=1)
     parser.add_argument("--cable-congestion-weight", type=float, default=0.25)
     parser.add_argument("--cable-load-weight", type=float, default=0.25)
     parser.add_argument("--cable-refine-swaps", type=int, default=2)
@@ -626,6 +622,7 @@ def main() -> None:
         or args.grace_refine_rounds < 0
         or args.grace_refine_swaps < 0
         or args.grace_refine_partners < 1
+        or not 0 <= args.grace_refine_remote_budget <= 1
         or (
             args.grace_refine_swap_compute_limit is not None
             and args.grace_refine_swap_compute_limit < 1
