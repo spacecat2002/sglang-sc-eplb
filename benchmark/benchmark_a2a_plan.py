@@ -190,27 +190,34 @@ def _quota_remote(
     slots: int,
     num_ranks: int,
 ) -> int:
-    import torch
+    import numpy as np
 
-    probabilities = torch.zeros(
-        (num_ranks, len(physical_replicas), num_ranks), dtype=torch.float64
+    from sglang.srt.eplb.expert_affinity_graph import RoutedArrays
+    from sglang.srt.eplb.grace_plus_replication import _route_quota, _source_demand
+
+    arrays = RoutedArrays(
+        layer["source_rank"].numpy(),
+        layer["topk_experts"].numpy(),
+        layer["count"].numpy(),
     )
+    replicas = {
+        expert: tuple(physical // slots for physical in values)
+        for expert, values in enumerate(physical_replicas)
+    }
+    demand = _source_demand(arrays, len(replicas), num_ranks)
+    dense_quota = np.zeros((num_ranks, len(replicas), num_ranks), dtype=np.int64)
     for source, row in enumerate(quota):
         for expert, values in enumerate(row):
-            total = sum(values)
-            for physical, value in zip(physical_replicas[expert], values):
-                probabilities[source, expert, physical // slots] = value / total
-    source = layer["source_rank"].long()
-    topk = layer["topk_experts"].long()
-    count = layer["count"].double()
-    remote = 0.0
-    for target in range(num_ranks):
-        sent = 1.0 - torch.prod(
-            1.0 - probabilities[source[:, None], topk, target], dim=1
-        )
-        selected = source != target
-        remote += float((count[selected] * sent[selected]).sum())
-    return round(remote)
+            ranks = replicas[expert]
+            order = sorted(
+                range(len(ranks)), key=lambda index: (ranks[index] != source, index)
+            )
+            scaled = _scale_quota(
+                [values[index] for index in order], int(demand[expert, source])
+            )
+            for index, value in zip(order, scaled):
+                dense_quota[source, expert, ranks[index]] = value
+    return _route_quota(arrays, dense_quota, demand, replicas).remote
 
 
 def _load(args: argparse.Namespace):
@@ -275,22 +282,51 @@ def _load(args: argparse.Namespace):
     )
 
 
-def _quota_topk(logical_topk, physical_replicas, quota, source: int, seed: int):
+def _scale_quota(values: Sequence[int], amount: int) -> list[int]:
+    total = sum(values)
+    if total < 1:
+        raise ValueError("quota must contain positive demand")
+    numerators = [value * amount for value in values]
+    result = [value // total for value in numerators]
+    remainder = amount - sum(result)
+    order = sorted(
+        range(len(values)),
+        key=lambda index: (-(numerators[index] % total), index),
+    )
+    for index in order[:remainder]:
+        result[index] += 1
+    return result
+
+
+def _quota_topk(logical_topk, physical_replicas, quota, source: int, slots: int):
     import torch
 
     result = torch.empty_like(logical_topk)
-    generator = torch.Generator(device=logical_topk.device).manual_seed(seed + source)
     for expert in torch.unique(logical_topk).tolist():
         selected = logical_topk == expert
         replicas = physical_replicas[expert]
-        probabilities = quota[source, expert, : len(replicas)].float()
-        choices = torch.multinomial(
-            probabilities,
-            int(selected.sum()),
-            replacement=True,
-            generator=generator,
+        valid = replicas >= 0
+        replicas = replicas[valid]
+        values = quota[source, expert, : len(replicas)]
+        local = replicas // slots == source
+        order = torch.cat(
+            (torch.nonzero(local).flatten(), torch.nonzero(~local).flatten())
         )
-        result[selected] = replicas[choices]
+        replicas = replicas[order]
+        values = values[order]
+        amount = int(selected.sum())
+        total = int(values.sum())
+        if total < 1:
+            raise ValueError("quota must contain positive demand")
+        numerators = values * amount
+        counts = torch.div(numerators, total, rounding_mode="floor")
+        remainder = amount - int(counts.sum())
+        if remainder:
+            residual_order = torch.argsort(
+                numerators % total, descending=True, stable=True
+            )
+            counts[residual_order[:remainder]] += 1
+        result[selected] = torch.repeat_interleave(replicas, counts)
     return result
 
 
@@ -441,7 +477,7 @@ def _worker(local_rank: int, args: argparse.Namespace) -> None:
                     replicas,
                     quota,
                     local_rank,
-                    args.seed + repeat,
+                    slots,
                 )
                 if name == "plan" and quota is not None
                 else maps[name][local_rank, logical_topk]

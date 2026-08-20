@@ -230,7 +230,7 @@ GRACE+ JSON 保存：
 
 通信复制和计算复制分别只受 `max_comm_expert_per_rank` 与 `max_comp_expert_per_rank` 的每-rank 权重槽预算约束。quota 生成本身没有迭代次数，计算复制迭代最多为 `num_ranks * max_comp_expert_per_rank`。
 
-因此计算阶段不会为了降低通信而接受更差的计算峰值，也尽量不产生新的 remote destination。最终保存 `quota[source][expert][replica_index]`，最后一维与该专家的 `replicas` 顺序一致。A2A benchmark 按 quota 比例为每个 token-expert occurrence 选择副本；旧的 routing-only plan 仍兼容。
+因此计算阶段不会为了降低通信而接受更差的计算峰值，也尽量不产生新的 remote destination。最终保存 `quota[source][expert][replica_index]`，最后一维与该专家的 `replicas` 顺序一致。A2A benchmark 将 quota 确定性缩放到 sampled occurrence 数，使用与 planner 相同的 local-first cumulative prefix 选择副本；旧的 routing-only plan 仍兼容。
 
 ### 5.8 最终选择与输出
 
