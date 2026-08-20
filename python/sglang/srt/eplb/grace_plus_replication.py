@@ -160,7 +160,18 @@ def _route_quota(
         replica_mask[np.arange(len(primary)), primary] = True
         return _route(arrays, primary, replica_mask, num_ranks=num_ranks)
     prefix = _quota_prefix(quota, replicas)
-    counters = np.zeros((num_ranks, quota.shape[1]), dtype=np.int64)
+    num_experts = quota.shape[1]
+    max_replicas = max(map(len, replicas.values()))
+    ordered_ranks = np.full((num_ranks, num_experts, max_replicas), -1, dtype=np.intp)
+    ordered_prefix = np.full_like(ordered_ranks, np.iinfo(np.int64).max, dtype=np.int64)
+    replica_counts = np.zeros(num_experts, dtype=np.intp)
+    for expert, ranks in replicas.items():
+        replica_counts[expert] = len(ranks)
+        for source in range(num_ranks):
+            order = _source_replica_order(source, ranks)
+            ordered_ranks[source, expert, : len(order)] = order
+            ordered_prefix[source, expert, : len(order)] = prefix[source, expert, order]
+    counters = np.zeros(num_ranks * num_experts, dtype=np.int64)
     traffic = np.zeros((num_ranks, num_ranks), dtype=np.int64)
     compute = quota.sum(axis=(0, 1), dtype=np.int64)
     for start in range(0, len(arrays), _CHUNK_SIZE):
@@ -168,38 +179,78 @@ def _route_quota(
         source = arrays.source_rank[start:end]
         topk = arrays.topk_experts[start:end]
         count = arrays.count[start:end]
-        for row in range(len(source)):
+        keys = (
+            source.astype(np.intp, copy=False)[:, None] * num_experts
+            + topk.astype(np.intp, copy=False)
+        ).ravel()
+        weights = np.broadcast_to(count[:, None], topk.shape).ravel()
+        order = np.argsort(keys, kind="stable")
+        sorted_keys = keys[order]
+        sorted_weights = weights[order]
+        cumulative = np.cumsum(sorted_weights, dtype=np.int64)
+        before = cumulative - sorted_weights
+        group_starts = np.flatnonzero(
+            np.concatenate(([True], sorted_keys[1:] != sorted_keys[:-1]))
+        )
+        group_ends = np.concatenate((group_starts[1:] - 1, [len(keys) - 1]))
+        within = np.empty_like(before)
+        within[order] = before - np.repeat(
+            before[group_starts], np.diff(np.append(group_starts, len(keys)))
+        )
+        ordinals = (within + counters[keys]).reshape(topk.shape)
+        counters[sorted_keys[group_starts]] += (
+            cumulative[group_ends] - before[group_starts]
+        )
+
+        rank_order = ordered_ranks[source[:, None], topk]
+        boundaries = ordered_prefix[source[:, None], topk]
+        replica_index = np.sum(ordinals[:, :, None] >= boundaries, axis=2)
+        destinations = np.take_along_axis(
+            rank_order, replica_index[:, :, None], axis=2
+        ).squeeze(2)
+        for rank in range(num_ranks):
+            sent = np.any(destinations == rank, axis=1) & (source != rank)
+            np.add.at(traffic[:, rank], source[sent], count[sent])
+
+        crossing = np.any(
+            (boundaries > ordinals[:, :, None])
+            & (boundaries < ordinals[:, :, None] + count[:, None, None]),
+            axis=(1, 2),
+        )
+        for row in np.flatnonzero(crossing):
             source_rank = int(source[row])
             tokens = int(count[row])
-            boundaries = {0, tokens}
-            starts = []
-            for column, expert_value in enumerate(topk[row]):
-                expert = int(expert_value)
-                ordinal = int(counters[source_rank, expert])
-                starts.append((expert, ordinal))
-                for boundary in prefix[source_rank, expert, replicas[expert]]:
+            for target in set(destinations[row]):
+                if target != source_rank:
+                    traffic[source_rank, target] -= tokens
+            offsets = {0, tokens}
+            for column, expert in enumerate(topk[row]):
+                ordinal = int(ordinals[row, column])
+                for boundary in ordered_prefix[
+                    source_rank, expert, : replica_counts[expert]
+                ]:
                     offset = int(boundary) - ordinal
                     if 0 < offset < tokens:
-                        boundaries.add(offset)
-            ordered = sorted(boundaries)
+                        offsets.add(offset)
+            ordered = sorted(offsets)
             for left, right in zip(ordered, ordered[1:]):
-                destinations = []
-                for expert, ordinal in starts:
-                    replica_ranks = _source_replica_order(source_rank, replicas[expert])
-                    replica_index = int(
+                segment_destinations = []
+                for column, expert in enumerate(topk[row]):
+                    size = replica_counts[expert]
+                    index = int(
                         np.searchsorted(
-                            prefix[source_rank, expert, replica_ranks],
-                            ordinal + left,
+                            ordered_prefix[source_rank, expert, :size],
+                            int(ordinals[row, column]) + left,
                             side="right",
                         )
                     )
-                    destinations.append(replica_ranks[replica_index])
+                    segment_destinations.append(
+                        int(ordered_ranks[source_rank, expert, index])
+                    )
                 segment = right - left
-                for target in set(destinations):
+                for target in set(segment_destinations):
                     if target != source_rank:
                         traffic[source_rank, target] += segment
-            for expert, _ in starts:
-                counters[source_rank, expert] += tokens
     return ReplicaMetrics(
         remote=int(traffic.sum()),
         max_pair_traffic=int(traffic.max(initial=0)),

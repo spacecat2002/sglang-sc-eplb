@@ -364,9 +364,9 @@ def test_joint_quota_shares_rank_capacity_across_experts():
 
 def test_quota_prefix_routes_local_before_remote_and_matches_counts():
     arrays = RoutedArrays(
-        np.array([0]),
-        np.array([[0, 1]]),
-        np.array([10]),
+        np.array([0, 0, 0]),
+        np.array([[0, 1], [0, 1], [0, 1]]),
+        np.array([4, 4, 2]),
     )
     quota = np.zeros((2, 2, 2), dtype=np.int64)
     quota[0, 0] = [6, 4]
@@ -374,7 +374,8 @@ def test_quota_prefix_routes_local_before_remote_and_matches_counts():
     replicas = {0: (0, 1), 1: (0, 1)}
 
     prefix = _quota_prefix(quota, replicas)
-    metrics = _route_quota(arrays, quota, np.array([[10, 0], [10, 0]]), replicas)
+    with patch("sglang.srt.eplb.grace_plus_replication._CHUNK_SIZE", 1):
+        metrics = _route_quota(arrays, quota, np.array([[10, 0], [10, 0]]), replicas)
 
     assert prefix[0, 0].tolist() == [6, 10]
     assert prefix[0, 1].tolist() == [4, 10]
