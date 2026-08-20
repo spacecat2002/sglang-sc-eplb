@@ -226,7 +226,7 @@ GRACE+ JSON 保存：
 
 第二阶段把每个 `(source_rank, expert)` 的需求拆成整数 quota，可将同一需求分给多个副本：
 
-1. 按专家总需求从高到低处理，用整数 water-filling 直接计算现有副本的理想负载；
+1. 在 `expert -> replica rank` 二分图上二分 rank 容量并求整数最大流，得到当前副本集合下全局最小的 `max compute load`；
 2. 计算复制只枚举新增权重 `(expert, target)`，必须严格改善 `(max_load, sum(load^2))`，通信量作为 tie-break；
 3. 副本集合确定后，一次性重新 water-fill 所有专家，不逐 quota 迭代迁移；
 4. source-local-first 填充各副本容量，剩余需求优先复用通信阶段的 routing destination；

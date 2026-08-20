@@ -12,6 +12,7 @@ from sglang.srt.eplb.grace_plus_expert_placement import (
 )
 from sglang.srt.eplb.grace_plus_replication import (
     ReplicaPlacement,
+    _instance_quotas,
     balance_replica_compute,
     evaluate_replicated_placement,
     replicate_hot_experts,
@@ -255,3 +256,13 @@ def test_unobserved_source_expert_keeps_valid_routing():
 
     assert balanced.routing_by_source[1][0] == 1
     assert balanced.quota_by_source[1][0] == (1,)
+
+
+def test_instance_quota_is_globally_balanced():
+    _, loads = _instance_quotas(
+        np.array([14, 7, 13, 15]),
+        {0: (0, 1), 1: (0,), 2: (2,), 3: (0, 2)},
+        3,
+    )
+
+    assert loads.tolist() == [18, 13, 18]

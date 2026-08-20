@@ -217,7 +217,93 @@ def _waterfill(loads: np.ndarray, ranks: Sequence[int], demand: int) -> np.ndarr
     return allocation
 
 
+def _max_flow(capacity: list[dict[int, int]], source: int, sink: int) -> int:
+    """Dinic max flow for the small expert-to-rank quota graph."""
+
+    flow = 0
+    while True:
+        level = [-1] * len(capacity)
+        level[source] = 0
+        queue = [source]
+        for node in queue:
+            for target, remaining in capacity[node].items():
+                if remaining and level[target] < 0:
+                    level[target] = level[node] + 1
+                    queue.append(target)
+        if level[sink] < 0:
+            return flow
+        edge = [iter(row) for row in capacity]
+
+        def send(node: int, amount: int) -> int:
+            if node == sink:
+                return amount
+            for target in edge[node]:
+                remaining = capacity[node][target]
+                if remaining and level[target] == level[node] + 1:
+                    sent = send(target, min(amount, remaining))
+                    if sent:
+                        capacity[node][target] -= sent
+                        capacity[target][node] += sent
+                        return sent
+            return 0
+
+        while sent := send(source, sum(capacity[source].values())):
+            flow += sent
+
+
+def _flow_quotas(
+    demand: np.ndarray,
+    replicas: Mapping[int, Sequence[int]],
+    num_ranks: int,
+    rank_capacity: int,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    num_experts = len(demand)
+    source = num_experts + num_ranks
+    sink = source + 1
+    capacity = [dict() for _ in range(sink + 1)]
+
+    def add(left: int, right: int, amount: int) -> None:
+        capacity[left][right] = amount
+        capacity[right][left] = 0
+
+    total = int(demand.sum())
+    for expert, amount in enumerate(demand):
+        add(source, expert, int(amount))
+        for rank in replicas[expert]:
+            add(expert, num_experts + rank, int(amount))
+    for rank in range(num_ranks):
+        add(num_experts + rank, sink, rank_capacity)
+    if _max_flow(capacity, source, sink) != total:
+        return None
+    quota = np.zeros((num_experts, num_ranks), dtype=np.int64)
+    for expert in range(num_experts):
+        for rank in replicas[expert]:
+            quota[expert, rank] = capacity[num_experts + rank][expert]
+    return quota, quota.sum(axis=0)
+
+
 def _instance_quotas(
+    demand: np.ndarray,
+    replicas: Mapping[int, Sequence[int]],
+    num_ranks: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    low = (int(demand.sum()) + num_ranks - 1) // num_ranks
+    high = int(demand.sum())
+    best = None
+    while low <= high:
+        middle = (low + high) // 2
+        result = _flow_quotas(demand, replicas, num_ranks, middle)
+        if result is None:
+            low = middle + 1
+        else:
+            best = result
+            high = middle - 1
+    if best is None:
+        raise RuntimeError("replica graph cannot serve expert demand")
+    return best
+
+
+def _greedy_instance_quotas(
     demand: np.ndarray,
     replicas: Mapping[int, Sequence[int]],
     num_ranks: int,
@@ -225,9 +311,8 @@ def _instance_quotas(
     quota = np.zeros((len(demand), num_ranks), dtype=np.int64)
     loads = np.zeros(num_ranks, dtype=np.int64)
     for expert in np.argsort(-demand, kind="stable"):
-        allocation = _waterfill(loads, replicas[int(expert)], int(demand[expert]))
-        quota[expert] = allocation
-        loads += allocation
+        quota[expert] = _waterfill(loads, replicas[int(expert)], int(demand[expert]))
+        loads += quota[expert]
     return quota, loads
 
 
@@ -487,7 +572,9 @@ def balance_replica_compute(
     balance_by_rank = np.zeros(num_ranks, dtype=np.int64)
     added = 0
     while added < num_ranks * max_extra_per_rank:
-        instance_quota, compute = _instance_quotas(expert_demand, replicas, num_ranks)
+        instance_quota, compute = _greedy_instance_quotas(
+            expert_demand, replicas, num_ranks
+        )
         current_key = (int(compute.max()), int(np.square(compute).sum()))
         best = None
         for expert in np.argsort(-expert_demand, kind="stable"):
