@@ -16,7 +16,6 @@ _CHUNK_SIZE = 200_000
 @dataclass(frozen=True)
 class ReplicaMetrics:
     remote: int
-    weighted_remote: float
     max_pair_traffic: int
     max_ingress: int
     max_egress: int
@@ -87,8 +86,6 @@ def _route(
     replica_mask: np.ndarray,
     *,
     num_ranks: int,
-    ranks_per_node: int,
-    rdma_cost: float,
     routing: np.ndarray | None = None,
 ) -> ReplicaMetrics:
     traffic = np.zeros((num_ranks, num_ranks), dtype=np.int64)
@@ -108,13 +105,8 @@ def _route(
         for rank in range(num_ranks):
             sent = np.any(destinations == rank, axis=1) & (source != rank)
             np.add.at(traffic[:, rank], source[sent], count[sent])
-    source_node = np.arange(num_ranks)[:, None] // ranks_per_node
-    target_node = np.arange(num_ranks)[None, :] // ranks_per_node
-    costs = np.where(source_node == target_node, 1.0, rdma_cost)
-    np.fill_diagonal(costs, 0.0)
     return ReplicaMetrics(
         remote=int(traffic.sum()),
-        weighted_remote=float((traffic * costs).sum()),
         max_pair_traffic=int(traffic.max()),
         max_ingress=int(traffic.sum(axis=0).max()),
         max_egress=int(traffic.sum(axis=1).max()),
@@ -127,8 +119,6 @@ def evaluate_replicated_placement(
     placement: Mapping[int, int | Sequence[int]],
     *,
     num_ranks: int,
-    ranks_per_node: int,
-    rdma_cost: float = 1.0,
 ) -> ReplicaMetrics:
     arrays = as_routed_arrays(tokens)
     _, primary, replica_mask = _replica_arrays(arrays, placement, num_ranks)
@@ -137,8 +127,6 @@ def evaluate_replicated_placement(
         primary,
         replica_mask,
         num_ranks=num_ranks,
-        ranks_per_node=ranks_per_node,
-        rdma_cost=rdma_cost,
     )
 
 
@@ -146,11 +134,8 @@ def _route_quota(
     arrays: RoutedArrays,
     quota: np.ndarray,
     source_demand: np.ndarray,
-    *,
-    ranks_per_node: int,
-    rdma_cost: float,
 ) -> ReplicaMetrics:
-    """Evaluate expected traffic for independently quota-routed Top-K experts."""
+    """Evaluate expected traffic for shared-uniform quota-routed Top-K experts."""
 
     num_ranks = quota.shape[2]
     traffic = np.zeros((num_ranks, num_ranks), dtype=np.float64)
@@ -161,19 +146,24 @@ def _route_quota(
         topk = arrays.topk_experts[start:end]
         count = arrays.count[start:end]
         demand = source_demand[topk, source[:, None]]
+        lower = np.zeros(topk.shape, dtype=np.float64)
         for target in range(num_ranks):
             probability = quota[source[:, None], topk, target] / demand
-            sent = 1.0 - np.prod(1.0 - probability, axis=1)
+            upper = lower + probability
+            order = np.argsort(lower, axis=1, kind="stable")
+            starts = np.take_along_axis(lower, order, axis=1)
+            ends = np.take_along_axis(upper, order, axis=1)
+            previous_end = np.maximum.accumulate(ends, axis=1)
+            sent = ends[:, 0] - starts[:, 0]
+            sent += np.maximum(
+                ends[:, 1:] - np.maximum(starts[:, 1:], previous_end[:, :-1]), 0
+            ).sum(axis=1)
             remote = source != target
             np.add.at(traffic[:, target], source[remote], count[remote] * sent[remote])
-    source_node = np.arange(num_ranks)[:, None] // ranks_per_node
-    target_node = np.arange(num_ranks)[None, :] // ranks_per_node
-    costs = np.where(source_node == target_node, 1.0, rdma_cost)
-    np.fill_diagonal(costs, 0.0)
+            lower = upper
     rounded = np.rint(traffic).astype(np.int64)
     return ReplicaMetrics(
         remote=int(rounded.sum()),
-        weighted_remote=float((traffic * costs).sum()),
         max_pair_traffic=int(rounded.max()),
         max_ingress=int(rounded.sum(axis=0).max()),
         max_egress=int(rounded.sum(axis=1).max()),
@@ -303,19 +293,6 @@ def _instance_quotas(
     return best
 
 
-def _greedy_instance_quotas(
-    demand: np.ndarray,
-    replicas: Mapping[int, Sequence[int]],
-    num_ranks: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    quota = np.zeros((len(demand), num_ranks), dtype=np.int64)
-    loads = np.zeros(num_ranks, dtype=np.int64)
-    for expert in np.argsort(-demand, kind="stable"):
-        quota[expert] = _waterfill(loads, replicas[int(expert)], int(demand[expert]))
-        loads += quota[expert]
-    return quota, loads
-
-
 def _source_quotas(
     source_demand: np.ndarray,
     instance_quota: np.ndarray,
@@ -437,9 +414,7 @@ def replicate_hot_experts(
     placement: Mapping[int, int],
     *,
     num_ranks: int,
-    ranks_per_node: int,
     objective: str = "ingress-egress",
-    rdma_cost: float = 1.0,
     hot_experts: int = 16,
     candidate_ranks: int = 4,
     compute_imbalance_limit: float = 1.25,
@@ -449,14 +424,14 @@ def replicate_hot_experts(
 
     if objective not in {"remote", "ingress-egress"}:
         raise ValueError("invalid replication objective")
-    if num_ranks < 1 or ranks_per_node < 1 or num_ranks % ranks_per_node:
-        raise ValueError("ranks_per_node must divide num_ranks")
+    if num_ranks < 1:
+        raise ValueError("num_ranks must be positive")
     if hot_experts < 0 or candidate_ranks < 1:
         raise ValueError("invalid replication limits")
     if max_extra_per_rank < 0:
         raise ValueError("max_extra_per_rank must be non-negative")
-    if compute_imbalance_limit < 1 or rdma_cost < 1:
-        raise ValueError("invalid replication cost or compute limit")
+    if compute_imbalance_limit < 1:
+        raise ValueError("invalid replication compute limit")
     arrays = as_routed_arrays(tokens)
     replicas, primary, replica_mask = _replica_arrays(arrays, placement, num_ranks)
     source_demand = _source_demand(arrays, len(primary), num_ranks)
@@ -534,8 +509,6 @@ def replicate_hot_experts(
         primary,
         replica_mask,
         num_ranks=num_ranks,
-        ranks_per_node=ranks_per_node,
-        rdma_cost=rdma_cost,
     )
     routing = _default_routing(primary, replica_mask, num_ranks)
     return ReplicaPlacement(
@@ -551,15 +524,10 @@ def balance_replica_compute(
     placement: ReplicaPlacement,
     *,
     num_ranks: int,
-    ranks_per_node: int,
-    objective: str = "ingress-egress",
-    rdma_cost: float = 1.0,
     max_extra_per_rank: int = 0,
 ) -> ReplicaPlacement:
     """Quickly balance source-expert demand with communication constraints."""
 
-    if objective not in {"remote", "ingress-egress"}:
-        raise ValueError("invalid balance objective")
     if max_extra_per_rank < 0:
         raise ValueError("invalid balance replication limits")
     arrays = as_routed_arrays(tokens)
@@ -572,9 +540,7 @@ def balance_replica_compute(
     balance_by_rank = np.zeros(num_ranks, dtype=np.int64)
     added = 0
     while added < num_ranks * max_extra_per_rank:
-        instance_quota, compute = _greedy_instance_quotas(
-            expert_demand, replicas, num_ranks
-        )
+        instance_quota, compute = _instance_quotas(expert_demand, replicas, num_ranks)
         current_key = (int(compute.max()), int(np.square(compute).sum()))
         best = None
         for expert in np.argsort(-expert_demand, kind="stable"):
@@ -582,8 +548,10 @@ def balance_replica_compute(
                 continue
             base = compute - instance_quota[expert]
             for target in range(num_ranks):
-                if replica_mask[expert, target] or (
-                    balance_by_rank[target] >= max_extra_per_rank
+                if (
+                    not source_demand[expert, target]
+                    or replica_mask[expert, target]
+                    or (balance_by_rank[target] >= max_extra_per_rank)
                 ):
                     continue
                 ranks = replicas[int(expert)] + (target,)
@@ -624,8 +592,6 @@ def balance_replica_compute(
         arrays,
         quota,
         source_demand,
-        ranks_per_node=ranks_per_node,
-        rdma_cost=rdma_cost,
     )
     serialized_quota = tuple(
         tuple(

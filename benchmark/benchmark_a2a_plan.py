@@ -200,14 +200,22 @@ def _quota_remote(
             total = sum(values)
             for physical, value in zip(physical_replicas[expert], values):
                 probabilities[source, expert, physical // slots] = value / total
+    lower = probabilities.cumsum(dim=2) - probabilities
     source = layer["source_rank"].long()
     topk = layer["topk_experts"].long()
     count = layer["count"].double()
     remote = 0.0
     for target in range(num_ranks):
-        sent = 1.0 - torch.prod(
-            1.0 - probabilities[source[:, None], topk, target], dim=1
-        )
+        starts = lower[source[:, None], topk, target]
+        ends = starts + probabilities[source[:, None], topk, target]
+        order = starts.argsort(dim=1)
+        starts = starts.gather(1, order)
+        ends = ends.gather(1, order)
+        previous_end = ends.cummax(dim=1).values
+        sent = ends[:, 0] - starts[:, 0]
+        sent += torch.clamp(
+            ends[:, 1:] - torch.maximum(starts[:, 1:], previous_end[:, :-1]), min=0
+        ).sum(dim=1)
         selected = source != target
         remote += float((count[selected] * sent[selected]).sum())
     return round(remote)
@@ -280,15 +288,21 @@ def _quota_topk(logical_topk, physical_replicas, quota, source: int, seed: int):
 
     result = torch.empty_like(logical_topk)
     generator = torch.Generator(device=logical_topk.device).manual_seed(seed + source)
+    shared = torch.rand(
+        (logical_topk.shape[0], 1), device=logical_topk.device, generator=generator
+    ).expand_as(logical_topk)
     for expert in torch.unique(logical_topk).tolist():
         selected = logical_topk == expert
         replicas = physical_replicas[expert]
-        probabilities = quota[source, expert, : len(replicas)].float()
-        choices = torch.multinomial(
-            probabilities,
-            int(selected.sum()),
-            replacement=True,
-            generator=generator,
+        valid = replicas >= 0
+        replicas = replicas[valid]
+        weights = quota[source, expert, : int(valid.sum())]
+        order = replicas.argsort()
+        replicas = replicas[order]
+        prefix = weights[order].cumsum(0)
+        positions = shared[selected] * prefix[-1]
+        choices = torch.searchsorted(prefix, positions, right=True).clamp_max(
+            len(replicas) - 1
         )
         result[selected] = replicas[choices]
     return result

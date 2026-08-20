@@ -1,4 +1,4 @@
-"""GRACE-MoE offline hierarchical expert grouping."""
+"""GRACE-MoE offline expert grouping."""
 
 from __future__ import annotations
 
@@ -230,46 +230,32 @@ def _controlled_groups(
     return groups
 
 
-def grace_hierarchical_placement(
+def grace_expert_placement(
     graph: CoRoutingGraph,
     *,
     num_ranks: int,
-    ranks_per_node: int | None = None,
     nonuniform_ratio: float = 0.15,
     equal_experts: bool = False,
 ) -> GracePlacement:
-    """Apply GRACE node-level and controlled GPU-level spectral grouping."""
+    """Group experts directly onto ranks with controlled spectral grouping."""
 
     if num_ranks < 1:
         raise ValueError("num_ranks must be positive")
     if not 0 <= nonuniform_ratio < 1:
         raise ValueError("nonuniform_ratio must be in [0, 1)")
-    ranks_per_node = ranks_per_node or num_ranks
-    if ranks_per_node < 1 or num_ranks % ranks_per_node:
-        raise ValueError("ranks_per_node must divide num_ranks")
     if len(graph.experts) < num_ranks:
         raise ValueError("GRACE grouping requires at least one expert per rank")
 
-    num_nodes = num_ranks // ranks_per_node
-    node_groups = _spectral_groups(graph, graph.experts, num_nodes)
-    if equal_experts:
-        if len(graph.experts) % num_ranks:
-            raise ValueError("exact experts per rank requires divisible expert count")
-        node_groups = _exact_groups(graph, node_groups, len(graph.experts) // num_nodes)
-    else:
-        _fill_minimum(graph, node_groups, ranks_per_node)
-    rank_by_expert = {}
-    for node, node_experts in enumerate(node_groups):
-        gpu_groups = _controlled_groups(
-            graph,
-            node_experts,
-            ranks_per_node,
-            nonuniform_ratio,
-            equal_size=equal_experts,
-        )
-        for local_rank, experts in enumerate(gpu_groups):
-            rank = node * ranks_per_node + local_rank
-            rank_by_expert.update({expert: rank for expert in experts})
+    groups = _controlled_groups(
+        graph,
+        graph.experts,
+        num_ranks,
+        nonuniform_ratio,
+        equal_size=equal_experts,
+    )
+    rank_by_expert = {
+        expert: rank for rank, experts in enumerate(groups) for expert in experts
+    }
     return GracePlacement(
         rank_by_expert,
         {

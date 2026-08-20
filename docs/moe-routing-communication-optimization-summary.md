@@ -30,13 +30,10 @@ T[r, r] = 0
 | 指标 | 定义 |
 |---|---|
 | `remote` | `sum(T)`，所有远端目标 rank 的总 token-bundle 数 |
-| `weighted` | 节点内代价 1、跨节点代价 `--rdma-cost` 的加权 remote |
 | `max-pair` | `max(T)` |
 | `max-ingress` | `max(sum(T, axis=0))` |
 | `max-egress` | `max(sum(T, axis=1))` |
 | `comp` | 最大 expert demand rank load / 平均 load |
-
-单 NVLink/NVSwitch 超节点通常设置 `--ranks-per-node == --num-ranks` 和 `--rdma-cost 1`。
 
 ## 2. 两种统一目标
 
@@ -80,9 +77,9 @@ rank = floor(expert_index * num_ranks / num_experts)
 
 compact 路径直接在 NumPy 数组上用 `np.add.at` 聚合，不创建逐 bundle Python 对象。
 
-### 4.2 Hierarchical spectral grouping
+### 4.2 Spectral grouping
 
-`grace_hierarchical_placement()` 先把 experts 聚成 node groups，再在每个 node 中聚成 rank groups：
+`grace_expert_placement()` 直接把 experts 聚成 `num_ranks` 个 rank groups：
 
 1. 构造对称 affinity matrix `A`。
 2. 计算 normalized affinity `D^-1/2 A D^-1/2`。
@@ -94,10 +91,10 @@ compact 路径直接在 NumPy 数组上用 `np.add.at` 聚合，不创建逐 bun
 
 ### 4.3 按顺序映射 rank
 
-GRACE 不读取 source-to-destination traffic matrix，也不求解 group-to-rank assignment。代码按 `gpu_groups` 返回顺序映射：
+GRACE 不读取 source-to-destination traffic matrix，也不求解 group-to-rank assignment。代码按 group 返回顺序映射：
 
 ```python
-rank = node * ranks_per_node + local_rank
+rank = group_index
 ```
 
 表格中的 `grace` 到此结束，因此不会把 GRACE+ 的 source-aware 优化计入论文基线。
@@ -227,21 +224,22 @@ GRACE+ JSON 保存：
 第二阶段把每个 `(source_rank, expert)` 的需求拆成整数 quota，可将同一需求分给多个副本：
 
 1. 在 `expert -> replica rank` 二分图上二分 rank 容量并求整数最大流，得到当前副本集合下全局最小的 `max compute load`；
-2. 计算复制只枚举新增权重 `(expert, target)`，必须严格改善 `(max_load, sum(load^2))`，通信量作为 tie-break；
+2. 计算复制只枚举有 source demand 的新增权重 `(expert, target)`，并且必须严格改善 `(max_load, sum(load^2))`；通信量作为 tie-break；
 3. 副本集合确定后，一次性重新 water-fill 所有专家，不逐 quota 迭代迁移；
 4. source-local-first 填充各副本容量，剩余需求优先复用通信阶段的 routing destination；
-5. 最后对完整 Top-K bundle 做一次期望通信评估。
+5. quota 按物理 rank 顺序构造 prefix；同一 token 的完整 Top-K 共享同一个位置，使相同 quota 区间尽量共用 destination；
+6. 最后对完整 Top-K bundle 做一次对应的期望通信评估。
 
 通信复制和计算复制分别只受 `max_comm_expert_per_rank` 与 `max_comp_expert_per_rank` 的每-rank 权重槽预算约束。quota 生成本身没有迭代次数，计算复制迭代最多为 `num_ranks * max_comp_expert_per_rank`。
 
-因此计算阶段不会为了降低通信而接受更差的计算峰值，也尽量不产生新的 remote destination。最终保存 `quota[source][expert][replica_index]`，最后一维与该专家的 `replicas` 顺序一致。A2A benchmark 按 quota 比例为每个 token-expert occurrence 选择副本；旧的 routing-only plan 仍兼容。
+因此计算阶段不会为了降低通信而接受更差的计算峰值，也尽量不产生新的 remote destination。最终保存 `quota[source][expert][replica_index]`，最后一维与该专家的 `replicas` 顺序一致。A2A benchmark 参考 UltraEP 的 quota-prefix 路由，为每个 token 生成一个共享位置，再对各 Top-K expert 的 prefix 查找副本；旧的 routing-only plan 仍兼容。
 
 ### 5.8 最终选择与输出
 
 最终 placement 用 `evaluate_placement()` 重算完整指标。benchmark 输出：
 
 ```text
-layer method    remote weighted max-pair max-ingress max-egress comp experts/rank solve-ms
+layer method    remote max-pair max-ingress max-egress comp experts/rank solve-ms
 0     baseline  ...
 0     grace     ...
 0     grace+    ...
@@ -257,7 +255,6 @@ layer method    remote weighted max-pair max-ingress max-egress comp experts/ran
 python benchmark/compare_grace.py \
   --input trace.pt \
   --num-ranks 8 \
-  --ranks-per-node 8 \
   --optimizer-bundles 20000 \
   --objective ingress-egress \
   --rounds 4 \

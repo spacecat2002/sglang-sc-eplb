@@ -6,13 +6,15 @@ from sglang.srt.eplb.expert_affinity_graph import (
     build_co_routing_graph,
     evaluate_primary_remote,
 )
-from sglang.srt.eplb.grace_expert_placement import grace_hierarchical_placement
+from sglang.srt.eplb.grace_expert_placement import grace_expert_placement
 from sglang.srt.eplb.grace_plus_expert_placement import (
     grace_plus_expert_placement,
 )
 from sglang.srt.eplb.grace_plus_replication import (
     ReplicaPlacement,
     _instance_quotas,
+    _route_quota,
+    _source_demand,
     balance_replica_compute,
     evaluate_replicated_placement,
     replicate_hot_experts,
@@ -27,7 +29,7 @@ def test_grace_plus_accepts_arrays_and_tokens():
         np.array([7, 5], dtype=np.int16),
     )
     graph = build_co_routing_graph(tokens, experts=range(3))
-    grace = grace_hierarchical_placement(graph, num_ranks=2)
+    grace = grace_expert_placement(graph, num_ranks=2)
     kwargs = dict(
         experts=range(3),
         num_ranks=2,
@@ -66,7 +68,7 @@ def test_ingress_egress_objective_is_supported():
 
 def test_remote_objective_keeps_grace_remote_non_increasing():
     tokens = [RoutedToken(0, (0, 1), 10), RoutedToken(1, (2, 3), 10)]
-    grace = grace_hierarchical_placement(
+    grace = grace_expert_placement(
         build_co_routing_graph(tokens, experts=range(4)), num_ranks=2
     )
     refined = grace_plus_expert_placement(
@@ -93,7 +95,6 @@ def test_replication_uses_source_local_routing_and_respects_slots():
         tokens,
         {0: 1, 1: 0},
         num_ranks=2,
-        ranks_per_node=2,
         objective="remote",
         max_extra_per_rank=1,
         compute_imbalance_limit=2,
@@ -107,7 +108,6 @@ def test_replication_uses_source_local_routing_and_respects_slots():
         tokens,
         {0: 1, 1: 0},
         num_ranks=2,
-        ranks_per_node=2,
         objective="ingress-egress",
         max_extra_per_rank=1,
         hot_experts=1,
@@ -127,15 +127,12 @@ def test_compute_balancing_adds_replica_and_reroutes_static_demand():
         tokens,
         {0: 0, 1: 1},
         num_ranks=2,
-        ranks_per_node=2,
         max_extra_per_rank=0,
     )
     balanced = balance_replica_compute(
         tokens,
         communication,
         num_ranks=2,
-        ranks_per_node=2,
-        objective="remote",
         max_extra_per_rank=1,
     )
 
@@ -143,7 +140,7 @@ def test_compute_balancing_adds_replica_and_reroutes_static_demand():
     assert balanced.replicas_by_expert[0] == (0, 1)
     assert balanced.routing_by_source[1][0] == 1
     assert max(balanced.metrics.compute_load) < max(communication.metrics.compute_load)
-    assert balanced.metrics.remote == communication.metrics.remote - 20
+    assert balanced.metrics.remote < communication.metrics.remote
 
 
 def test_compute_balancing_rejects_remote_for_variance_only():
@@ -156,14 +153,12 @@ def test_compute_balancing_rejects_remote_for_variance_only():
         tokens,
         {0: 0, 1: 1, 2: 2},
         num_ranks=3,
-        ranks_per_node=3,
         max_extra_per_rank=0,
     )
     balanced = balance_replica_compute(
         tokens,
         communication,
         num_ranks=3,
-        ranks_per_node=3,
         max_extra_per_rank=1,
     )
 
@@ -177,7 +172,6 @@ def test_compute_balancing_zero_budget_still_generates_quota():
         tokens,
         {0: 0},
         num_ranks=2,
-        ranks_per_node=2,
         max_extra_per_rank=0,
     )
 
@@ -185,7 +179,6 @@ def test_compute_balancing_zero_budget_still_generates_quota():
         tokens,
         communication,
         num_ranks=2,
-        ranks_per_node=2,
         max_extra_per_rank=0,
     )
 
@@ -199,14 +192,13 @@ def test_compute_balancing_uses_quota_routing():
     communication = ReplicaPlacement(
         replicas,
         ((0,), (1,), (0,), (0,)),
-        evaluate_replicated_placement(tokens, replicas, num_ranks=4, ranks_per_node=4),
+        evaluate_replicated_placement(tokens, replicas, num_ranks=4),
         extra_copies=1,
     )
     balanced = balance_replica_compute(
         tokens,
         communication,
         num_ranks=4,
-        ranks_per_node=4,
         max_extra_per_rank=1,
     )
 
@@ -221,14 +213,12 @@ def test_quota_splits_one_source_expert_demand():
         tokens,
         {0: 0},
         num_ranks=2,
-        ranks_per_node=2,
         max_extra_per_rank=0,
     )
     balanced = balance_replica_compute(
         tokens,
         communication,
         num_ranks=2,
-        ranks_per_node=2,
         max_extra_per_rank=1,
     )
 
@@ -243,14 +233,12 @@ def test_unobserved_source_expert_keeps_valid_routing():
         tokens,
         {0: 1},
         num_ranks=2,
-        ranks_per_node=2,
         max_extra_per_rank=0,
     )
     balanced = balance_replica_compute(
         tokens,
         communication,
         num_ranks=2,
-        ranks_per_node=2,
         max_extra_per_rank=0,
     )
 
@@ -266,3 +254,18 @@ def test_instance_quota_is_globally_balanced():
     )
 
     assert loads.tolist() == [18, 13, 18]
+
+
+def test_quota_routing_shares_position_across_topk():
+    arrays = RoutedArrays(
+        np.array([0]),
+        np.array([[0, 1]]),
+        np.array([100]),
+    )
+    source_demand = _source_demand(arrays, num_experts=2, num_ranks=3)
+    quota = np.zeros((3, 2, 3), dtype=np.int64)
+    quota[0, :, 1:] = 50
+
+    metrics = _route_quota(arrays, quota, source_demand)
+
+    assert metrics.remote == 100

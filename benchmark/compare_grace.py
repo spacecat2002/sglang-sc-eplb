@@ -18,9 +18,8 @@ from sglang.srt.eplb.expert_affinity_graph import (
     RoutedToken,
     build_co_routing_graph,
     evaluate_primary_remote,
-    evaluate_weighted_remote,
 )
-from sglang.srt.eplb.grace_expert_placement import grace_hierarchical_placement
+from sglang.srt.eplb.grace_expert_placement import grace_expert_placement
 from sglang.srt.eplb.grace_plus_expert_placement import (
     grace_plus_expert_placement,
 )
@@ -154,8 +153,6 @@ def _metrics(
     placement: Mapping[int, int],
     *,
     num_ranks: int,
-    ranks_per_node: int,
-    rdma_cost: float,
     compute_load: Sequence[int] | None = None,
 ) -> dict[str, Any]:
     placement_metrics = evaluate_placement(tokens, placement, num_ranks=num_ranks)
@@ -166,9 +163,6 @@ def _metrics(
     average = sum(loads) / num_ranks
     return {
         "remote": evaluate_primary_remote(tokens, placement),
-        "weighted_remote": evaluate_weighted_remote(
-            tokens, placement, ranks_per_node=ranks_per_node, rdma_cost=rdma_cost
-        ),
         "compute_imbalance": max(loads, default=0) / average if average else 0.0,
         "compute_load": loads,
         "expert_count": counts,
@@ -189,7 +183,6 @@ def _replica_metrics(
     average = sum(loads) / len(loads)
     return {
         "remote": metrics.remote,
-        "weighted_remote": metrics.weighted_remote,
         "compute_imbalance": max(loads, default=0) / average if average else 0.0,
         "compute_load": loads,
         "expert_count": counts,
@@ -228,10 +221,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         graph = build_co_routing_graph(
             tokens, experts=experts, source_affinity_weight=args.source_affinity_weight
         )
-        grace = grace_hierarchical_placement(
+        grace = grace_expert_placement(
             graph,
             num_ranks=args.num_ranks,
-            ranks_per_node=args.ranks_per_node,
             nonuniform_ratio=args.grace_ratio,
             equal_experts=args.equal_experts,
         )
@@ -257,9 +249,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             tokens,
             grace_plus["rank_by_expert"],
             num_ranks=args.num_ranks,
-            ranks_per_node=args.ranks_per_node,
             objective=args.objective,
-            rdma_cost=args.rdma_cost,
             hot_experts=args.hot_experts,
             candidate_ranks=args.replica_candidates,
             compute_imbalance_limit=args.replica_compute_limit,
@@ -269,9 +259,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             tokens,
             replication,
             num_ranks=args.num_ranks,
-            ranks_per_node=args.ranks_per_node,
-            objective=args.objective,
-            rdma_cost=args.rdma_cost,
             max_extra_per_rank=args.max_comp_expert_per_rank,
         )
         plus_seconds = time.perf_counter() - started
@@ -294,8 +281,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 tokens,
                 baseline_placement,
                 num_ranks=args.num_ranks,
-                ranks_per_node=args.ranks_per_node,
-                rdma_cost=args.rdma_cost,
             ),
             "placement": baseline_placement,
             "solve_seconds": 0.0,
@@ -305,8 +290,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 tokens,
                 grace.rank_by_expert,
                 num_ranks=args.num_ranks,
-                ranks_per_node=args.ranks_per_node,
-                rdma_cost=args.rdma_cost,
             ),
             "placement": grace.rank_by_expert,
             "solve_seconds": grace_seconds,
@@ -329,7 +312,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "objective": args.objective,
         "source_ep": source_ep,
         "num_ranks": args.num_ranks,
-        "ranks_per_node": args.ranks_per_node,
         "optimizer_bundles": args.optimizer_bundles,
         "layers": results,
     }
@@ -353,7 +335,6 @@ def _print(result: Mapping[str, Any]) -> None:
             "layer",
             "method",
             "remote",
-            "weighted",
             "max-pair",
             "max-ingress",
             "max-egress",
@@ -370,7 +351,6 @@ def _print(result: Mapping[str, Any]) -> None:
                     str(layer["layer"]),
                     method,
                     str(metric["remote"]),
-                    f"{metric['weighted_remote']:.0f}",
                     str(metric["max_pair_traffic"]),
                     str(metric["max_ingress"]),
                     str(metric["max_egress"]),
@@ -387,13 +367,11 @@ def main() -> None:
     parser.add_argument("--input", required=True)
     parser.add_argument("--num-ranks", type=int, required=True)
     parser.add_argument("--source-ep", type=int)
-    parser.add_argument("--ranks-per-node", type=int)
     parser.add_argument("--grace-ratio", type=float, default=0.15)
     parser.add_argument("--source-affinity-weight", type=float, default=0.0)
     parser.add_argument("--equal-experts", action="store_true")
     parser.add_argument("--optimizer-bundles", type=int, default=20_000)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--rdma-cost", type=float, default=1.0)
     parser.add_argument(
         "--objective", choices=("remote", "ingress-egress"), default="ingress-egress"
     )
@@ -413,14 +391,11 @@ def main() -> None:
     parser.add_argument("--save-grace-plus")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
-    args.ranks_per_node = args.ranks_per_node or args.num_ranks
-    if args.num_ranks < 1 or args.num_ranks % args.ranks_per_node:
-        parser.error("--ranks-per-node must be positive and divide --num-ranks")
     if (
-        args.optimizer_bundles < 0
+        args.num_ranks < 1
+        or args.optimizer_bundles < 0
         or not 0 <= args.grace_ratio < 1
         or args.source_affinity_weight < 0
-        or args.rdma_cost < 1
         or args.rounds < 0
         or args.swaps < 0
         or args.partners < 1
