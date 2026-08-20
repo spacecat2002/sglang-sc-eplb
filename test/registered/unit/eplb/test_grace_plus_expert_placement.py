@@ -13,8 +13,9 @@ from sglang.srt.eplb.grace_plus_expert_placement import (
 from sglang.srt.eplb.grace_plus_replication import (
     ReplicaPlacement,
     _instance_quotas,
+    _joint_quotas,
+    _quota_prefix,
     _route_quota,
-    _source_demand,
     balance_replica_compute,
     evaluate_replicated_placement,
     replicate_hot_experts,
@@ -256,16 +257,45 @@ def test_instance_quota_is_globally_balanced():
     assert loads.tolist() == [18, 13, 18]
 
 
-def test_quota_routing_shares_position_across_topk():
+def test_joint_quota_chooses_local_among_compute_optimal_solutions():
+    source_demand = np.array([[10, 0], [0, 10]])
+    replicas = {0: (1, 0), 1: (0, 1)}
+    routing = np.array([[0, 0], [1, 1]])
+
+    quota = _joint_quotas(source_demand, replicas, routing)
+
+    assert quota.sum(axis=(0, 1)).tolist() == [10, 10]
+    assert quota[0, 0].tolist() == [10, 0]
+    assert quota[1, 1].tolist() == [0, 10]
+
+
+def test_joint_quota_shares_rank_capacity_across_experts():
+    source_demand = np.array([[10, 0], [10, 0]])
+    replicas = {0: (0, 1), 1: (0, 1)}
+    routing = np.zeros((2, 2), dtype=np.int64)
+
+    quota = _joint_quotas(source_demand, replicas, routing)
+
+    assert quota.sum(axis=(0, 1)).tolist() == [10, 10]
+    assert quota[:, :, 0].sum() == 10
+    assert quota[:, :, 1].sum() == 10
+
+
+def test_quota_prefix_routes_local_before_remote_and_matches_counts():
     arrays = RoutedArrays(
         np.array([0]),
         np.array([[0, 1]]),
-        np.array([100]),
+        np.array([10]),
     )
-    source_demand = _source_demand(arrays, num_experts=2, num_ranks=3)
-    quota = np.zeros((3, 2, 3), dtype=np.int64)
-    quota[0, :, 1:] = 50
+    quota = np.zeros((2, 2, 2), dtype=np.int64)
+    quota[0, 0] = [6, 4]
+    quota[0, 1] = [4, 6]
+    replicas = {0: (0, 1), 1: (0, 1)}
 
-    metrics = _route_quota(arrays, quota, source_demand)
+    prefix = _quota_prefix(quota, replicas)
+    metrics = _route_quota(arrays, quota, np.array([[10, 0], [10, 0]]), replicas)
 
-    assert metrics.remote == 100
+    assert prefix[0, 0].tolist() == [6, 10]
+    assert prefix[0, 1].tolist() == [4, 10]
+    assert metrics.remote == 6
+    assert metrics.compute_load == (10, 10)

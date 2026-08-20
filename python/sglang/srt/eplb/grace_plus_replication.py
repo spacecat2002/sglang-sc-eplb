@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from typing import Mapping, Sequence
 
@@ -134,41 +135,82 @@ def _route_quota(
     arrays: RoutedArrays,
     quota: np.ndarray,
     source_demand: np.ndarray,
+    replicas: Mapping[int, Sequence[int]] | None = None,
 ) -> ReplicaMetrics:
-    """Evaluate expected traffic for shared-uniform quota-routed Top-K experts."""
+    """Evaluate exact prefix-routed traffic without expanding token bundles."""
 
     num_ranks = quota.shape[2]
-    traffic = np.zeros((num_ranks, num_ranks), dtype=np.float64)
-    compute = quota.sum(axis=(0, 1), dtype=np.int64)
+    if replicas is None:
+        replicas = {
+            expert: tuple(
+                int(rank)
+                for rank in np.flatnonzero(np.any(quota[:, expert, :] > 0, axis=0))
+            )
+            for expert in range(quota.shape[1])
+        }
+    prefix = _quota_prefix(quota, replicas)
+    counters = np.zeros((num_ranks, quota.shape[1]), dtype=np.int64)
+    traffic = np.zeros((num_ranks, num_ranks), dtype=np.int64)
+    compute = np.zeros(num_ranks, dtype=np.int64)
     for start in range(0, len(arrays), _CHUNK_SIZE):
         end = min(start + _CHUNK_SIZE, len(arrays))
         source = arrays.source_rank[start:end]
         topk = arrays.topk_experts[start:end]
         count = arrays.count[start:end]
-        demand = source_demand[topk, source[:, None]]
-        lower = np.zeros(topk.shape, dtype=np.float64)
-        for target in range(num_ranks):
-            probability = quota[source[:, None], topk, target] / demand
-            upper = lower + probability
-            order = np.argsort(lower, axis=1, kind="stable")
-            starts = np.take_along_axis(lower, order, axis=1)
-            ends = np.take_along_axis(upper, order, axis=1)
-            previous_end = np.maximum.accumulate(ends, axis=1)
-            sent = ends[:, 0] - starts[:, 0]
-            sent += np.maximum(
-                ends[:, 1:] - np.maximum(starts[:, 1:], previous_end[:, :-1]), 0
-            ).sum(axis=1)
-            remote = source != target
-            np.add.at(traffic[:, target], source[remote], count[remote] * sent[remote])
-            lower = upper
-    rounded = np.rint(traffic).astype(np.int64)
+        for row in range(len(source)):
+            source_rank = int(source[row])
+            tokens = int(count[row])
+            boundaries = {0, tokens}
+            starts = []
+            for column, expert_value in enumerate(topk[row]):
+                expert = int(expert_value)
+                ordinal = int(counters[source_rank, expert])
+                starts.append((expert, ordinal))
+                for boundary in prefix[source_rank, expert, replicas[expert]]:
+                    offset = int(boundary) - ordinal
+                    if 0 < offset < tokens:
+                        boundaries.add(offset)
+            ordered = sorted(boundaries)
+            for left, right in zip(ordered, ordered[1:]):
+                destinations = []
+                for expert, ordinal in starts:
+                    replica_ranks = replicas[expert]
+                    replica_index = int(
+                        np.searchsorted(
+                            prefix[source_rank, expert, replica_ranks],
+                            ordinal + left,
+                            side="right",
+                        )
+                    )
+                    destinations.append(replica_ranks[replica_index])
+                    compute[replica_ranks[replica_index]] += right - left
+                segment = right - left
+                for target in set(destinations):
+                    if target != source_rank:
+                        traffic[source_rank, target] += segment
+            for expert, _ in starts:
+                counters[source_rank, expert] += tokens
     return ReplicaMetrics(
-        remote=int(rounded.sum()),
-        max_pair_traffic=int(rounded.max()),
-        max_ingress=int(rounded.sum(axis=0).max()),
-        max_egress=int(rounded.sum(axis=1).max()),
+        remote=int(traffic.sum()),
+        max_pair_traffic=int(traffic.max(initial=0)),
+        max_ingress=int(traffic.sum(axis=0).max(initial=0)),
+        max_egress=int(traffic.sum(axis=1).max(initial=0)),
         compute_load=tuple(int(load) for load in compute),
     )
+
+
+def _quota_prefix(
+    quota: np.ndarray, replicas: Mapping[int, Sequence[int]]
+) -> np.ndarray:
+    """Build source/expert cumulative quotas in replica-list order."""
+
+    prefix = np.zeros_like(quota)
+    for expert, ranks in replicas.items():
+        cumulative = np.zeros(quota.shape[0], dtype=np.int64)
+        for rank in ranks:
+            cumulative += quota[:, expert, rank]
+            prefix[:, expert, rank] = cumulative
+    return prefix
 
 
 def _source_demand(
@@ -293,36 +335,112 @@ def _instance_quotas(
     return best
 
 
-def _source_quotas(
+def _joint_quotas(
     source_demand: np.ndarray,
-    instance_quota: np.ndarray,
+    replicas: Mapping[int, Sequence[int]],
     routing: np.ndarray,
 ) -> np.ndarray:
+    """Jointly minimize peak rank load, then remote source-expert traffic."""
+
     num_experts, num_ranks = source_demand.shape
+    expert_demand = source_demand.sum(axis=1)
+    _, balanced_load = _instance_quotas(expert_demand, replicas, num_ranks)
+    rank_capacity = int(balanced_load.max(initial=0))
     quota = np.zeros((num_ranks, num_experts, num_ranks), dtype=np.int64)
+    pairs = [
+        (source, expert, int(source_demand[expert, source]))
+        for expert in range(num_experts)
+        for source in range(num_ranks)
+        if source_demand[expert, source]
+    ]
+    pair_offset = 1
+    rank_offset = pair_offset + len(pairs)
+    sink = rank_offset + num_ranks
+    graph: list[list[list[int]]] = [[] for _ in range(sink + 1)]
+
+    def add_edge(left: int, right: int, capacity: int, cost: int) -> int:
+        index = len(graph[left])
+        graph[left].append([right, len(graph[right]), capacity, cost])
+        graph[right].append([left, index, 0, -cost])
+        return index
+
+    edge_by_route = {}
+    total = int(source_demand.sum())
+    baseline_traffic = np.zeros((num_ranks, num_ranks), dtype=np.int64)
     for expert in range(num_experts):
-        capacity = instance_quota[expert].copy()
-        remaining = source_demand[expert].copy()
-        local = np.minimum(remaining, capacity)
-        quota[np.arange(num_ranks), expert, np.arange(num_ranks)] = local
-        remaining -= local
-        capacity -= local
-        for source in np.argsort(-remaining, kind="stable"):
-            amount = int(remaining[source])
-            while amount:
-                targets = np.flatnonzero(capacity)
-                target = min(
-                    targets,
-                    key=lambda rank: (
-                        rank != routing[source, expert],
-                        -capacity[rank],
-                        rank,
-                    ),
-                )
-                moved = min(amount, int(capacity[target]))
-                quota[source, expert, target] += moved
-                capacity[target] -= moved
-                amount -= moved
+        for source in range(num_ranks):
+            target = int(routing[source, expert])
+            if target != source:
+                baseline_traffic[source, target] += source_demand[expert, source]
+    congestion = (
+        baseline_traffic
+        + baseline_traffic.sum(axis=0, keepdims=True)
+        + baseline_traffic.sum(axis=1, keepdims=True)
+    )
+    remote_cost = total * (int(congestion.max(initial=0)) + 1) + 1
+    for pair_index, (source, expert, amount) in enumerate(pairs):
+        node = pair_offset + pair_index
+        add_edge(0, node, amount, 0)
+        targets = sorted(
+            replicas[expert],
+            key=lambda target: (
+                target != source,
+                target != routing[source, expert],
+                target,
+            ),
+        )
+        for target in targets:
+            cost = (
+                0 if target == source else remote_cost + int(congestion[source, target])
+            )
+            edge_by_route[source, expert, target] = (
+                node,
+                add_edge(node, rank_offset + target, amount, cost),
+            )
+    for rank in range(num_ranks):
+        add_edge(rank_offset + rank, sink, rank_capacity, 0)
+
+    flow = 0
+    while flow < total:
+        distance = [None] * len(graph)
+        previous = [None] * len(graph)
+        distance[0] = 0
+        queue = deque([0])
+        queued = [False] * len(graph)
+        queued[0] = True
+        while queue:
+            node = queue.popleft()
+            queued[node] = False
+            for edge_index, (target, _, capacity, cost) in enumerate(graph[node]):
+                candidate = distance[node] + cost
+                if capacity and (
+                    distance[target] is None or candidate < distance[target]
+                ):
+                    distance[target] = candidate
+                    previous[target] = (node, edge_index)
+                    if not queued[target]:
+                        queue.append(target)
+                        queued[target] = True
+        if previous[sink] is None:
+            raise RuntimeError("replica graph cannot serve source-expert demand")
+        moved = total - flow
+        node = sink
+        while node:
+            parent, edge_index = previous[node]
+            moved = min(moved, graph[parent][edge_index][2])
+            node = parent
+        node = sink
+        while node:
+            parent, edge_index = previous[node]
+            edge = graph[parent][edge_index]
+            edge[2] -= moved
+            graph[node][edge[1]][2] += moved
+            node = parent
+        flow += moved
+
+    for (source, expert, target), (node, edge_index) in edge_by_route.items():
+        edge = graph[node][edge_index]
+        quota[source, expert, target] = graph[edge[0]][edge[1]][2]
     return quota
 
 
@@ -585,13 +703,13 @@ def balance_replica_compute(
         replica_mask[expert, target] = True
         balance_by_rank[target] += 1
         added += 1
-    instance_quota, _ = _instance_quotas(expert_demand, replicas, num_ranks)
-    quota = _source_quotas(source_demand, instance_quota, routing)
+    quota = _joint_quotas(source_demand, replicas, routing)
     routing = np.where(quota.sum(axis=2) > 0, quota.argmax(axis=2), routing)
     metrics = _route_quota(
         arrays,
         quota,
         source_demand,
+        replicas,
     )
     serialized_quota = tuple(
         tuple(

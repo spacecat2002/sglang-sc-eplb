@@ -225,14 +225,12 @@ GRACE+ JSON 保存：
 
 1. 在 `expert -> replica rank` 二分图上二分 rank 容量并求整数最大流，得到当前副本集合下全局最小的 `max compute load`；
 2. 计算复制只枚举有 source demand 的新增权重 `(expert, target)`，并且必须严格改善 `(max_load, sum(load^2))`；通信量作为 tie-break；
-3. 副本集合确定后，一次性重新 water-fill 所有专家，不逐 quota 迭代迁移；
-4. source-local-first 填充各副本容量，剩余需求优先复用通信阶段的 routing destination；
-5. quota 按物理 rank 顺序构造 prefix；同一 token 的完整 Top-K 共享同一个位置，使相同 quota 区间尽量共用 destination；
-6. 最后对完整 Top-K bundle 做一次对应的期望通信评估。
+3. 副本集合确定后，固定最小 `max compute load`，在 `(source, expert) -> replica rank` 网络上联合求整数 min-cost flow；所有 expert 共享 rank 容量，本地边成本为 0，远端边先按 remote 数量优化，再按已有 source-to-destination congestion 做次级优化；
+4. 将 quota 转成 source/expert 的 cumulative prefix，按 occurrence ordinal 模拟现场 reroute；同一 bundle 的 Top-K 使用这次模拟得到的实际目标集合，最终通信指标不再使用独立概率近似。
 
 通信复制和计算复制分别只受 `max_comm_expert_per_rank` 与 `max_comp_expert_per_rank` 的每-rank 权重槽预算约束。quota 生成本身没有迭代次数，计算复制迭代最多为 `num_ranks * max_comp_expert_per_rank`。
 
-因此计算阶段不会为了降低通信而接受更差的计算峰值，也尽量不产生新的 remote destination。最终保存 `quota[source][expert][replica_index]`，最后一维与该专家的 `replicas` 顺序一致。A2A benchmark 参考 UltraEP 的 quota-prefix 路由，为每个 token 生成一个共享位置，再对各 Top-K expert 的 prefix 查找副本；旧的 routing-only plan 仍兼容。
+因此计算阶段不会为了降低通信而接受更差的计算峰值，也尽量不产生新的 remote destination。最终保存 `quota[source][expert][replica_index]`，最后一维与该专家的 `replicas` 顺序一致。A2A benchmark 按 quota 比例为每个 token-expert occurrence 选择副本；旧的 routing-only plan 仍兼容。
 
 ### 5.8 最终选择与输出
 

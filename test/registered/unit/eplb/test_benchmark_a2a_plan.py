@@ -3,7 +3,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-import torch
 
 
 _PATH = Path(__file__).parents[4] / "benchmark" / "benchmark_a2a_plan.py"
@@ -69,25 +68,3 @@ def test_normalize_quota_accepts_disabled_and_unobserved_routes():
     assert _MODULE._normalize_quota(
         {"quota": [[[1, 0]], [[0, 0]]]}, "gate", plan, 1, 2
     ) == [[[1, 0]], [[0, 0]]]
-
-
-def test_quota_topk_shares_position_across_experts():
-    logical_topk = torch.tensor([[0, 1]] * 32)
-    replicas = torch.tensor([[1, 2], [1, 2]])
-    quota = torch.tensor([[[1, 1], [1, 1]]])
-
-    physical_topk = _MODULE._quota_topk(logical_topk, replicas, quota, 0, 1)
-
-    assert torch.all(physical_topk[:, 0] == physical_topk[:, 1])
-
-
-def test_quota_remote_accounts_for_shared_position():
-    layer = {
-        "source_rank": torch.tensor([0]),
-        "topk_experts": torch.tensor([[0, 1]]),
-        "count": torch.tensor([100]),
-    }
-    replicas = [[1, 2], [1, 2]]
-    quota = [[[50, 50], [50, 50]], [[1, 0], [1, 0]], [[0, 1], [0, 1]]]
-
-    assert _MODULE._quota_remote(layer, replicas, quota, slots=1, num_ranks=3) == 100
