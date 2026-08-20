@@ -141,3 +141,28 @@ def test_compute_balancing_adds_replica_and_reroutes_static_demand():
     assert balanced.routing_by_source[1][0] == 1
     assert max(balanced.metrics.compute_load) < max(communication.metrics.compute_load)
     assert balanced.metrics.remote == communication.metrics.remote - 20
+
+
+def test_compute_balancing_rejects_remote_for_variance_only():
+    tokens = [
+        RoutedToken(0, (0,), 10),
+        RoutedToken(1, (1,), 8),
+        RoutedToken(2, (2,), 2),
+    ]
+    communication = replicate_hot_experts(
+        tokens,
+        {0: 0, 1: 1, 2: 2},
+        num_ranks=3,
+        ranks_per_node=3,
+        max_extra_per_rank=0,
+    )
+    balanced = balance_replica_compute(
+        tokens,
+        communication,
+        num_ranks=3,
+        ranks_per_node=3,
+        max_extra_per_rank=1,
+    )
+
+    assert balanced.balance_copies == 0
+    assert balanced.metrics == communication.metrics

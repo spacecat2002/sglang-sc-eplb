@@ -224,10 +224,13 @@ GRACE+ JSON 保存：
 1. 计算旧 rank 和目标 rank 的 load 变化；
 2. 只有 `(max_load, sum(load^2))` 严格改善才接受；
 3. 如果目标 rank 没有该专家，则新增一个副本并检查副本上限；
-4. 精确更新受影响 bundle 的 destination set；
-5. 在计算改善相同的候选中，优先复用 bundle 已访问的 destination，再按 `remote` 或 `ingress-egress` 比较通信。
+4. 用 `source-expert` demand 构造通信上界，不在候选循环扫描 Top-K bundle；
+5. 优先复用已有 destination，再按 `remote` 或 `ingress-egress` 比较通信；
+6. 新增 remote 的迁移必须严格降低 `max_load`，仅改善 `sum(load^2)` 不足以接受。
 
-因此计算阶段不会为了降低通信而接受更差的计算峰值，也尽量不产生新的 remote destination。最终每个 source/expert 都有一个确定目标，保存为 `routing[R][E]`。A2A benchmark 优先使用这个 source-specific routing；没有 routing 字段的旧 plan 仍使用 local-first 兼容逻辑。
+每轮只从当前最大负载 rank 迁出需求，批量评估所有 target，并在过载需求过多时保留 `8 * num_ranks` 个最热 `(source, expert)`。总迁移次数不超过 `num_ranks * max_comp_expert_per_rank`，因此求解延迟有明确上界。
+
+因此计算阶段不会为了降低通信而接受更差的计算峰值，也尽量不产生新的 remote destination。通信上界把同一 bundle 发往同一 rank 的多个专家分别计数，适合 GPU/运行时快速求解；求解完成后再对完整 Top-K bundle 做一次精确评估。最终每个 source/expert 都有一个确定目标，保存为 `routing[R][E]`。A2A benchmark 优先使用这个 source-specific routing；没有 routing 字段的旧 plan 仍使用 local-first 兼容逻辑。
 
 ### 5.8 最终选择与输出
 
@@ -319,9 +322,9 @@ torchrun --standalone --nproc-per-node=8 benchmark/benchmark_a2a_plan.py \
 
 affinity graph 构造约为 `O(B * K^2)`；GRACE spectral decomposition 主要依赖 expert 数，而不是 bundle 数。
 
-GRACE+ move 约为 `O(rounds * E * R * average_occurrence)`。pair-swap 对候选 expert pair 的 bundle union 做 exact 扫描；`ingress-egress` 还要复制并更新 `R x R` traffic matrix，因此通常是最大热点。Replication 初始 gain 构造约为 `O(B * (R + K^2))`，每增加一个副本只重扫来自目标 source 且包含该 expert 的相关 bundle。计算均衡阶段按 source-expert 需求枚举迁移，并只扫描受影响 bundle；它比全量运行时 least-load 更可复现，但仍随热点 expert 数和 Top-K occurrence 增长。
+GRACE+ move 约为 `O(rounds * E * R * average_occurrence)`。pair-swap 对候选 expert pair 的 bundle union 做 exact 扫描；`ingress-egress` 还要复制并更新 `R x R` traffic matrix，因此通常是最大热点。Replication 初始 gain 构造约为 `O(B * (R + K^2))`，每增加一个副本只重扫来自目标 source 且包含该 expert 的相关 bundle。计算均衡先用一次 `O(B*K)` 聚合得到 source-expert demand，候选循环不再依赖 bundle 数，最后用一次 `O(B*K)` 精确评估。
 
-20M bundles 不建议在每次调参时全量求解。先用默认 20k 或更大样本选参数，再用 `--optimizer-bundles 0` 做最终 placement/评估。若 full-trace solve latency 成为硬约束，下一步应缓存 expert-pair traffic delta，而不是增加更多启发式模式。
+20M bundles 不建议在每次调参时全量执行前面的 grouping、move 和 swap。先用默认 20k 或更大样本选参数，再用 `--optimizer-bundles 0` 做最终 placement/评估。计算均衡阶段已不再逐候选扫描完整 trace；若仍需进一步压缩运行时延迟，应把 source-expert 聚合和候选归约移入现有 UltraEP CUDA kernel。
 
 ## 9. 代码位置
 

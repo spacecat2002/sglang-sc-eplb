@@ -366,7 +366,7 @@ def balance_replica_compute(
     max_extra_per_rank: int = 0,
     max_replicas_per_expert: int = 3,
 ) -> ReplicaPlacement:
-    """Add compute-driven replicas and statically reroute source-expert demand."""
+    """Quickly balance source-expert demand with communication constraints."""
 
     if objective not in {"remote", "ingress-egress"}:
         raise ValueError("invalid balance objective")
@@ -381,92 +381,163 @@ def balance_replica_compute(
     compute = np.zeros(num_ranks, dtype=np.int64)
     for source in range(num_ranks):
         np.add.at(compute, routing[source], source_demand[:, source])
-    metrics = _route(
-        arrays,
-        primary,
-        replica_mask,
-        num_ranks=num_ranks,
-        ranks_per_node=ranks_per_node,
-        rdma_cost=rdma_cost,
-        routing=routing,
-    )
+    # This is the same compact input used by UltraEP's placement kernel. It is
+    # a conservative communication proxy because Top-K bundle coalescing is
+    # intentionally left to the single exact evaluation after solving.
     traffic = np.zeros((num_ranks, num_ranks), dtype=np.int64)
     for source in range(num_ranks):
-        selected = arrays.source_rank == source
-        destinations = routing[source, arrays.topk_experts[selected]]
-        for rank in range(num_ranks):
-            sent = np.any(destinations == rank, axis=1) & (source != rank)
-            traffic[source, rank] = int(arrays.count[selected][sent].sum())
+        destinations = routing[source]
+        remote = destinations != source
+        np.add.at(traffic[source], destinations[remote], source_demand[remote, source])
     balance_by_rank = np.zeros(num_ranks, dtype=np.int64)
+    moved = np.zeros_like(source_demand, dtype=bool)
     added = 0
-    while added < num_ranks * max_extra_per_rank:
+    migrations = 0
+    max_migrations = num_ranks * max_extra_per_rank
+    while migrations < max_migrations:
         current_compute_key = (int(compute.max()), int(np.square(compute).sum()))
+        overloaded = compute == current_compute_key[0]
+        ingress_load = traffic.sum(axis=0)
+        egress_load = traffic.sum(axis=1)
+        remote_total = int(traffic.sum())
+        max_egress_without_source = np.full(num_ranks, int(egress_load.max()))
+        top_source = int(egress_load.argmax())
+        hidden_egress = egress_load.copy()
+        hidden_egress[top_source] = -1
+        max_egress_without_source[top_source] = int(hidden_egress.max())
+        row_max = traffic.max(axis=1)
+        max_pair_without_source = np.full(num_ranks, int(row_max.max()))
+        top_source = int(row_max.argmax())
+        hidden_pair = row_max.copy()
+        hidden_pair[top_source] = -1
+        max_pair_without_source[top_source] = int(hidden_pair.max())
         best = None
-        for source in range(num_ranks):
-            for expert in range(len(primary)):
-                demand = int(source_demand[expert, source])
-                old = int(routing[source, expert])
-                if demand <= 0:
-                    continue
-                indexes = np.flatnonzero(
-                    (arrays.source_rank == source)
-                    & np.any(arrays.topk_experts == expert, axis=1)
+        candidate_expert, candidate_source = np.nonzero(
+            (source_demand > 0) & ~moved & overloaded[routing.T]
+        )
+        candidate_demand = source_demand[candidate_expert, candidate_source]
+        # ponytail: bounded hot set keeps runtime predictable; use a GPU
+        # reduction if more candidates are ever needed without this ceiling.
+        candidate_limit = 8 * num_ranks
+        if len(candidate_demand) > candidate_limit:
+            hottest = np.argpartition(candidate_demand, -candidate_limit)[
+                -candidate_limit:
+            ]
+            candidate_expert = candidate_expert[hottest]
+            candidate_source = candidate_source[hottest]
+        for expert, source in zip(candidate_expert, candidate_source):
+            demand = int(source_demand[expert, source])
+            old = int(routing[source, expert])
+            targets = np.arange(num_ranks)
+            needs_copy = ~replica_mask[expert]
+            feasible = targets != old
+            feasible &= ~needs_copy | (
+                (balance_by_rank < max_extra_per_rank)
+                & (len(replicas[expert]) < max_replicas_per_expert)
+            )
+
+            without_old = compute.copy()
+            without_old[old] = -1
+            unaffected = np.full(num_ranks, int(without_old.max()))
+            top = int(without_old.argmax())
+            without_old[top] = -1
+            unaffected[top] = int(without_old.max())
+            old_compute = int(compute[old] - demand)
+            target_compute = compute + demand
+            next_max = np.maximum(np.maximum(unaffected, target_compute), old_compute)
+            next_squares = (
+                current_compute_key[1]
+                - int(compute[old] ** 2)
+                + old_compute**2
+                - np.square(compute)
+                + np.square(target_compute)
+            )
+            feasible &= (next_max < current_compute_key[0]) | (
+                (next_max == current_compute_key[0])
+                & (next_squares < current_compute_key[1])
+            )
+
+            old_delta = -demand if source != old else 0
+            target_delta = np.where(targets != source, demand, 0)
+            remote = remote_total + old_delta + target_delta
+            feasible &= (old_delta + target_delta <= 0) | (
+                next_max < current_compute_key[0]
+            )
+            if not np.any(feasible):
+                continue
+
+            next_old_traffic = int(traffic[source, old] + old_delta)
+            next_target_traffic = traffic[source] + target_delta
+            row_without_old = traffic[source].copy()
+            row_without_old[old] = -1
+            unaffected_pair = np.full(num_ranks, int(row_without_old.max()))
+            top = int(row_without_old.argmax())
+            row_without_old[top] = -1
+            unaffected_pair[top] = int(row_without_old.max())
+            max_pair = np.maximum(
+                np.maximum(unaffected_pair, next_target_traffic),
+                max(next_old_traffic, int(max_pair_without_source[source])),
+            )
+
+            ingress_without_old = ingress_load.copy()
+            ingress_without_old[old] = -1
+            unaffected_ingress = np.full(num_ranks, int(ingress_without_old.max()))
+            top = int(ingress_without_old.argmax())
+            ingress_without_old[top] = -1
+            unaffected_ingress[top] = int(ingress_without_old.max())
+            next_ingress = np.maximum(
+                np.maximum(unaffected_ingress, ingress_load + target_delta),
+                int(ingress_load[old] + old_delta),
+            )
+            next_source_egress = int(egress_load[source] + old_delta) + target_delta
+            next_egress = np.maximum(
+                max_egress_without_source[source], next_source_egress
+            )
+            bottleneck = np.maximum(next_ingress, next_egress)
+            adds_destination = (target_delta > 0) & (traffic[source] == 0)
+            indexes = np.flatnonzero(feasible)
+            communication = (
+                (bottleneck, max_pair, remote)
+                if objective == "ingress-egress"
+                else (remote, bottleneck, max_pair)
+            )
+            order = np.lexsort(
+                (
+                    targets[indexes],
+                    needs_copy[indexes],
+                    communication[2][indexes],
+                    communication[1][indexes],
+                    communication[0][indexes],
+                    adds_destination[indexes],
+                    next_squares[indexes],
+                    next_max[indexes],
                 )
-                old_destinations = routing[source, arrays.topk_experts[indexes]]
-                for target in range(num_ranks):
-                    if target == old:
-                        continue
-                    needs_copy = not replica_mask[expert, target]
-                    if needs_copy and (
-                        balance_by_rank[target] >= max_extra_per_rank
-                        or len(replicas[expert]) >= max_replicas_per_expert
-                    ):
-                        continue
-                    next_compute = compute.copy()
-                    next_compute[old] -= demand
-                    next_compute[target] += demand
-                    compute_key = (
-                        int(next_compute.max()),
-                        int(np.square(next_compute).sum()),
-                    )
-                    if compute_key >= current_compute_key:
-                        continue
-                    old_removed = (old_destinations == old).sum(axis=1) == 1
-                    target_added = ~np.any(old_destinations == target, axis=1)
-                    old_delta = -int(
-                        arrays.count[indexes][old_removed & (source != old)].sum()
-                    )
-                    target_delta = int(
-                        arrays.count[indexes][target_added & (source != target)].sum()
-                    )
-                    next_traffic = traffic.copy()
-                    next_traffic[source, old] += old_delta
-                    next_traffic[source, target] += target_delta
-                    remote = int(next_traffic.sum())
-                    ingress = int(next_traffic.sum(axis=0).max())
-                    egress = int(next_traffic.sum(axis=1).max())
-                    pair = int(next_traffic.max())
-                    communication_key = (
-                        (max(ingress, egress), pair, remote)
-                        if objective == "ingress-egress"
-                        else (remote, max(ingress, egress), pair)
-                    )
-                    candidate = (
-                        compute_key
-                        + (int(target_added.any()),)
-                        + communication_key
-                        + (int(needs_copy), expert, source, target),
-                        expert,
-                        source,
-                        old,
-                        target,
-                        demand,
-                        old_delta,
-                        target_delta,
-                        needs_copy,
-                    )
-                    if best is None or candidate[0] < best[0]:
-                        best = candidate
+            )
+            target = int(indexes[order[0]])
+            candidate = (
+                (
+                    int(next_max[target]),
+                    int(next_squares[target]),
+                    int(adds_destination[target]),
+                    int(communication[0][target]),
+                    int(communication[1][target]),
+                    int(communication[2][target]),
+                    int(needs_copy[target]),
+                    expert,
+                    source,
+                    target,
+                ),
+                expert,
+                source,
+                old,
+                target,
+                demand,
+                old_delta,
+                int(target_delta[target]),
+                bool(needs_copy[target]),
+            )
+            if best is None or candidate[0] < best[0]:
+                best = candidate
         if best is None:
             break
         (
@@ -486,10 +557,12 @@ def balance_replica_compute(
             balance_by_rank[target] += 1
             added += 1
         routing[source, expert] = target
+        moved[expert, source] = True
         compute[old] -= demand
         compute[target] += demand
         traffic[source, old] += old_delta
         traffic[source, target] += target_delta
+        migrations += 1
     metrics = _route(
         arrays,
         primary,
