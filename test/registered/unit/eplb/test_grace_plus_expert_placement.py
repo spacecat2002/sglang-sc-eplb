@@ -170,7 +170,7 @@ def test_compute_balancing_rejects_remote_for_variance_only():
     assert balanced.metrics == communication.metrics
 
 
-def test_compute_balancing_zero_budget_is_disabled():
+def test_compute_balancing_zero_budget_still_generates_quota():
     tokens = [RoutedToken(0, (0,), 10), RoutedToken(1, (0,), 10)]
     communication = replicate_hot_experts(
         tokens,
@@ -180,16 +180,16 @@ def test_compute_balancing_zero_budget_is_disabled():
         max_extra_per_rank=0,
     )
 
-    assert (
-        balance_replica_compute(
-            tokens,
-            communication,
-            num_ranks=2,
-            ranks_per_node=2,
-            max_extra_per_rank=0,
-        )
-        is communication
+    balanced = balance_replica_compute(
+        tokens,
+        communication,
+        num_ranks=2,
+        ranks_per_node=2,
+        max_extra_per_rank=0,
     )
+
+    assert balanced.balance_copies == 0
+    assert balanced.quota_by_source == (((10,),), ((10,),))
 
 
 def test_compute_balancing_uses_quota_routing():

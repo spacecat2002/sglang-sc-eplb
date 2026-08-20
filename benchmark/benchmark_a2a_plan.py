@@ -96,6 +96,8 @@ def _normalize_quota(
     if not isinstance(values, Mapping) or "quota" not in values:
         return None
     quota = values["quota"]
+    if quota is None:
+        return None
     if (
         not isinstance(quota, list)
         or len(quota) != num_ranks
@@ -104,7 +106,6 @@ def _normalize_quota(
             not isinstance(values, list)
             or len(values) != len(plan[expert])
             or not all(isinstance(value, int) and value >= 0 for value in values)
-            or not sum(values)
             for row in quota
             for expert, values in enumerate(row)
         )
@@ -236,6 +237,20 @@ def _load(args: argparse.Namespace):
         for expert in range(num_experts)
     ):
         raise ValueError("routing selects a rank without that expert replica")
+    if quota is not None:
+        quota = [[list(values) for values in row] for row in quota]
+        for source, row in enumerate(quota):
+            for expert, values in enumerate(row):
+                if sum(values):
+                    continue
+                target = (
+                    routing[source][expert]
+                    if routing is not None
+                    else source
+                    if source in plan[expert]
+                    else plan[expert][0]
+                )
+                values[plan[expert].index(target)] = 1
     layouts = {"baseline": _baseline(num_experts, num_ranks), "plan": plan}
     slots, maps = _physical_maps(
         layouts,

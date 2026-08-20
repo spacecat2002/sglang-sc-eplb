@@ -407,8 +407,6 @@ def balance_replica_compute(
         raise ValueError("invalid balance objective")
     if max_extra_per_rank < 0:
         raise ValueError("invalid balance replication limits")
-    if max_extra_per_rank == 0:
-        return placement
     arrays = as_routed_arrays(tokens)
     replicas, primary, replica_mask = _replica_arrays(
         arrays, placement.replicas_by_expert, num_ranks

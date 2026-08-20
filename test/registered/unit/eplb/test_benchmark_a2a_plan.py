@@ -59,3 +59,12 @@ def test_normalize_quota_matches_replica_order():
     plan = {0: (0, 1), 1: (1,)}
 
     assert _MODULE._normalize_quota(raw, "gate", plan, 2, 2) == raw["gate"]["quota"]
+
+
+def test_normalize_quota_accepts_disabled_and_unobserved_routes():
+    plan = {0: (0, 1)}
+
+    assert _MODULE._normalize_quota({"quota": None}, "gate", plan, 1, 2) is None
+    assert _MODULE._normalize_quota(
+        {"quota": [[[1, 0]], [[0, 0]]]}, "gate", plan, 1, 2
+    ) == [[[1, 0]], [[0, 0]]]

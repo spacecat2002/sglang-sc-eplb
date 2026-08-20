@@ -304,7 +304,7 @@ python benchmark/compare_grace.py \
 | `--replica-candidates` | `4` | 每个 expert 保留的候选 target rank 数 |
 | `--replica-compute-limit` | `1.25` | 复制路由的最大计算不均衡 |
 | `--max-comm-expert-per-rank` | `0` | 通信优化阶段单 rank 最多新增的专家权重数；0 禁用该阶段 |
-| `--max-comp-expert-per-rank` | `0` | 计算均衡阶段单 rank 最多新增的专家权重数；0 禁用该阶段 |
+| `--max-comp-expert-per-rank` | `0` | 计算均衡阶段单 rank 最多新增的专家权重数；0 不新增权重，但仍生成 quota |
 
 ## 7. DeepEP 实测
 

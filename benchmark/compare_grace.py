@@ -454,14 +454,18 @@ def main() -> None:
         Path(args.save_grace_plus).write_text(
             json.dumps(
                 {
-                    layer["gate"]: {
-                        "replicas": {
+                    layer["gate"]: dict(
+                        replicas={
                             str(e): list(ranks)
                             for e, ranks in sorted(layer["grace+"]["placement"].items())
                         },
-                        "routing": [list(row) for row in layer["grace+"]["routing"]],
-                        "quota": layer["grace+"]["quota"],
-                    }
+                        routing=[list(row) for row in layer["grace+"]["routing"]],
+                        **(
+                            {"quota": layer["grace+"]["quota"]}
+                            if layer["grace+"]["quota"] is not None
+                            else {}
+                        ),
+                    )
                     for layer in result["layers"]
                 },
                 indent=2,
