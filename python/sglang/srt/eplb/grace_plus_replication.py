@@ -372,6 +372,8 @@ def balance_replica_compute(
         raise ValueError("invalid balance objective")
     if max_extra_per_rank < 0 or max_replicas_per_expert < 1:
         raise ValueError("invalid balance replication limits")
+    if max_extra_per_rank == 0:
+        return placement
     arrays = as_routed_arrays(tokens)
     replicas, primary, replica_mask = _replica_arrays(
         arrays, placement.replicas_by_expert, num_ranks
@@ -390,11 +392,8 @@ def balance_replica_compute(
         remote = destinations != source
         np.add.at(traffic[source], destinations[remote], source_demand[remote, source])
     balance_by_rank = np.zeros(num_ranks, dtype=np.int64)
-    moved = np.zeros_like(source_demand, dtype=bool)
     added = 0
-    migrations = 0
-    max_migrations = num_ranks * max_extra_per_rank
-    while migrations < max_migrations:
+    while True:
         current_compute_key = (int(compute.max()), int(np.square(compute).sum()))
         overloaded = compute == current_compute_key[0]
         ingress_load = traffic.sum(axis=0)
@@ -413,18 +412,8 @@ def balance_replica_compute(
         max_pair_without_source[top_source] = int(hidden_pair.max())
         best = None
         candidate_expert, candidate_source = np.nonzero(
-            (source_demand > 0) & ~moved & overloaded[routing.T]
+            (source_demand > 0) & overloaded[routing.T]
         )
-        candidate_demand = source_demand[candidate_expert, candidate_source]
-        # ponytail: bounded hot set keeps runtime predictable; use a GPU
-        # reduction if more candidates are ever needed without this ceiling.
-        candidate_limit = 8 * num_ranks
-        if len(candidate_demand) > candidate_limit:
-            hottest = np.argpartition(candidate_demand, -candidate_limit)[
-                -candidate_limit:
-            ]
-            candidate_expert = candidate_expert[hottest]
-            candidate_source = candidate_source[hottest]
         for expert, source in zip(candidate_expert, candidate_source):
             demand = int(source_demand[expert, source])
             old = int(routing[source, expert])
@@ -557,12 +546,10 @@ def balance_replica_compute(
             balance_by_rank[target] += 1
             added += 1
         routing[source, expert] = target
-        moved[expert, source] = True
         compute[old] -= demand
         compute[target] += demand
         traffic[source, old] += old_delta
         traffic[source, target] += target_delta
-        migrations += 1
     metrics = _route(
         arrays,
         primary,

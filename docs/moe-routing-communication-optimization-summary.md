@@ -228,7 +228,7 @@ GRACE+ JSON 保存：
 5. 优先复用已有 destination，再按 `remote` 或 `ingress-egress` 比较通信；
 6. 新增 remote 的迁移必须严格降低 `max_load`，仅改善 `sum(load^2)` 不足以接受。
 
-每轮只从当前最大负载 rank 迁出需求，批量评估所有 target，并在过载需求过多时保留 `8 * num_ranks` 个最热 `(source, expert)`。总迁移次数不超过 `num_ranks * max_comp_expert_per_rank`，因此求解延迟有明确上界。
+每轮只从当前最大负载 rank 迁出需求，并批量评估所有 target。所有可改善的 `(source, expert)` 都会参与，不截断热点候选或已有副本的 reroute；新副本仍受 `max_comp_expert_per_rank` 限制。
 
 因此计算阶段不会为了降低通信而接受更差的计算峰值，也尽量不产生新的 remote destination。通信上界把同一 bundle 发往同一 rank 的多个专家分别计数，适合 GPU/运行时快速求解；求解完成后再对完整 Top-K bundle 做一次精确评估。最终每个 source/expert 都有一个确定目标，保存为 `routing[R][E]`。A2A benchmark 优先使用这个 source-specific routing；没有 routing 字段的旧 plan 仍使用 local-first 兼容逻辑。
 

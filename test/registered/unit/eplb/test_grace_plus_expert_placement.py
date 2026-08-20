@@ -166,3 +166,25 @@ def test_compute_balancing_rejects_remote_for_variance_only():
 
     assert balanced.balance_copies == 0
     assert balanced.metrics == communication.metrics
+
+
+def test_compute_balancing_zero_budget_is_disabled():
+    tokens = [RoutedToken(0, (0,), 10), RoutedToken(1, (0,), 10)]
+    communication = replicate_hot_experts(
+        tokens,
+        {0: 0},
+        num_ranks=2,
+        ranks_per_node=2,
+        max_extra_per_rank=0,
+    )
+
+    assert (
+        balance_replica_compute(
+            tokens,
+            communication,
+            num_ranks=2,
+            ranks_per_node=2,
+            max_extra_per_rank=0,
+        )
+        is communication
+    )
