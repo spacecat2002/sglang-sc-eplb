@@ -85,6 +85,34 @@ def _normalize_routing(
     return routing
 
 
+def _normalize_quota(
+    raw: Mapping[str, object],
+    gate: str,
+    plan: Mapping[int, Sequence[int]],
+    num_experts: int,
+    num_ranks: int,
+) -> list[list[list[int]]] | None:
+    values = raw.get(gate, raw)
+    if not isinstance(values, Mapping) or "quota" not in values:
+        return None
+    quota = values["quota"]
+    if (
+        not isinstance(quota, list)
+        or len(quota) != num_ranks
+        or any(not isinstance(row, list) or len(row) != num_experts for row in quota)
+        or any(
+            not isinstance(values, list)
+            or len(values) != len(plan[expert])
+            or not all(isinstance(value, int) and value >= 0 for value in values)
+            or not sum(values)
+            for row in quota
+            for expert, values in enumerate(row)
+        )
+    ):
+        raise ValueError("plan contains invalid quota routing")
+    return quota
+
+
 def _baseline(num_experts: int, num_ranks: int) -> dict[int, tuple[int, ...]]:
     return {
         expert: (min(expert * num_ranks // num_experts, num_ranks - 1),)
@@ -124,6 +152,20 @@ def _physical_maps(
     return slots, maps
 
 
+def _physical_replicas(
+    layout: Mapping[int, Sequence[int]], slots: int, num_ranks: int
+) -> list[list[int]]:
+    next_slot = [0] * num_ranks
+    result = []
+    for expert in range(len(layout)):
+        physical = []
+        for rank in layout[expert]:
+            physical.append(rank * slots + next_slot[rank])
+            next_slot[rank] += 1
+        result.append(physical)
+    return result
+
+
 def _remote(
     layer: Mapping[str, object], mapping: Sequence[Sequence[int]], slots: int
 ) -> int:
@@ -138,6 +180,36 @@ def _remote(
         int(count[torch.any(destinations == rank, dim=1) & (source != rank)].sum())
         for rank in range(mapping.shape[0])
     )
+
+
+def _quota_remote(
+    layer: Mapping[str, object],
+    physical_replicas: Sequence[Sequence[int]],
+    quota: Sequence[Sequence[Sequence[int]]],
+    slots: int,
+    num_ranks: int,
+) -> int:
+    import torch
+
+    probabilities = torch.zeros(
+        (num_ranks, len(physical_replicas), num_ranks), dtype=torch.float64
+    )
+    for source, row in enumerate(quota):
+        for expert, values in enumerate(row):
+            total = sum(values)
+            for physical, value in zip(physical_replicas[expert], values):
+                probabilities[source, expert, physical // slots] = value / total
+    source = layer["source_rank"].long()
+    topk = layer["topk_experts"].long()
+    count = layer["count"].double()
+    remote = 0.0
+    for target in range(num_ranks):
+        sent = 1.0 - torch.prod(
+            1.0 - probabilities[source[:, None], topk, target], dim=1
+        )
+        selected = source != target
+        remote += float((count[selected] * sent[selected]).sum())
+    return round(remote)
 
 
 def _load(args: argparse.Namespace):
@@ -157,6 +229,7 @@ def _load(args: argparse.Namespace):
     raw_plan = json.loads(Path(args.plan).read_text(encoding="utf-8"))
     plan = _normalize_plan(raw_plan, gate, num_experts, num_ranks)
     routing = _normalize_routing(raw_plan, gate, num_experts, num_ranks)
+    quota = _normalize_quota(raw_plan, gate, plan, num_experts, num_ranks)
     if routing is not None and any(
         routing[source][expert] not in plan[expert]
         for source in range(num_ranks)
@@ -170,7 +243,35 @@ def _load(args: argparse.Namespace):
         num_ranks,
         routes={"baseline": None, "plan": routing},
     )
-    return layer, gate, num_experts, num_ranks, slots, maps
+    return (
+        layer,
+        gate,
+        num_experts,
+        num_ranks,
+        slots,
+        maps,
+        quota,
+        _physical_replicas(plan, slots, num_ranks),
+    )
+
+
+def _quota_topk(logical_topk, physical_replicas, quota, source: int, seed: int):
+    import torch
+
+    result = torch.empty_like(logical_topk)
+    generator = torch.Generator(device=logical_topk.device).manual_seed(seed + source)
+    for expert in torch.unique(logical_topk).tolist():
+        selected = logical_topk == expert
+        replicas = physical_replicas[expert]
+        probabilities = quota[source, expert, : len(replicas)].float()
+        choices = torch.multinomial(
+            probabilities,
+            int(selected.sum()),
+            replacement=True,
+            generator=generator,
+        )
+        result[selected] = replicas[choices]
+    return result
 
 
 def _sample(layer, rank: int, num_tokens: int, seed: int):
@@ -256,7 +357,7 @@ def _worker(local_rank: int, args: argparse.Namespace) -> None:
     import torch
     import torch.distributed as dist
 
-    layer, gate, num_experts, num_ranks, slots, maps = _load(args)
+    layer, gate, num_experts, num_ranks, slots, maps, quota, replicas = _load(args)
     torch.cuda.set_device(local_rank)
     dist.init_process_group(
         "nccl",
@@ -286,6 +387,24 @@ def _worker(local_rank: int, args: argparse.Namespace) -> None:
         name: torch.tensor(mapping, dtype=torch.int64, device="cuda")
         for name, mapping in maps.items()
     }
+    max_replicas = max(map(len, replicas))
+    quota = (
+        torch.tensor(
+            [
+                [values + [0] * (max_replicas - len(values)) for values in row]
+                for row in quota
+            ],
+            dtype=torch.int64,
+            device="cuda",
+        )
+        if quota
+        else None
+    )
+    replicas = torch.tensor(
+        [row + [-1] * (max_replicas - len(row)) for row in replicas],
+        dtype=torch.int64,
+        device="cuda",
+    )
     logical_topk = _sample(layer, local_rank, args.tokens_per_rank, args.seed).cuda()
     x = torch.randn(
         (args.tokens_per_rank, args.hidden), dtype=torch.bfloat16, device="cuda"
@@ -296,7 +415,17 @@ def _worker(local_rank: int, args: argparse.Namespace) -> None:
     for repeat in range(args.repeats):
         order = tuple(maps) if repeat % 2 == 0 else tuple(reversed(maps))
         for name in order:
-            topk = maps[name][local_rank, logical_topk]
+            topk = (
+                _quota_topk(
+                    logical_topk,
+                    replicas,
+                    quota,
+                    local_rank,
+                    args.seed + repeat,
+                )
+                if name == "plan" and quota is not None
+                else maps[name][local_rank, logical_topk]
+            )
             destinations = topk // slots
             local_remote = torch.zeros((), dtype=torch.int64, device="cuda")
             for rank in range(num_ranks):
@@ -386,7 +515,7 @@ def main() -> None:
         or min(args.warmups, args.num_sms) < 0
     ):
         parser.error("invalid benchmark parameters")
-    layer, gate, num_experts, num_ranks, slots, maps = _load(args)
+    layer, gate, num_experts, num_ranks, slots, maps, quota, replicas = _load(args)
     if args.dry_run:
         print(
             json.dumps(
@@ -396,7 +525,11 @@ def main() -> None:
                     "num_experts": num_experts,
                     "physical_slots_per_rank": slots,
                     "remote": {
-                        name: _remote(layer, mapping, slots)
+                        name: (
+                            _quota_remote(layer, replicas, quota, slots, num_ranks)
+                            if name == "plan" and quota is not None
+                            else _remote(layer, mapping, slots)
+                        )
                         for name, mapping in maps.items()
                     },
                 },

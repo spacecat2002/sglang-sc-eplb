@@ -11,7 +11,9 @@ from sglang.srt.eplb.grace_plus_expert_placement import (
     grace_plus_expert_placement,
 )
 from sglang.srt.eplb.grace_plus_replication import (
+    ReplicaPlacement,
     balance_replica_compute,
+    evaluate_replicated_placement,
     replicate_hot_experts,
 )
 
@@ -188,3 +190,47 @@ def test_compute_balancing_zero_budget_is_disabled():
         )
         is communication
     )
+
+
+def test_compute_balancing_uses_quota_routing():
+    tokens = [RoutedToken(source, (0,), 20) for source in range(4)]
+    replicas = {0: (0, 1)}
+    communication = ReplicaPlacement(
+        replicas,
+        ((0,), (1,), (0,), (0,)),
+        evaluate_replicated_placement(tokens, replicas, num_ranks=4, ranks_per_node=4),
+        extra_copies=1,
+    )
+    balanced = balance_replica_compute(
+        tokens,
+        communication,
+        num_ranks=4,
+        ranks_per_node=4,
+        max_extra_per_rank=1,
+    )
+
+    assert balanced.replicas_by_expert[0] == (0, 1, 2, 3)
+    assert balanced.metrics.compute_load == (20, 20, 20, 20)
+    assert balanced.quota_by_source is not None
+
+
+def test_quota_splits_one_source_expert_demand():
+    tokens = [RoutedToken(0, (0,), 100), RoutedToken(1, (0,), 20)]
+    communication = replicate_hot_experts(
+        tokens,
+        {0: 0},
+        num_ranks=2,
+        ranks_per_node=2,
+        max_extra_per_rank=0,
+    )
+    balanced = balance_replica_compute(
+        tokens,
+        communication,
+        num_ranks=2,
+        ranks_per_node=2,
+        max_extra_per_rank=1,
+    )
+
+    assert balanced.metrics.compute_load == (60, 60)
+    assert balanced.quota_by_source[0][0] == (60, 40)
+    assert balanced.quota_by_source[1][0] == (0, 20)

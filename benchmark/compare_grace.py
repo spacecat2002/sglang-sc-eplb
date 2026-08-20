@@ -264,7 +264,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             candidate_ranks=args.replica_candidates,
             compute_imbalance_limit=args.replica_compute_limit,
             max_extra_per_rank=args.max_comm_expert_per_rank,
-            max_replicas_per_expert=args.max_replicas_per_expert,
         )
         balanced = balance_replica_compute(
             tokens,
@@ -274,7 +273,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             objective=args.objective,
             rdma_cost=args.rdma_cost,
             max_extra_per_rank=args.max_comp_expert_per_rank,
-            max_replicas_per_expert=args.max_replicas_per_expert,
         )
         plus_seconds = time.perf_counter() - started
         total_tokens = (
@@ -317,6 +315,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "metrics": _replica_metrics(balanced.metrics, balanced.replicas_by_expert),
             "placement": balanced.replicas_by_expert,
             "routing": balanced.routing_by_source,
+            "quota": balanced.quota_by_source,
             "extra_copies": replication.extra_copies,
             "balance_copies": balanced.balance_copies,
             "solve_seconds": grace_seconds + plus_seconds,
@@ -410,7 +409,6 @@ def main() -> None:
     parser.add_argument("--replica-compute-limit", type=float, default=1.25)
     parser.add_argument("--max-comm-expert-per-rank", type=int, default=0)
     parser.add_argument("--max-comp-expert-per-rank", type=int, default=0)
-    parser.add_argument("--max-replicas-per-expert", type=int, default=2)
     parser.add_argument("--save-grace")
     parser.add_argument("--save-grace-plus")
     parser.add_argument("--json", action="store_true")
@@ -429,7 +427,7 @@ def main() -> None:
         or not 0 <= args.capacity_ratio < 1
         or args.compute_limit < 1
         or args.hot_experts < 0
-        or min(args.replica_candidates, args.max_replicas_per_expert) < 1
+        or args.replica_candidates < 1
         or args.max_comm_expert_per_rank < 0
         or args.max_comp_expert_per_rank < 0
         or args.replica_compute_limit < 1
@@ -459,11 +457,10 @@ def main() -> None:
                     layer["gate"]: {
                         "replicas": {
                             str(e): list(ranks)
-                            for e, ranks in sorted(
-                                layer["grace+"]["placement"].items()
-                            )
+                            for e, ranks in sorted(layer["grace+"]["placement"].items())
                         },
                         "routing": [list(row) for row in layer["grace+"]["routing"]],
+                        "quota": layer["grace+"]["quota"],
                     }
                     for layer in result["layers"]
                 },

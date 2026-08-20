@@ -35,6 +35,7 @@ class ReplicaPlacement:
     metrics: ReplicaMetrics
     extra_copies: int
     balance_copies: int = 0
+    quota_by_source: tuple[tuple[tuple[int, ...], ...], ...] | None = None
 
 
 def _replica_arrays(
@@ -138,6 +139,45 @@ def evaluate_replicated_placement(
         num_ranks=num_ranks,
         ranks_per_node=ranks_per_node,
         rdma_cost=rdma_cost,
+    )
+
+
+def _route_quota(
+    arrays: RoutedArrays,
+    quota: np.ndarray,
+    source_demand: np.ndarray,
+    *,
+    ranks_per_node: int,
+    rdma_cost: float,
+) -> ReplicaMetrics:
+    """Evaluate expected traffic for independently quota-routed Top-K experts."""
+
+    num_ranks = quota.shape[2]
+    traffic = np.zeros((num_ranks, num_ranks), dtype=np.float64)
+    compute = quota.sum(axis=(0, 1), dtype=np.int64)
+    for start in range(0, len(arrays), _CHUNK_SIZE):
+        end = min(start + _CHUNK_SIZE, len(arrays))
+        source = arrays.source_rank[start:end]
+        topk = arrays.topk_experts[start:end]
+        count = arrays.count[start:end]
+        demand = source_demand[topk, source[:, None]]
+        for target in range(num_ranks):
+            probability = quota[source[:, None], topk, target] / demand
+            sent = 1.0 - np.prod(1.0 - probability, axis=1)
+            remote = source != target
+            np.add.at(traffic[:, target], source[remote], count[remote] * sent[remote])
+    source_node = np.arange(num_ranks)[:, None] // ranks_per_node
+    target_node = np.arange(num_ranks)[None, :] // ranks_per_node
+    costs = np.where(source_node == target_node, 1.0, rdma_cost)
+    np.fill_diagonal(costs, 0.0)
+    rounded = np.rint(traffic).astype(np.int64)
+    return ReplicaMetrics(
+        remote=int(rounded.sum()),
+        weighted_remote=float((traffic * costs).sum()),
+        max_pair_traffic=int(rounded.max()),
+        max_ingress=int(rounded.sum(axis=0).max()),
+        max_egress=int(rounded.sum(axis=1).max()),
+        compute_load=tuple(int(load) for load in compute),
     )
 
 
@@ -249,7 +289,6 @@ def replicate_hot_experts(
     candidate_ranks: int = 4,
     compute_imbalance_limit: float = 1.25,
     max_extra_per_rank: int = 0,
-    max_replicas_per_expert: int = 2,
 ) -> ReplicaPlacement:
     """Greedily add the globally best feasible source-local replica."""
 
@@ -257,7 +296,7 @@ def replicate_hot_experts(
         raise ValueError("invalid replication objective")
     if num_ranks < 1 or ranks_per_node < 1 or num_ranks % ranks_per_node:
         raise ValueError("ranks_per_node must divide num_ranks")
-    if hot_experts < 0 or min(candidate_ranks, max_replicas_per_expert) < 1:
+    if hot_experts < 0 or candidate_ranks < 1:
         raise ValueError("invalid replication limits")
     if max_extra_per_rank < 0:
         raise ValueError("max_extra_per_rank must be non-negative")
@@ -279,10 +318,7 @@ def replicate_hot_experts(
     while added < num_ranks * max_extra_per_rank:
         best = None
         for expert in hot:
-            if (
-                expert not in replicas
-                or len(replicas[expert]) >= max_replicas_per_expert
-            ):
+            if expert not in replicas:
                 continue
             targets = sorted(
                 (
@@ -364,13 +400,12 @@ def balance_replica_compute(
     objective: str = "ingress-egress",
     rdma_cost: float = 1.0,
     max_extra_per_rank: int = 0,
-    max_replicas_per_expert: int = 3,
 ) -> ReplicaPlacement:
     """Quickly balance source-expert demand with communication constraints."""
 
     if objective not in {"remote", "ingress-egress"}:
         raise ValueError("invalid balance objective")
-    if max_extra_per_rank < 0 or max_replicas_per_expert < 1:
+    if max_extra_per_rank < 0:
         raise ValueError("invalid balance replication limits")
     if max_extra_per_rank == 0:
         return placement
@@ -380,22 +415,23 @@ def balance_replica_compute(
     )
     routing = np.asarray(placement.routing_by_source, dtype=np.intp).copy()
     source_demand = _source_demand(arrays, len(primary), num_ranks)
-    compute = np.zeros(num_ranks, dtype=np.int64)
+    quota = np.zeros((num_ranks, len(primary), num_ranks), dtype=np.int64)
     for source in range(num_ranks):
-        np.add.at(compute, routing[source], source_demand[:, source])
+        quota[source, np.arange(len(primary)), routing[source]] = source_demand[
+            :, source
+        ]
+    compute = quota.sum(axis=(0, 1), dtype=np.int64)
     # This is the same compact input used by UltraEP's placement kernel. It is
     # a conservative communication proxy because Top-K bundle coalescing is
     # intentionally left to the single exact evaluation after solving.
     traffic = np.zeros((num_ranks, num_ranks), dtype=np.int64)
     for source in range(num_ranks):
-        destinations = routing[source]
-        remote = destinations != source
-        np.add.at(traffic[source], destinations[remote], source_demand[remote, source])
+        traffic[source] = quota[source].sum(axis=0)
+        traffic[source, source] = 0
     balance_by_rank = np.zeros(num_ranks, dtype=np.int64)
     added = 0
     while True:
         current_compute_key = (int(compute.max()), int(np.square(compute).sum()))
-        overloaded = compute == current_compute_key[0]
         ingress_load = traffic.sum(axis=0)
         egress_load = traffic.sum(axis=1)
         remote_total = int(traffic.sum())
@@ -411,19 +447,15 @@ def balance_replica_compute(
         hidden_pair[top_source] = -1
         max_pair_without_source[top_source] = int(hidden_pair.max())
         best = None
-        candidate_expert, candidate_source = np.nonzero(
-            (source_demand > 0) & overloaded[routing.T]
-        )
-        for expert, source in zip(candidate_expert, candidate_source):
-            demand = int(source_demand[expert, source])
-            old = int(routing[source, expert])
+        candidate_source, candidate_expert, candidate_old = np.nonzero(quota > 0)
+        for source, expert, old in zip(
+            candidate_source, candidate_expert, candidate_old
+        ):
+            available = int(quota[source, expert, old])
             targets = np.arange(num_ranks)
             needs_copy = ~replica_mask[expert]
             feasible = targets != old
-            feasible &= ~needs_copy | (
-                (balance_by_rank < max_extra_per_rank)
-                & (len(replicas[expert]) < max_replicas_per_expert)
-            )
+            feasible &= ~needs_copy | (balance_by_rank < max_extra_per_rank)
 
             without_old = compute.copy()
             without_old[old] = -1
@@ -431,13 +463,17 @@ def balance_replica_compute(
             top = int(without_old.argmax())
             without_old[top] = -1
             unaffected[top] = int(without_old.max())
-            old_compute = int(compute[old] - demand)
-            target_compute = compute + demand
+            amount = np.minimum(
+                available, np.maximum(0, (compute[old] - compute + 1) // 2)
+            )
+            feasible &= amount > 0
+            old_compute = compute[old] - amount
+            target_compute = compute + amount
             next_max = np.maximum(np.maximum(unaffected, target_compute), old_compute)
             next_squares = (
                 current_compute_key[1]
                 - int(compute[old] ** 2)
-                + old_compute**2
+                + np.square(old_compute)
                 - np.square(compute)
                 + np.square(target_compute)
             )
@@ -446,8 +482,8 @@ def balance_replica_compute(
                 & (next_squares < current_compute_key[1])
             )
 
-            old_delta = -demand if source != old else 0
-            target_delta = np.where(targets != source, demand, 0)
+            old_delta = np.where(source != old, -amount, 0)
+            target_delta = np.where(targets != source, amount, 0)
             remote = remote_total + old_delta + target_delta
             feasible &= (old_delta + target_delta <= 0) | (
                 next_max < current_compute_key[0]
@@ -455,7 +491,7 @@ def balance_replica_compute(
             if not np.any(feasible):
                 continue
 
-            next_old_traffic = int(traffic[source, old] + old_delta)
+            next_old_traffic = traffic[source, old] + old_delta
             next_target_traffic = traffic[source] + target_delta
             row_without_old = traffic[source].copy()
             row_without_old[old] = -1
@@ -465,7 +501,7 @@ def balance_replica_compute(
             unaffected_pair[top] = int(row_without_old.max())
             max_pair = np.maximum(
                 np.maximum(unaffected_pair, next_target_traffic),
-                max(next_old_traffic, int(max_pair_without_source[source])),
+                np.maximum(next_old_traffic, int(max_pair_without_source[source])),
             )
 
             ingress_without_old = ingress_load.copy()
@@ -476,9 +512,9 @@ def balance_replica_compute(
             unaffected_ingress[top] = int(ingress_without_old.max())
             next_ingress = np.maximum(
                 np.maximum(unaffected_ingress, ingress_load + target_delta),
-                int(ingress_load[old] + old_delta),
+                ingress_load[old] + old_delta,
             )
-            next_source_egress = int(egress_load[source] + old_delta) + target_delta
+            next_source_egress = egress_load[source] + old_delta + target_delta
             next_egress = np.maximum(
                 max_egress_without_source[source], next_source_egress
             )
@@ -520,8 +556,8 @@ def balance_replica_compute(
                 source,
                 old,
                 target,
-                demand,
-                old_delta,
+                int(amount[target]),
+                int(old_delta[target]),
                 int(target_delta[target]),
                 bool(needs_copy[target]),
             )
@@ -535,7 +571,7 @@ def balance_replica_compute(
             source,
             old,
             target,
-            demand,
+            amount,
             old_delta,
             target_delta,
             needs_copy,
@@ -545,19 +581,42 @@ def balance_replica_compute(
             replica_mask[expert, target] = True
             balance_by_rank[target] += 1
             added += 1
-        routing[source, expert] = target
-        compute[old] -= demand
-        compute[target] += demand
+            local_quota = quota[target, expert].copy()
+            quota[target, expert] = 0
+            quota[target, expert, target] = local_quota.sum()
+            for old_rank, local_amount in enumerate(local_quota):
+                if old_rank == target or local_amount == 0:
+                    continue
+                compute[old_rank] -= local_amount
+                compute[target] += local_amount
+                traffic[target, old_rank] -= local_amount
+            continue
+        quota[source, expert, old] -= amount
+        quota[source, expert, target] += amount
+        compute[old] -= amount
+        compute[target] += amount
         traffic[source, old] += old_delta
         traffic[source, target] += target_delta
-    metrics = _route(
+    routing = quota.argmax(axis=2)
+    metrics = _route_quota(
         arrays,
-        primary,
-        replica_mask,
-        num_ranks=num_ranks,
+        quota,
+        source_demand,
         ranks_per_node=ranks_per_node,
         rdma_cost=rdma_cost,
-        routing=routing,
+    )
+    serialized_quota = tuple(
+        tuple(
+            (
+                tuple(int(quota[source, expert, rank]) for rank in replicas[expert])
+                if source_demand[expert, source]
+                else tuple(
+                    int(rank == routing[source, expert]) for rank in replicas[expert]
+                )
+            )
+            for expert in range(len(primary))
+        )
+        for source in range(num_ranks)
     )
     return ReplicaPlacement(
         replicas,
@@ -565,4 +624,5 @@ def balance_replica_compute(
         metrics,
         placement.extra_copies,
         added,
+        serialized_quota,
     )

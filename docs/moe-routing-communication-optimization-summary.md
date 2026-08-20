@@ -195,7 +195,6 @@ gains[E, R]          将 expert E 复制到 source R 后可精确消除的 remot
 每轮在 demand 最高的 `--hot-experts` 中枚举 `(expert, target rank)`，并要求：
 
 - target 尚无该 expert；
-- expert 副本数小于 `--max-replicas-per-expert`；
 - target 新增权重数小于 `--max-comm-expert-per-rank`；
 - gain 大于 0 且统一 objective 严格改善；
 - source-local demand 从 primary 转到 target 后，计算不均衡满足 `--replica-compute-limit`。
@@ -205,12 +204,18 @@ gains[E, R]          将 expert E 复制到 source R 后可精确消除的 remot
 GRACE+ JSON 保存：
 
 ```json
-{"0": [2, 0], "1": [1]}
+{
+  "replicas": {"0": [2, 0], "1": [1]},
+  "quota": [
+    [[70, 30], [1]],
+    [[0, 100], [1]]
+  ]
+}
 ```
 
-第一个 rank 是 primary，后续为 source-local secondary。`--max-comm-expert-per-rank 0` 时不复制，仍输出单元素列表，便于同一 A2A benchmark 直接读取。
+第一个 rank 是 primary，后续为 secondary；quota 最后一维使用相同顺序。`--max-comm-expert-per-rank 0` 时通信阶段不复制，计算阶段仍可由 `--max-comp-expert-per-rank` 单独开启。
 
-### 5.7 计算均衡复制与静态分发
+### 5.7 计算均衡复制与 quota 分发
 
 通信复制完成后，`balance_replica_compute()` 再执行计算优先的第二阶段。它不把通信复制的上限和计算复制混用：
 
@@ -219,18 +224,18 @@ GRACE+ JSON 保存：
 --max-comp-expert-per-rank  计算均衡复制阶段的每 rank 上限
 ```
 
-第二阶段把每个 `(source_rank, expert)` 的需求作为可迁移单元。对候选迁移：
+第二阶段把每个 `(source_rank, expert)` 的需求拆成整数 quota，可将同一需求分给多个副本。对候选迁移：
 
 1. 计算旧 rank 和目标 rank 的 load 变化；
 2. 只有 `(max_load, sum(load^2))` 严格改善才接受；
-3. 如果目标 rank 没有该专家，则新增一个副本并检查副本上限；
+3. 如果目标 rank 没有该专家，则新增一个副本并检查该 rank 的权重槽上限；
 4. 用 `source-expert` demand 构造通信上界，不在候选循环扫描 Top-K bundle；
 5. 优先复用已有 destination，再按 `remote` 或 `ingress-egress` 比较通信；
 6. 新增 remote 的迁移必须严格降低 `max_load`，仅改善 `sum(load^2)` 不足以接受。
 
-每轮只从当前最大负载 rank 迁出需求，并批量评估所有 target。所有可改善的 `(source, expert)` 都会参与，不截断热点候选或已有副本的 reroute；新副本仍受 `max_comp_expert_per_rank` 限制。
+每轮批量评估所有 `(source, expert)` 的全部 target，不截断热点候选或已有副本的 reroute。通信复制和计算复制分别只受 `max_comm_expert_per_rank` 与 `max_comp_expert_per_rank` 的每-rank 权重槽预算约束。
 
-因此计算阶段不会为了降低通信而接受更差的计算峰值，也尽量不产生新的 remote destination。通信上界把同一 bundle 发往同一 rank 的多个专家分别计数，适合 GPU/运行时快速求解；求解完成后再对完整 Top-K bundle 做一次精确评估。最终每个 source/expert 都有一个确定目标，保存为 `routing[R][E]`。A2A benchmark 优先使用这个 source-specific routing；没有 routing 字段的旧 plan 仍使用 local-first 兼容逻辑。
+因此计算阶段不会为了降低通信而接受更差的计算峰值，也尽量不产生新的 remote destination。最终保存 `quota[source][expert][replica_index]`，最后一维与该专家的 `replicas` 顺序一致。A2A benchmark 按 quota 比例为每个 token-expert occurrence 选择副本；旧的 routing-only plan 仍兼容。
 
 ### 5.8 最终选择与输出
 
@@ -299,7 +304,6 @@ python benchmark/compare_grace.py \
 | `--replica-candidates` | `4` | 每个 expert 保留的候选 target rank 数 |
 | `--replica-compute-limit` | `1.25` | 复制路由的最大计算不均衡 |
 | `--max-comm-expert-per-rank` | `0` | 通信优化阶段单 rank 最多新增的专家权重数；0 禁用该阶段 |
-| `--max-replicas-per-expert` | `2` | 单 expert 的总副本数，包含 primary |
 | `--max-comp-expert-per-rank` | `0` | 计算均衡阶段单 rank 最多新增的专家权重数；0 禁用该阶段 |
 
 ## 7. DeepEP 实测

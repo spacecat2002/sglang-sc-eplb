@@ -47,3 +47,15 @@ def test_physical_maps_use_source_specific_routing():
 
     assert maps["plan"][0][0] // slots == 1
     assert maps["plan"][1][0] // slots == 0
+
+
+def test_normalize_quota_matches_replica_order():
+    raw = {
+        "gate": {
+            "replicas": {"0": [0, 1], "1": [1]},
+            "quota": [[[6, 4], [1]], [[0, 10], [1]]],
+        }
+    }
+    plan = {0: (0, 1), 1: (1,)}
+
+    assert _MODULE._normalize_quota(raw, "gate", plan, 2, 2) == raw["gate"]["quota"]
