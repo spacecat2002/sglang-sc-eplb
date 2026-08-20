@@ -15,6 +15,7 @@ from sglang.srt.eplb.grace_plus_expert_placement import (
 from sglang.srt.eplb.grace_plus_replication import (
     ReplicaPlacement,
     _instance_quotas,
+    _greedy_instance_quotas,
     _joint_quotas,
     _quota_prefix,
     _route_quota,
@@ -336,6 +337,16 @@ def test_instance_quota_is_globally_balanced():
     )
 
     assert loads.tolist() == [18, 13, 18]
+
+
+def test_greedy_quota_places_fixed_load_before_replicated_experts():
+    _, loads = _greedy_instance_quotas(
+        np.array([40, 5]),
+        {0: (0, 1), 1: (1,)},
+        2,
+    )
+
+    assert loads.tolist() == [23, 22]
 
 
 def test_joint_quota_chooses_local_among_compute_optimal_solutions():

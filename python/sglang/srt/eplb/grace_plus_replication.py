@@ -405,6 +405,56 @@ def _instance_quotas(
     return best
 
 
+def _greedy_instance_quotas(
+    demand: np.ndarray,
+    replicas: Mapping[int, Sequence[int]],
+    num_ranks: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    quota = np.zeros((len(demand), num_ranks), dtype=np.int64)
+    loads = np.zeros(num_ranks, dtype=np.int64)
+    order = sorted(
+        range(len(demand)),
+        key=lambda expert: (len(replicas[expert]) > 1, -demand[expert], expert),
+    )
+    for expert in order:
+        quota[expert] = _waterfill(loads, replicas[int(expert)], int(demand[expert]))
+        loads += quota[expert]
+    return quota, loads
+
+
+def _source_quotas(
+    source_demand: np.ndarray,
+    instance_quota: np.ndarray,
+    routing: np.ndarray,
+) -> np.ndarray:
+    num_experts, num_ranks = source_demand.shape
+    quota = np.zeros((num_ranks, num_experts, num_ranks), dtype=np.int64)
+    for expert in range(num_experts):
+        capacity = instance_quota[expert].copy()
+        remaining = source_demand[expert].copy()
+        local = np.minimum(remaining, capacity)
+        quota[np.arange(num_ranks), expert, np.arange(num_ranks)] = local
+        remaining -= local
+        capacity -= local
+        for source in np.argsort(-remaining, kind="stable"):
+            amount = int(remaining[source])
+            while amount:
+                targets = np.flatnonzero(capacity)
+                target = min(
+                    targets,
+                    key=lambda rank: (
+                        rank != routing[source, expert],
+                        -capacity[rank],
+                        rank,
+                    ),
+                )
+                moved = min(amount, int(capacity[target]))
+                quota[source, expert, target] += moved
+                capacity[target] -= moved
+                amount -= moved
+    return quota
+
+
 def _joint_quotas(
     source_demand: np.ndarray,
     replicas: Mapping[int, Sequence[int]],
@@ -435,7 +485,12 @@ def _joint_quotas(
     if not pairs:
         return quota
     pair_offset = 1
-    rank_offset = pair_offset + len(pairs)
+    flexible = tuple(expert for expert, ranks in replicas.items() if len(ranks) > 1)
+    expert_offset = pair_offset + len(pairs)
+    expert_node = {
+        expert: expert_offset + index for index, expert in enumerate(flexible)
+    }
+    rank_offset = expert_offset + len(flexible)
     sink = rank_offset + num_ranks
     graph: list[list[list[int]]] = [[] for _ in range(sink + 1)]
 
@@ -445,38 +500,24 @@ def _joint_quotas(
         graph[right].append([left, index, 0, -cost])
         return index
 
-    edge_by_route = {}
+    local_edges = {}
+    expert_rank_edges = {}
     total = sum(amount for _, _, amount in pairs)
-    baseline_traffic = np.zeros((num_ranks, num_ranks), dtype=np.int64)
-    for expert in range(num_experts):
-        for source in range(num_ranks):
-            target = int(routing[source, expert])
-            if target != source:
-                baseline_traffic[source, target] += source_demand[expert, source]
-    congestion = (
-        baseline_traffic
-        + baseline_traffic.sum(axis=0, keepdims=True)
-        + baseline_traffic.sum(axis=1, keepdims=True)
-    )
-    remote_cost = total * (int(congestion.max(initial=0)) + 1) + 1
     for pair_index, (source, expert, amount) in enumerate(pairs):
         node = pair_offset + pair_index
         add_edge(0, node, amount, 0)
-        targets = sorted(
-            replicas[expert],
-            key=lambda target: (
-                target != source,
-                target != routing[source, expert],
-                target,
-            ),
-        )
-        for target in targets:
-            cost = (
-                0 if target == source else remote_cost + int(congestion[source, target])
-            )
-            edge_by_route[source, expert, target] = (
+        if source in replicas[expert]:
+            local_edges[source, expert] = (
                 node,
-                add_edge(node, rank_offset + target, amount, cost),
+                add_edge(node, rank_offset + source, amount, 0),
+            )
+        add_edge(node, expert_node[expert], amount, 1)
+    for expert in flexible:
+        node = expert_node[expert]
+        for rank in replicas[expert]:
+            expert_rank_edges[expert, rank] = (
+                node,
+                add_edge(node, rank_offset + rank, int(expert_demand[expert]), 0),
             )
     for rank in range(num_ranks):
         add_edge(rank_offset + rank, sink, rank_capacity - int(fixed_load[rank]), 0)
@@ -519,10 +560,17 @@ def _joint_quotas(
             node = parent
         flow += moved
 
-    for (source, expert, target), (node, edge_index) in edge_by_route.items():
+    instance_quota = np.zeros((num_experts, num_ranks), dtype=np.int64)
+    for (source, expert), (node, edge_index) in local_edges.items():
         edge = graph[node][edge_index]
-        quota[source, expert, target] = graph[edge[0]][edge[1]][2]
-    return quota
+        instance_quota[expert, source] += graph[edge[0]][edge[1]][2]
+    for (expert, rank), (node, edge_index) in expert_rank_edges.items():
+        edge = graph[node][edge_index]
+        instance_quota[expert, rank] += graph[edge[0]][edge[1]][2]
+    for expert, ranks in replicas.items():
+        if len(ranks) == 1:
+            instance_quota[expert, ranks[0]] = expert_demand[expert]
+    return _source_quotas(source_demand, instance_quota, routing)
 
 
 def _gains_and_traffic(
@@ -763,22 +811,26 @@ def balance_replica_compute(
     remote_demand = source_demand.copy()
     remote_demand[routing.T == np.arange(num_ranks)] = 0
     remote_sources = np.argsort(-remote_demand, axis=1, kind="stable")
+    expert_order = np.argsort(-expert_demand, kind="stable")
     balance_by_rank = np.zeros(num_ranks, dtype=np.int64)
     added = 0
     while added < num_ranks * max_extra_per_rank:
-        instance_quota, compute = _instance_quotas(expert_demand, replicas, num_ranks)
+        instance_quota, compute = _greedy_instance_quotas(
+            expert_demand, replicas, num_ranks
+        )
         current_key = (int(compute.max()), int(np.square(compute).sum()))
         best = None
-        for expert in np.argsort(-expert_demand, kind="stable"):
+        for expert in expert_order:
             if not expert_demand[expert]:
                 continue
             base = compute - instance_quota[expert]
+            # ponytail: one remote-priority target per expert; widen only if quality regresses.
             for target_value in remote_sources[expert]:
                 target = int(target_value)
-                if (
-                    not remote_demand[expert, target]
-                    or replica_mask[expert, target]
-                    or (balance_by_rank[target] >= max_extra_per_rank)
+                if not remote_demand[expert, target]:
+                    break
+                if replica_mask[expert, target] or (
+                    balance_by_rank[target] >= max_extra_per_rank
                 ):
                     continue
                 ranks = replicas[int(expert)] + (target,)
@@ -788,23 +840,31 @@ def balance_replica_compute(
                     int(next_compute.max()),
                     int(np.square(next_compute).sum()),
                 )
-                if compute_key >= current_key:
-                    continue
-                remote = int(
-                    expert_demand[expert]
-                    - sum(
-                        min(int(source_demand[expert, rank]), int(allocation[rank]))
-                        for rank in ranks
+                if compute_key < current_key:
+                    remote = int(
+                        expert_demand[expert]
+                        - sum(
+                            min(
+                                int(source_demand[expert, rank]),
+                                int(allocation[rank]),
+                            )
+                            for rank in ranks
+                        )
                     )
-                )
-                candidate = (
-                    compute_key
-                    + (remote, -int(source_demand[expert, target]), expert, target),
-                    int(expert),
-                    target,
-                )
-                if best is None or candidate[0] < best[0]:
-                    best = candidate
+                    candidate = (
+                        compute_key
+                        + (
+                            remote,
+                            -int(source_demand[expert, target]),
+                            expert,
+                            target,
+                        ),
+                        int(expert),
+                        target,
+                    )
+                    if best is None or candidate[0] < best[0]:
+                        best = candidate
+                break
         if best is None:
             break
         _, expert, target = best

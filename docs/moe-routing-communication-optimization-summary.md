@@ -223,9 +223,9 @@ GRACE+ JSON 保存：
 
 第二阶段把每个 `(source_rank, expert)` 的需求拆成整数 quota，可将同一需求分给多个副本：
 
-1. 在 `expert -> replica rank` 二分图上二分 rank 容量并求整数最大流，得到当前副本集合下全局最小的 `max compute load`；
-2. 计算复制只枚举有 source demand 的新增权重 `(expert, target)`，并且必须严格改善 `(max_load, sum(load^2))`；通信量作为 tie-break；
-3. 副本集合确定后，固定最小 `max compute load`，在 `(source, expert) -> replica rank` 网络上联合求整数 min-cost flow；所有 expert 共享 rank 容量，本地边成本为 0，远端边先按 remote 数量优化，再按已有 source-to-destination congestion 做次级优化；
+1. 副本搜索阶段先放置单副本 expert 的固定负载，再用 waterfill 快速估算可拆 expert；每个 expert 每轮只检查 remote demand 最大且仍有槽位的 target，避免反复运行全局 flow 和穷举所有 ranks；
+2. 候选必须严格改善 `(max_load, sum(load^2))`；通信量作为 tie-break；
+3. 副本集合确定后，只运行一次精确联合 flow。先在 `expert -> replica rank` 图上求全局最小的 `max compute load`，再用压缩的 `(source, expert) -> expert -> replica rank` min-cost flow 共享所有 rank capacity 并最大化本地执行；
 4. 将 quota 转成 source/expert 的 cumulative prefix，按 occurrence ordinal 模拟现场 reroute；同一 bundle 的 Top-K 使用这次模拟得到的实际目标集合，最终通信指标不再使用独立概率近似。ordinal 和常规 bundle 路由使用 NumPy 分块向量化，只有内部跨过 quota boundary 的少量 bundle 才逐段精确修正。
 
 通信复制和计算复制分别只受 `max_comm_expert_per_rank` 与 `max_comp_expert_per_rank` 的每-rank 权重槽预算约束。quota 生成本身没有迭代次数，计算复制迭代最多为 `num_ranks * max_comp_expert_per_rank`。
@@ -320,7 +320,7 @@ torchrun --standalone --nproc-per-node=8 benchmark/benchmark_a2a_plan.py \
 
 affinity graph 构造约为 `O(B * K^2)`；GRACE spectral decomposition 主要依赖 expert 数，而不是 bundle 数。
 
-GRACE+ move 约为 `O(rounds * E * R * average_occurrence)`。pair-swap 对候选 expert pair 的 bundle union 做 exact 扫描；`ingress-egress` 还要复制并更新 `R x R` traffic matrix，因此通常是最大热点。Replication 初始 gain 构造约为 `O(B * (R + K^2))`，每增加一个副本只重扫来自目标 source 且包含该 expert 的相关 bundle。该扫描同时缓存 source-expert demand；通信复制关闭时，常规 placement 评估在同一遍扫描中顺手缓存。计算均衡不再重复遍历 bundle，复制候选只枚举当前 routing 为远端的 source rank，并按 remote demand 从高到低处理。最终 prefix 评估对全部 occurrence 做分块向量化，逐 bundle Python 工作量只与实际跨界数相关；无副本时仍走更简单的 placement 评估。
+GRACE+ move 约为 `O(rounds * E * R * average_occurrence)`。pair-swap 对候选 expert pair 的 bundle union 做 exact 扫描；`ingress-egress` 还要复制并更新 `R x R` traffic matrix，因此通常是最大热点。Replication 初始 gain 构造约为 `O(B * (R + K^2))`，每增加一个副本只重扫来自目标 source 且包含该 expert 的相关 bundle。该扫描同时缓存 source-expert demand；通信复制关闭时，常规 placement 评估在同一遍扫描中顺手缓存。计算均衡不再重复遍历 bundle；每个 expert 每轮只评估 remote demand 最大的可用 source rank，最终只执行一次压缩联合 flow。最终 prefix 评估对全部 occurrence 做分块向量化，逐 bundle Python 工作量只与实际跨界数相关；无副本时仍走更简单的 placement 评估。
 
 20M bundles 不建议在每次调参时全量执行前面的 grouping、move 和 swap。先用默认 20k 或更大样本选参数，再用 `--optimizer-bundles 0` 做最终 placement/评估。计算均衡阶段已不再逐候选扫描完整 trace；若仍需进一步压缩运行时延迟，应把 source-expert 聚合和候选归约移入现有 UltraEP CUDA kernel。
 
