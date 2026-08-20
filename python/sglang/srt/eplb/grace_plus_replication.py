@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Mapping, Sequence
 
 import numpy as np
@@ -36,6 +36,7 @@ class ReplicaPlacement:
     extra_copies: int
     balance_copies: int = 0
     quota_by_source: tuple[tuple[tuple[int, ...], ...], ...] | None = None
+    source_demand: np.ndarray | None = field(default=None, repr=False, compare=False)
 
 
 def _replica_arrays(
@@ -88,6 +89,7 @@ def _route(
     *,
     num_ranks: int,
     routing: np.ndarray | None = None,
+    source_demand: np.ndarray | None = None,
 ) -> ReplicaMetrics:
     traffic = np.zeros((num_ranks, num_ranks), dtype=np.int64)
     compute = np.zeros(num_ranks, dtype=np.int64)
@@ -103,6 +105,8 @@ def _route(
         )
         for column in range(topk.shape[1]):
             np.add.at(compute, destinations[:, column], count)
+            if source_demand is not None:
+                np.add.at(source_demand, (topk[:, column], source), count)
         for rank in range(num_ranks):
             sent = np.any(destinations == rank, axis=1) & (source != rank)
             np.add.at(traffic[:, rank], source[sent], count[sent])
@@ -475,17 +479,20 @@ def _gains_and_traffic(
     primary: np.ndarray,
     replica_mask: np.ndarray,
     num_ranks: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return exact remote removal for every source-local replica candidate."""
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return replica gains, traffic, and source-expert demand in one scan."""
 
     gains = np.zeros((len(primary), num_ranks), dtype=np.int64)
     traffic = np.zeros((num_ranks, num_ranks), dtype=np.int64)
+    source_demand = np.zeros((len(primary), num_ranks), dtype=np.int64)
     for start in range(0, len(arrays), _CHUNK_SIZE):
         end = min(start + _CHUNK_SIZE, len(arrays))
         source = arrays.source_rank[start:end]
         topk = arrays.topk_experts[start:end]
         count = arrays.count[start:end]
         destinations = _destinations(source, topk, primary, replica_mask)
+        for column in range(topk.shape[1]):
+            np.add.at(source_demand, (topk[:, column], source), count)
         for rank in range(num_ranks):
             sent = np.any(destinations == rank, axis=1) & (source != rank)
             np.add.at(traffic[:, rank], source[sent], count[sent])
@@ -499,7 +506,7 @@ def _gains_and_traffic(
             old = destinations[:, column]
             useful = (source != old) & unique_destination[:, column]
             np.add.at(gains, (topk[useful, column], source[useful]), count[useful])
-    return gains, traffic
+    return gains, traffic, source_demand
 
 
 def _key(
@@ -578,14 +585,32 @@ def replicate_hot_experts(
         raise ValueError("invalid replication compute limit")
     arrays = as_routed_arrays(tokens)
     replicas, primary, replica_mask = _replica_arrays(arrays, placement, num_ranks)
-    source_demand = _source_demand(arrays, len(primary), num_ranks)
+    routing = _default_routing(primary, replica_mask, num_ranks)
+    if max_extra_per_rank == 0:
+        source_demand = np.zeros((len(primary), num_ranks), dtype=np.int64)
+        metrics = _route(
+            arrays,
+            primary,
+            replica_mask,
+            num_ranks=num_ranks,
+            source_demand=source_demand,
+        )
+        return ReplicaPlacement(
+            replicas,
+            tuple(tuple(int(rank) for rank in row) for row in routing),
+            metrics,
+            0,
+            source_demand=source_demand,
+        )
+    gains, traffic, source_demand = _gains_and_traffic(
+        arrays, primary, replica_mask, num_ranks
+    )
     total_demand = source_demand.sum(axis=1)
     compute = np.zeros(num_ranks, dtype=np.int64)
     observed = primary >= 0
     np.add.at(compute, primary[observed], total_demand[observed])
     average = float(compute.sum()) / num_ranks
     extra_by_rank = np.zeros(num_ranks, dtype=np.int64)
-    gains, traffic = _gains_and_traffic(arrays, primary, replica_mask, num_ranks)
     current_key = _key(traffic, 0, 0, 0, objective)
     hot = np.argsort(-total_demand, kind="stable")[:hot_experts].tolist()
     added = 0
@@ -660,6 +685,7 @@ def replicate_hot_experts(
         tuple(tuple(int(rank) for rank in row) for row in routing),
         metrics,
         added,
+        source_demand=source_demand,
     )
 
 
@@ -679,8 +705,13 @@ def balance_replica_compute(
         arrays, placement.replicas_by_expert, num_ranks
     )
     routing = np.asarray(placement.routing_by_source, dtype=np.intp).copy()
-    source_demand = _source_demand(arrays, len(primary), num_ranks)
+    source_demand = placement.source_demand
+    if source_demand is None:
+        source_demand = _source_demand(arrays, len(primary), num_ranks)
     expert_demand = source_demand.sum(axis=1)
+    remote_demand = source_demand.copy()
+    remote_demand[routing.T == np.arange(num_ranks)] = 0
+    remote_sources = np.argsort(-remote_demand, axis=1, kind="stable")
     balance_by_rank = np.zeros(num_ranks, dtype=np.int64)
     added = 0
     while added < num_ranks * max_extra_per_rank:
@@ -691,9 +722,10 @@ def balance_replica_compute(
             if not expert_demand[expert]:
                 continue
             base = compute - instance_quota[expert]
-            for target in range(num_ranks):
+            for target_value in remote_sources[expert]:
+                target = int(target_value)
                 if (
-                    not source_demand[expert, target]
+                    not remote_demand[expert, target]
                     or replica_mask[expert, target]
                     or (balance_by_rank[target] >= max_extra_per_rank)
                 ):
@@ -757,4 +789,5 @@ def balance_replica_compute(
         placement.extra_copies,
         added,
         serialized_quota,
+        source_demand,
     )

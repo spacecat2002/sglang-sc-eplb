@@ -320,7 +320,7 @@ torchrun --standalone --nproc-per-node=8 benchmark/benchmark_a2a_plan.py \
 
 affinity graph 构造约为 `O(B * K^2)`；GRACE spectral decomposition 主要依赖 expert 数，而不是 bundle 数。
 
-GRACE+ move 约为 `O(rounds * E * R * average_occurrence)`。pair-swap 对候选 expert pair 的 bundle union 做 exact 扫描；`ingress-egress` 还要复制并更新 `R x R` traffic matrix，因此通常是最大热点。Replication 初始 gain 构造约为 `O(B * (R + K^2))`，每增加一个副本只重扫来自目标 source 且包含该 expert 的相关 bundle。计算均衡先用一次 `O(B*K)` 聚合得到 source-expert demand，候选循环不再依赖 bundle 数，最后用一次 `O(B*K)` 精确评估。
+GRACE+ move 约为 `O(rounds * E * R * average_occurrence)`。pair-swap 对候选 expert pair 的 bundle union 做 exact 扫描；`ingress-egress` 还要复制并更新 `R x R` traffic matrix，因此通常是最大热点。Replication 初始 gain 构造约为 `O(B * (R + K^2))`，每增加一个副本只重扫来自目标 source 且包含该 expert 的相关 bundle。该扫描同时缓存 source-expert demand；通信复制关闭时，常规 placement 评估在同一遍扫描中顺手缓存。计算均衡不再重复遍历 bundle，复制候选只枚举当前 routing 为远端的 source rank，并按 remote demand 从高到低处理。最后有副本时做一次精确 prefix 评估，无副本时走向量化 placement 评估。
 
 20M bundles 不建议在每次调参时全量执行前面的 grouping、move 和 swap。先用默认 20k 或更大样本选参数，再用 `--optimizer-bundles 0` 做最终 placement/评估。计算均衡阶段已不再逐候选扫描完整 trace；若仍需进一步压缩运行时延迟，应把 source-expert 聚合和候选归约移入现有 UltraEP CUDA kernel。
 

@@ -1,3 +1,5 @@
+from unittest.mock import patch
+
 import numpy as np
 
 from sglang.srt.eplb.expert_affinity_graph import (
@@ -168,6 +170,59 @@ def test_compute_balancing_adds_replica_and_reroutes_static_demand():
     assert balanced.routing_by_source[1][0] == 1
     assert max(balanced.metrics.compute_load) < max(communication.metrics.compute_load)
     assert balanced.metrics.remote < communication.metrics.remote
+
+
+def test_replication_caches_source_demand_without_an_extra_scan():
+    communication = replicate_hot_experts(
+        [
+            RoutedToken(0, (0,), 7),
+            RoutedToken(1, (0,), 5),
+            RoutedToken(1, (1,), 5),
+        ],
+        {0: 0, 1: 1},
+        num_ranks=2,
+        max_extra_per_rank=0,
+    )
+
+    assert communication.source_demand.tolist() == [[7, 5], [0, 5]]
+    with patch(
+        "sglang.srt.eplb.grace_plus_replication._source_demand",
+        side_effect=AssertionError("source demand scanned twice"),
+    ):
+        balance_replica_compute(
+            [
+                RoutedToken(0, (0,), 7),
+                RoutedToken(1, (0,), 5),
+                RoutedToken(1, (1,), 5),
+            ],
+            communication,
+            num_ranks=2,
+        )
+
+
+def test_compute_balancing_prefers_the_largest_remote_source():
+    tokens = [
+        RoutedToken(0, (0,), 100),
+        RoutedToken(1, (0,), 30),
+        RoutedToken(2, (0,), 10),
+        RoutedToken(1, (1,), 60),
+        RoutedToken(2, (2,), 60),
+    ]
+    communication = replicate_hot_experts(
+        tokens,
+        {0: 0, 1: 1, 2: 2},
+        num_ranks=3,
+        max_extra_per_rank=0,
+    )
+
+    balanced = balance_replica_compute(
+        tokens,
+        communication,
+        num_ranks=3,
+        max_extra_per_rank=1,
+    )
+
+    assert balanced.replicas_by_expert[0][:2] == (0, 1)
 
 
 def test_compute_balancing_rejects_remote_for_variance_only():
