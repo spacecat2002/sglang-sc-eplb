@@ -231,12 +231,17 @@ def _load(args: argparse.Namespace):
     plan = _normalize_plan(raw_plan, gate, num_experts, num_ranks)
     routing = _normalize_routing(raw_plan, gate, num_experts, num_ranks)
     quota = _normalize_quota(raw_plan, gate, plan, num_experts, num_ranks)
-    if routing is not None and any(
-        routing[source][expert] not in plan[expert]
-        for source in range(num_ranks)
-        for expert in range(num_experts)
-    ):
-        raise ValueError("routing selects a rank without that expert replica")
+    if routing is not None:
+        routing = [list(row) for row in routing]
+        for source, row in enumerate(routing):
+            for expert, target in enumerate(row):
+                if target in plan[expert]:
+                    continue
+                if quota is None:
+                    raise ValueError(
+                        "routing selects a rank without that expert replica"
+                    )
+                row[expert] = source if source in plan[expert] else plan[expert][0]
     if quota is not None:
         quota = [[list(values) for values in row] for row in quota]
         for source, row in enumerate(quota):

@@ -224,16 +224,15 @@ GRACE+ JSON 保存：
 --max-comp-expert-per-rank  计算均衡复制阶段的每 rank 上限
 ```
 
-第二阶段把每个 `(source_rank, expert)` 的需求拆成整数 quota，可将同一需求分给多个副本。对候选迁移：
+第二阶段把每个 `(source_rank, expert)` 的需求拆成整数 quota，可将同一需求分给多个副本：
 
-1. 计算旧 rank 和目标 rank 的 load 变化；
-2. 只有 `(max_load, sum(load^2))` 严格改善才接受；
-3. 如果目标 rank 没有该专家，则新增一个副本并检查该 rank 的权重槽上限；
-4. 用 `source-expert` demand 构造通信上界，不在候选循环扫描 Top-K bundle；
-5. 优先复用已有 destination，再按 `remote` 或 `ingress-egress` 比较通信；
-6. 新增 remote 的迁移必须严格降低 `max_load`，仅改善 `sum(load^2)` 不足以接受。
+1. 按专家总需求从高到低处理，用整数 water-filling 直接计算现有副本的理想负载；
+2. 计算复制只枚举新增权重 `(expert, target)`，必须严格改善 `(max_load, sum(load^2))`，通信量作为 tie-break；
+3. 副本集合确定后，一次性重新 water-fill 所有专家，不逐 quota 迭代迁移；
+4. source-local-first 填充各副本容量，剩余需求优先复用通信阶段的 routing destination；
+5. 最后对完整 Top-K bundle 做一次期望通信评估。
 
-每轮批量评估所有 `(source, expert)` 的全部 target，不截断热点候选或已有副本的 reroute。通信复制和计算复制分别只受 `max_comm_expert_per_rank` 与 `max_comp_expert_per_rank` 的每-rank 权重槽预算约束。
+通信复制和计算复制分别只受 `max_comm_expert_per_rank` 与 `max_comp_expert_per_rank` 的每-rank 权重槽预算约束。quota 生成本身没有迭代次数，计算复制迭代最多为 `num_ranks * max_comp_expert_per_rank`。
 
 因此计算阶段不会为了降低通信而接受更差的计算峰值，也尽量不产生新的 remote destination。最终保存 `quota[source][expert][replica_index]`，最后一维与该专家的 `replicas` 顺序一致。A2A benchmark 按 quota 比例为每个 token-expert occurrence 选择副本；旧的 routing-only plan 仍兼容。
 

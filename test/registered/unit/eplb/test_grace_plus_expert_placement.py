@@ -234,3 +234,24 @@ def test_quota_splits_one_source_expert_demand():
     assert balanced.metrics.compute_load == (60, 60)
     assert balanced.quota_by_source[0][0] == (60, 40)
     assert balanced.quota_by_source[1][0] == (0, 20)
+
+
+def test_unobserved_source_expert_keeps_valid_routing():
+    tokens = [RoutedToken(0, (0,), 10)]
+    communication = replicate_hot_experts(
+        tokens,
+        {0: 1},
+        num_ranks=2,
+        ranks_per_node=2,
+        max_extra_per_rank=0,
+    )
+    balanced = balance_replica_compute(
+        tokens,
+        communication,
+        num_ranks=2,
+        ranks_per_node=2,
+        max_extra_per_rank=0,
+    )
+
+    assert balanced.routing_by_source[1][0] == 1
+    assert balanced.quota_by_source[1][0] == (1,)
