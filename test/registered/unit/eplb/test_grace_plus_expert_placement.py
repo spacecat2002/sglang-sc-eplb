@@ -87,6 +87,32 @@ def test_remote_objective_keeps_grace_remote_non_increasing():
     ) <= evaluate_primary_remote(tokens, grace.rank_by_expert)
 
 
+def test_default_communication_refinement_does_not_worsen_compute_peak():
+    tokens = [
+        RoutedToken(1, (0,), 50),
+        RoutedToken(0, (2,), 50),
+        RoutedToken(0, (1,), 1),
+        RoutedToken(1, (3,), 1),
+    ]
+    initial = {0: 0, 1: 0, 2: 1, 3: 1}
+
+    result = grace_plus_expert_placement(
+        tokens,
+        experts=range(4),
+        num_ranks=2,
+        capacity_ratio=0.5,
+        initial_placement=initial,
+        objective="remote",
+        refine_rounds=2,
+        swap_rounds=0,
+    )
+
+    initial_peak = max(
+        evaluate_replicated_placement(tokens, initial, num_ranks=2).compute_load
+    )
+    assert max(result["metrics"].compute_load) <= initial_peak
+
+
 def test_replication_uses_source_local_routing_and_respects_slots():
     tokens = [
         RoutedToken(0, (0,), 20),
@@ -299,3 +325,12 @@ def test_quota_prefix_routes_local_before_remote_and_matches_counts():
     assert prefix[0, 1].tolist() == [4, 10]
     assert metrics.remote == 6
     assert metrics.compute_load == (10, 10)
+
+
+def test_quota_prefix_puts_local_replica_before_primary():
+    quota = np.zeros((2, 1, 2), dtype=np.int64)
+    quota[1, 0] = [4, 6]
+
+    prefix = _quota_prefix(quota, {0: (0, 1)})
+
+    assert prefix[1, 0].tolist() == [10, 6]

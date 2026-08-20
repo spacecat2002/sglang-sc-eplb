@@ -379,7 +379,7 @@ def main() -> None:
     parser.add_argument("--swaps", type=int, default=1)
     parser.add_argument("--partners", type=int, default=8)
     parser.add_argument("--capacity-ratio", type=float, default=0.15)
-    parser.add_argument("--compute-limit", type=float, default=2.0)
+    parser.add_argument("--compute-limit", type=float, default=1.0)
     parser.add_argument("--allow-load-worsening", action="store_true")
     parser.add_argument("--swap-compute-limit", type=float)
     parser.add_argument("--hot-experts", type=int, default=16)

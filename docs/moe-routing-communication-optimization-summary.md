@@ -288,7 +288,7 @@ python benchmark/compare_grace.py \
 | `--equal-experts` | false | 强制每 rank expert 数相同 |
 | `--source-affinity-weight` | `0` | affinity graph 的 source overlap bonus |
 | `--capacity-ratio` | `0.15` | GRACE+ move 的 expert 容量浮动 |
-| `--compute-limit` | `2.0` | move 最大计算不均衡上限 |
+| `--compute-limit` | `1.0` | move 最大计算不均衡上限；默认不允许最大计算负载增加 |
 | `--rounds` | `4` | 单专家 move 轮数 |
 | `--swaps` | `1` | pair-swap 轮数 |
 | `--partners` | `8` | 每个 expert/目标 rank 的候选 partner 数 |

@@ -148,10 +148,17 @@ def _route_quota(
             )
             for expert in range(quota.shape[1])
         }
+    if all(len(ranks) == 1 for ranks in replicas.values()):
+        primary = np.asarray(
+            [replicas[expert][0] for expert in range(quota.shape[1])], dtype=np.intp
+        )
+        replica_mask = np.zeros((len(primary), num_ranks), dtype=bool)
+        replica_mask[np.arange(len(primary)), primary] = True
+        return _route(arrays, primary, replica_mask, num_ranks=num_ranks)
     prefix = _quota_prefix(quota, replicas)
     counters = np.zeros((num_ranks, quota.shape[1]), dtype=np.int64)
     traffic = np.zeros((num_ranks, num_ranks), dtype=np.int64)
-    compute = np.zeros(num_ranks, dtype=np.int64)
+    compute = quota.sum(axis=(0, 1), dtype=np.int64)
     for start in range(0, len(arrays), _CHUNK_SIZE):
         end = min(start + _CHUNK_SIZE, len(arrays))
         source = arrays.source_rank[start:end]
@@ -174,7 +181,7 @@ def _route_quota(
             for left, right in zip(ordered, ordered[1:]):
                 destinations = []
                 for expert, ordinal in starts:
-                    replica_ranks = replicas[expert]
+                    replica_ranks = _source_replica_order(source_rank, replicas[expert])
                     replica_index = int(
                         np.searchsorted(
                             prefix[source_rank, expert, replica_ranks],
@@ -183,7 +190,6 @@ def _route_quota(
                         )
                     )
                     destinations.append(replica_ranks[replica_index])
-                    compute[replica_ranks[replica_index]] += right - left
                 segment = right - left
                 for target in set(destinations):
                     if target != source_rank:
@@ -202,15 +208,24 @@ def _route_quota(
 def _quota_prefix(
     quota: np.ndarray, replicas: Mapping[int, Sequence[int]]
 ) -> np.ndarray:
-    """Build source/expert cumulative quotas in replica-list order."""
+    """Build source/expert cumulative quotas with the local replica first."""
 
     prefix = np.zeros_like(quota)
     for expert, ranks in replicas.items():
-        cumulative = np.zeros(quota.shape[0], dtype=np.int64)
-        for rank in ranks:
-            cumulative += quota[:, expert, rank]
-            prefix[:, expert, rank] = cumulative
+        for source in range(quota.shape[0]):
+            cumulative = 0
+            for rank in _source_replica_order(source, ranks):
+                cumulative += int(quota[source, expert, rank])
+                prefix[source, expert, rank] = cumulative
     return prefix
+
+
+def _source_replica_order(source: int, ranks: Sequence[int]) -> tuple[int, ...]:
+    return (
+        (source,) + tuple(rank for rank in ranks if rank != source)
+        if source in ranks
+        else tuple(ranks)
+    )
 
 
 def _source_demand(
@@ -347,12 +362,23 @@ def _joint_quotas(
     _, balanced_load = _instance_quotas(expert_demand, replicas, num_ranks)
     rank_capacity = int(balanced_load.max(initial=0))
     quota = np.zeros((num_ranks, num_experts, num_ranks), dtype=np.int64)
+    fixed_load = np.zeros(num_ranks, dtype=np.int64)
+    for expert, ranks in replicas.items():
+        if len(ranks) == 1:
+            target = ranks[0]
+            quota[:, expert, target] = source_demand[expert]
+            fixed_load[target] += expert_demand[expert]
+    if np.any(fixed_load > rank_capacity):
+        raise RuntimeError("fixed expert load exceeds balanced rank capacity")
     pairs = [
         (source, expert, int(source_demand[expert, source]))
         for expert in range(num_experts)
+        if len(replicas[expert]) > 1
         for source in range(num_ranks)
         if source_demand[expert, source]
     ]
+    if not pairs:
+        return quota
     pair_offset = 1
     rank_offset = pair_offset + len(pairs)
     sink = rank_offset + num_ranks
@@ -365,7 +391,7 @@ def _joint_quotas(
         return index
 
     edge_by_route = {}
-    total = int(source_demand.sum())
+    total = sum(amount for _, _, amount in pairs)
     baseline_traffic = np.zeros((num_ranks, num_ranks), dtype=np.int64)
     for expert in range(num_experts):
         for source in range(num_ranks):
@@ -398,7 +424,7 @@ def _joint_quotas(
                 add_edge(node, rank_offset + target, amount, cost),
             )
     for rank in range(num_ranks):
-        add_edge(rank_offset + rank, sink, rank_capacity, 0)
+        add_edge(rank_offset + rank, sink, rank_capacity - int(fixed_load[rank]), 0)
 
     flow = 0
     while flow < total:

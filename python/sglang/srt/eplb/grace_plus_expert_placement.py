@@ -417,7 +417,7 @@ def grace_plus_expert_placement(
     experts: Sequence[int],
     num_ranks: int,
     capacity_ratio: float = 0.15,
-    compute_imbalance_limit: float = 2.0,
+    compute_imbalance_limit: float = 1.0,
     refine_rounds: int = 4,
     initial_placement: Mapping[int, int],
     align_groups: bool = False,
