@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import logging
+import os
+from collections import deque
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
-
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
@@ -61,6 +62,106 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 logger = logging.getLogger(__name__)
 _expert_load_logging_enabled = get_bool_env_var("SGLANG_ENABLE_EXPERT_LOAD_LOGGING")
+_moe_stage_timer = None
+
+
+def _format_moe_stage_timing(
+    samples: int,
+    dispatch_ms: float,
+    compute_ms: float,
+    combine_ms: float,
+    rank: int,
+) -> str:
+    communication_ms = dispatch_ms + combine_ms
+    total_ms = communication_ms + compute_ms
+    communication_pct = 100 * communication_ms / total_ms if total_ms else 0.0
+    compute_pct = 100 * compute_ms / total_ms if total_ms else 0.0
+    return (
+        f"[MoE stage timing][rank={rank}] samples={samples} "
+        f"communication_ms={communication_ms:.3f} compute_ms={compute_ms:.3f} "
+        f"communication_pct={communication_pct:.2f}% compute_pct={compute_pct:.2f}% "
+        f"dispatch_ms={dispatch_ms:.3f} combine_ms={combine_ms:.3f}"
+    )
+
+
+class _MoEStageTimer:
+    def __init__(self, report_interval: int):
+        if report_interval < 1:
+            raise ValueError("SGLANG_MOE_STAGE_TIMING_INTERVAL must be positive")
+        self.report_interval = report_interval
+        self.next_report = report_interval
+        # ponytail: one in-flight sample; use per-subbatch state to time TBO.
+        self.events = []
+        self.pending = deque()
+        self.samples = 0
+        self.dispatch_ms = 0.0
+        self.compute_ms = 0.0
+        self.combine_ms = 0.0
+
+    @staticmethod
+    def _record_event():
+        event = torch.cuda.Event(enable_timing=True)
+        event.record()
+        return event
+
+    def pre_dispatch(self, *_args):
+        self._drain()
+        self.events = [self._record_event()]
+
+    def post_dispatch(self, *_args):
+        self.events.append(self._record_event())
+
+    def begin_compute(self):
+        self.events.append(self._record_event())
+
+    def end_compute(self):
+        self.events.append(self._record_event())
+
+    def pre_combine(self, *_args):
+        self.events.append(self._record_event())
+
+    def post_combine(self, *_args):
+        self.events.append(self._record_event())
+        if len(self.events) == 6:
+            self.pending.append(tuple(self.events))
+        self.events = []
+        self._drain()
+
+    def _drain(self):
+        while self.pending and self.pending[0][-1].query():
+            events = self.pending.popleft()
+            self.dispatch_ms += events[0].elapsed_time(events[1])
+            self.compute_ms += events[2].elapsed_time(events[3])
+            self.combine_ms += events[4].elapsed_time(events[5])
+            self.samples += 1
+
+        if self.samples < self.next_report:
+            return
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        print(
+            _format_moe_stage_timing(
+                self.samples,
+                self.dispatch_ms,
+                self.compute_ms,
+                self.combine_ms,
+                rank,
+            ),
+            flush=True,
+        )
+        self.next_report = (
+            self.samples // self.report_interval + 1
+        ) * self.report_interval
+
+
+def _get_moe_stage_timer() -> Optional[_MoEStageTimer]:
+    global _moe_stage_timer
+    if not get_bool_env_var("SGLANG_MOE_STAGE_TIMING"):
+        return None
+    if _moe_stage_timer is None:
+        _moe_stage_timer = _MoEStageTimer(
+            int(os.environ.get("SGLANG_MOE_STAGE_TIMING_INTERVAL", "256"))
+        )
+    return _moe_stage_timer
 
 
 def _maybe_log_expert_load(moe_layer, dispatch_output) -> None:
@@ -175,6 +276,12 @@ class DeepEPMoE(FusedMoE):
                 "will be replaced with a deterministic balanced pattern."
             )
             DeepEPMoE._has_logged_router_force_balance = True
+        self._stage_timer = _get_moe_stage_timer()
+        if self._stage_timer is not None:
+            self.dispatcher.register_pre_dispatch_hook(self._stage_timer.pre_dispatch)
+            self.dispatcher.register_post_dispatch_hook(self._stage_timer.post_dispatch)
+            self.dispatcher.register_pre_combine_hook(self._stage_timer.pre_combine)
+            self.dispatcher.register_post_combine_hook(self._stage_timer.post_combine)
         is_humming = (
             get_moe_runner_backend().is_humming()
             or get_moe_runner_backend().is_auto()
@@ -395,6 +502,18 @@ class DeepEPMoE(FusedMoE):
         )
 
     def run_moe_core(
+        self,
+        dispatch_output: DispatchOutput,
+    ):
+        if self._stage_timer is not None:
+            self._stage_timer.begin_compute()
+        try:
+            return self._run_moe_core_impl(dispatch_output)
+        finally:
+            if self._stage_timer is not None:
+                self._stage_timer.end_compute()
+
+    def _run_moe_core_impl(
         self,
         dispatch_output: DispatchOutput,
     ):

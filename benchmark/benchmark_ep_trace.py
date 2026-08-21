@@ -10,7 +10,9 @@ Example:
     PYTHONPATH=python python benchmark/benchmark_ep_trace.py \
         --model Qwen/Qwen3-30B-A3B \
         --tp-size 8 --dp-size 8 --ep-size 8 --enable-dp-attention \
+        --moe-a2a-backend deepep \
         --dataset sharegpt --num-samples 128 --batch-size 8 \
+        --show-stage-timing --stage-timing-interval 256 \
         --output /tmp/qwen3_ep8_trace.pt
 """
 
@@ -18,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -169,6 +172,12 @@ def main() -> None:
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--log-level", default="info")
     parser.add_argument("--engine-args-json", default="{}")
+    parser.add_argument(
+        "--show-stage-timing",
+        action="store_true",
+        help="report DeepEP dispatch/combine communication versus expert compute time",
+    )
+    parser.add_argument("--stage-timing-interval", type=int, default=256)
 
     parser.add_argument("--text")
     parser.add_argument("--text-file", help="one prompt per line")
@@ -200,8 +209,14 @@ def main() -> None:
         parser.error("--batch-size and --num-samples must be positive")
     if args.max_new_tokens < 1:
         parser.error("--max-new-tokens must be positive")
+    if args.stage_timing_interval < 1:
+        parser.error("--stage-timing-interval must be positive")
     if Path(args.output).suffix not in {".pt", ".pth"}:
         parser.error("--output must be a .pt or .pth file")
+
+    if args.show_stage_timing:
+        os.environ["SGLANG_MOE_STAGE_TIMING"] = "1"
+        os.environ["SGLANG_MOE_STAGE_TIMING_INTERVAL"] = str(args.stage_timing_interval)
 
     result = run(args)
     output = json.dumps(result, indent=2)
