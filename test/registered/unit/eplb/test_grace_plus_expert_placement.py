@@ -156,15 +156,38 @@ def test_source_top_experts_copies_at_most_the_per_rank_limit():
         RoutedToken(1, (0,), 9),
     ]
 
-    replicas, copies = replicate_source_top_experts(
+    result = replicate_source_top_experts(
         tokens,
         {0: 0, 1: 0, 2: 1, 3: 1},
         num_ranks=2,
         max_extra_per_rank=1,
     )
 
-    assert replicas == {0: (0, 1), 1: (0,), 2: (1, 0), 3: (1,)}
-    assert copies == (1, 1)
+    assert result.replicas_by_expert == {
+        0: (0, 1),
+        1: (0,),
+        2: (1, 0),
+        3: (1,),
+    }
+    assert result.extra_copies == 2
+
+
+def test_source_top_experts_quota_limits_local_compute():
+    result = replicate_source_top_experts(
+        [
+            RoutedToken(0, (0,), 20),
+            RoutedToken(1, (0,), 80),
+            RoutedToken(1, (1,), 50),
+        ],
+        {0: 0, 1: 1},
+        num_ranks=2,
+        max_extra_per_rank=1,
+        compute_imbalance_limit=1,
+    )
+
+    assert result.replicas_by_expert == {0: (0, 1), 1: (1,)}
+    assert result.metrics.compute_load == (75, 75)
+    assert result.metrics.remote == 55
 
 
 def test_compute_balancing_adds_replica_and_reroutes_static_demand():

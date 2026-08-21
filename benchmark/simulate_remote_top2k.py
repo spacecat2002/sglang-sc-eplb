@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import time
 from pathlib import Path
 from typing import Sequence
@@ -30,6 +32,44 @@ def _rows(layer: int, method: str, metrics, copies: Sequence[int], elapsed: floa
     ]
 
 
+def _plan_entry(placement):
+    return {
+        "replicas": {
+            str(expert): list(ranks)
+            for expert, ranks in sorted(placement.replicas_by_expert.items())
+        },
+        "routing": [list(row) for row in placement.routing_by_source],
+        "quota": placement.quota_by_source,
+    }
+
+
+def _print_plan(gate: str, placement) -> None:
+    copies = [[] for _ in placement.routing_by_source]
+    for expert, ranks in placement.replicas_by_expert.items():
+        for rank in ranks[1:]:
+            copies[rank].append(expert)
+    print(f"[replicas] {gate}")
+    for rank, experts in enumerate(copies):
+        values = ", ".join(
+            f"expert {expert} <- rank {placement.replicas_by_expert[expert][0]}"
+            for expert in experts
+        )
+        print(f"  rank {rank}: {values or 'none'}")
+    print(f"[token-quota] {gate}")
+    for source, row in enumerate(placement.quota_by_source or ()):
+        for expert, values in enumerate(row):
+            ranks = placement.replicas_by_expert[expert]
+            if (
+                len(ranks) > 1
+                and placement.source_demand is not None
+                and placement.source_demand[expert, source]
+            ):
+                allocation = ", ".join(
+                    f"rank {rank}={value}" for rank, value in zip(ranks, values)
+                )
+                print(f"  source {source}, expert {expert}: {allocation}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", required=True, help="compact routing trace (.pt)")
@@ -37,6 +77,16 @@ def main() -> None:
         "--max-extra-experts-per-rank",
         type=int,
         help="remote expert replica limit per rank (default: 2 * trace Top-K)",
+    )
+    parser.add_argument(
+        "--compute-imbalance-limit",
+        type=float,
+        default=1.25,
+        help="maximum rank load / average load, when feasible (default: 1.25)",
+    )
+    parser.add_argument(
+        "--output-plan",
+        help="write replicas/routing/quota JSON for benchmark_a2a_plan.py",
     )
     args = parser.parse_args()
     if Path(args.input).suffix != ".pt":
@@ -46,6 +96,11 @@ def main() -> None:
         and args.max_extra_experts_per_rank < 0
     ):
         parser.error("--max-extra-experts-per-rank must be non-negative")
+    if (
+        not math.isfinite(args.compute_imbalance_limit)
+        or args.compute_imbalance_limit < 1
+    ):
+        parser.error("--compute-imbalance-limit must be at least 1")
     raw, layers = _load(args.input)
     num_ranks = int(raw["num_ranks"])
     top_k = int(raw["top_k"])
@@ -67,6 +122,7 @@ def main() -> None:
             "eval-ms",
         ]
     ]
+    plan = {}
     for layer, (gate, value, compact) in enumerate(layers):
         tokens, _ = _tokens(gate, value, compact, limit=0, seed=0)
         experts = tuple(range(int(value["topk_experts"].max().item()) + 1))
@@ -85,18 +141,25 @@ def main() -> None:
         )
 
         started = time.perf_counter()
-        replicas, copies = replicate_source_top_experts(
+        optimized = replicate_source_top_experts(
             tokens,
             primary,
             num_ranks=num_ranks,
             max_extra_per_rank=max_extra,
+            compute_imbalance_limit=args.compute_imbalance_limit,
         )
-        optimized = evaluate_replicated_placement(tokens, replicas, num_ranks=num_ranks)
+        if args.output_plan:
+            plan[gate] = _plan_entry(optimized)
+            _print_plan(gate, optimized)
+        copies = [0] * num_ranks
+        for ranks in optimized.replicas_by_expert.values():
+            for rank in ranks[1:]:
+                copies[rank] += 1
         rows.append(
             _rows(
                 layer,
                 f"remote-top{max_extra}",
-                optimized,
+                optimized.metrics,
                 copies,
                 time.perf_counter() - started,
             )
@@ -104,9 +167,15 @@ def main() -> None:
 
     print(
         f"trace={args.input}  EP={num_ranks}  K={top_k}  "
-        f"remote replica cap/rank={max_extra}"
+        f"remote replica cap/rank={max_extra}  "
+        f"compute limit={args.compute_imbalance_limit:.2f}x"
     )
     print(_table(rows))
+    if args.output_plan:
+        Path(args.output_plan).write_text(
+            json.dumps(plan, indent=2) + "\n", encoding="utf-8"
+        )
+        print(f"plan={args.output_plan}")
 
 
 if __name__ == "__main__":

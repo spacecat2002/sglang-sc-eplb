@@ -74,6 +74,21 @@ def test_normalize_quota_accepts_disabled_and_unobserved_routes():
     ) == [[[1, 0]], [[0, 0]]]
 
 
+def test_normalize_topn_plan_with_compute_quota():
+    raw = {
+        "gate": {
+            "replicas": {"0": [0, 1], "1": [1]},
+            "routing": [[0, 1], [0, 1]],
+            "quota": [[[20, 0], [1]], [[55, 25], [50]]],
+        }
+    }
+    plan = _MODULE._normalize_plan(raw, "gate", 2, 2)
+
+    assert plan == {0: (0, 1), 1: (1,)}
+    assert _MODULE._normalize_routing(raw, "gate", 2, 2) == [[0, 1], [0, 1]]
+    assert _MODULE._normalize_quota(raw, "gate", plan, 2, 2) == raw["gate"]["quota"]
+
+
 def test_scale_quota_preserves_total_with_stable_remainders():
     assert _MODULE._scale_quota([3, 1], 6) == [5, 1]
 
