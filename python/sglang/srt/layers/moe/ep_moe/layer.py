@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 from collections import deque
+from functools import partial
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
@@ -66,7 +67,8 @@ _moe_stage_timer = None
 
 
 def _format_moe_stage_timing(
-    samples: int,
+    batch: int,
+    layers: int,
     dispatch_ms: float,
     compute_ms: float,
     combine_ms: float,
@@ -77,7 +79,7 @@ def _format_moe_stage_timing(
     communication_pct = 100 * communication_ms / total_ms if total_ms else 0.0
     compute_pct = 100 * compute_ms / total_ms if total_ms else 0.0
     return (
-        f"[MoE stage timing][rank={rank}] samples={samples} "
+        f"[MoE stage timing][rank={rank}][prefill={batch}] layers={layers} "
         f"communication_ms={communication_ms:.3f} compute_ms={compute_ms:.3f} "
         f"communication_pct={communication_pct:.2f}% compute_pct={compute_pct:.2f}% "
         f"dispatch_ms={dispatch_ms:.3f} combine_ms={combine_ms:.3f}"
@@ -85,18 +87,22 @@ def _format_moe_stage_timing(
 
 
 class _MoEStageTimer:
-    def __init__(self, report_interval: int):
-        if report_interval < 1:
-            raise ValueError("SGLANG_MOE_STAGE_TIMING_INTERVAL must be positive")
-        self.report_interval = report_interval
-        self.next_report = report_interval
+    def __init__(self):
+        self.ready_file = os.environ.get("SGLANG_MOE_STAGE_TIMING_READY_FILE")
+        self.ready = self.ready_file is None
+        self.layer_ids = set()
+        self.batch = 0
         # ponytail: one in-flight sample; use per-subbatch state to time TBO.
         self.events = []
         self.pending = deque()
-        self.samples = 0
-        self.dispatch_ms = 0.0
-        self.compute_ms = 0.0
-        self.combine_ms = 0.0
+
+    def register_layer(self, layer_id: int):
+        self.layer_ids.add(layer_id)
+
+    def _enabled(self):
+        if not self.ready and os.path.exists(self.ready_file):
+            self.ready = True
+        return self.ready and get_is_extend_in_batch()
 
     @staticmethod
     def _record_event():
@@ -104,53 +110,62 @@ class _MoEStageTimer:
         event.record()
         return event
 
-    def pre_dispatch(self, *_args):
-        self._drain()
+    def pre_dispatch(self, _layer_id, *_args):
+        if not self._enabled():
+            self.events = []
+            return
         self.events = [self._record_event()]
 
-    def post_dispatch(self, *_args):
-        self.events.append(self._record_event())
+    def post_dispatch(self, _layer_id, *_args):
+        if self.events:
+            self.events.append(self._record_event())
 
-    def begin_compute(self):
-        self.events.append(self._record_event())
+    def begin_compute(self, _layer_id):
+        if self.events:
+            self.events.append(self._record_event())
 
-    def end_compute(self):
-        self.events.append(self._record_event())
+    def end_compute(self, _layer_id):
+        if self.events:
+            self.events.append(self._record_event())
 
-    def pre_combine(self, *_args):
-        self.events.append(self._record_event())
+    def pre_combine(self, _layer_id, *_args):
+        if self.events:
+            self.events.append(self._record_event())
 
-    def post_combine(self, *_args):
-        self.events.append(self._record_event())
-        if len(self.events) == 6:
-            self.pending.append(tuple(self.events))
-        self.events = []
-        self._drain()
-
-    def _drain(self):
-        while self.pending and self.pending[0][-1].query():
-            events = self.pending.popleft()
-            self.dispatch_ms += events[0].elapsed_time(events[1])
-            self.compute_ms += events[2].elapsed_time(events[3])
-            self.combine_ms += events[4].elapsed_time(events[5])
-            self.samples += 1
-
-        if self.samples < self.next_report:
+    def post_combine(self, layer_id, *_args):
+        if not self.events:
             return
+        self.events.append(self._record_event())
+        if len(self.events) != 6:
+            self.events = []
+            return
+        self.pending.append(tuple(self.events))
+        self.events = []
+        if layer_id == max(self.layer_ids):
+            self.pending[-1][-1].synchronize()
+            self._report_batch()
+
+    def _report_batch(self):
+        dispatch_ms = compute_ms = combine_ms = 0.0
+        layers = len(self.pending)
+        while self.pending:
+            events = self.pending.popleft()
+            dispatch_ms += events[0].elapsed_time(events[1])
+            compute_ms += events[2].elapsed_time(events[3])
+            combine_ms += events[4].elapsed_time(events[5])
+        self.batch += 1
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         print(
             _format_moe_stage_timing(
-                self.samples,
-                self.dispatch_ms,
-                self.compute_ms,
-                self.combine_ms,
+                self.batch,
+                layers,
+                dispatch_ms,
+                compute_ms,
+                combine_ms,
                 rank,
             ),
             flush=True,
         )
-        self.next_report = (
-            self.samples // self.report_interval + 1
-        ) * self.report_interval
 
 
 def _get_moe_stage_timer() -> Optional[_MoEStageTimer]:
@@ -158,9 +173,7 @@ def _get_moe_stage_timer() -> Optional[_MoEStageTimer]:
     if not get_bool_env_var("SGLANG_MOE_STAGE_TIMING"):
         return None
     if _moe_stage_timer is None:
-        _moe_stage_timer = _MoEStageTimer(
-            int(os.environ.get("SGLANG_MOE_STAGE_TIMING_INTERVAL", "256"))
-        )
+        _moe_stage_timer = _MoEStageTimer()
     return _moe_stage_timer
 
 
@@ -278,10 +291,19 @@ class DeepEPMoE(FusedMoE):
             DeepEPMoE._has_logged_router_force_balance = True
         self._stage_timer = _get_moe_stage_timer()
         if self._stage_timer is not None:
-            self.dispatcher.register_pre_dispatch_hook(self._stage_timer.pre_dispatch)
-            self.dispatcher.register_post_dispatch_hook(self._stage_timer.post_dispatch)
-            self.dispatcher.register_pre_combine_hook(self._stage_timer.pre_combine)
-            self.dispatcher.register_post_combine_hook(self._stage_timer.post_combine)
+            self._stage_timer.register_layer(self.layer_id)
+            self.dispatcher.register_pre_dispatch_hook(
+                partial(self._stage_timer.pre_dispatch, self.layer_id)
+            )
+            self.dispatcher.register_post_dispatch_hook(
+                partial(self._stage_timer.post_dispatch, self.layer_id)
+            )
+            self.dispatcher.register_pre_combine_hook(
+                partial(self._stage_timer.pre_combine, self.layer_id)
+            )
+            self.dispatcher.register_post_combine_hook(
+                partial(self._stage_timer.post_combine, self.layer_id)
+            )
         is_humming = (
             get_moe_runner_backend().is_humming()
             or get_moe_runner_backend().is_auto()
@@ -506,12 +528,12 @@ class DeepEPMoE(FusedMoE):
         dispatch_output: DispatchOutput,
     ):
         if self._stage_timer is not None:
-            self._stage_timer.begin_compute()
+            self._stage_timer.begin_compute(self.layer_id)
         try:
             return self._run_moe_core_impl(dispatch_output)
         finally:
             if self._stage_timer is not None:
-                self._stage_timer.end_compute()
+                self._stage_timer.end_compute(self.layer_id)
 
     def _run_moe_core_impl(
         self,
