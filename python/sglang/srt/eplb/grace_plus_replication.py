@@ -296,185 +296,29 @@ def _source_demand(
     return demand
 
 
-def _quota_source_replicas(
-    arrays: RoutedArrays,
-    replicas: Mapping[int, Sequence[int]],
-    source_demand: np.ndarray,
-    *,
-    num_ranks: int,
-    extra_copies: int,
-    compute_imbalance_limit: float,
-) -> ReplicaPlacement:
-    replicas, primary, replica_mask = _replica_arrays(arrays, replicas, num_ranks)
-    routing = _default_routing(primary, replica_mask, num_ranks)
-    instance_quota, compute = _greedy_instance_quotas(
-        source_demand.sum(axis=1), replicas, num_ranks
-    )
-    quota = _source_quotas(source_demand, instance_quota, routing)
-    average = source_demand.sum() / num_ranks
-    capacity = max(int(compute.max()), int(np.ceil(average * compute_imbalance_limit)))
-    changed = True
-    while changed:
-        changed = False
-        for source in range(num_ranks):
-            room = capacity - int(compute[source])
-            local_experts = sorted(
-                (expert for expert, ranks in replicas.items() if source in ranks),
-                key=lambda expert: (-source_demand[expert, source], expert),
-            )
-            for expert in local_experts:
-                for target in replicas[expert]:
-                    if target == source or not room:
-                        continue
-                    moved = min(room, int(quota[source, expert, target]))
-                    quota[source, expert, target] -= moved
-                    quota[source, expert, source] += moved
-                    compute[target] -= moved
-                    compute[source] += moved
-                    room -= moved
-                    changed |= bool(moved)
-    routing = np.where(quota.sum(axis=2) > 0, quota.argmax(axis=2), routing)
-    serialized_quota = tuple(
-        tuple(
-            (
-                tuple(int(quota[source, expert, rank]) for rank in replicas[expert])
-                if source_demand[expert, source]
-                else tuple(
-                    int(rank == routing[source, expert]) for rank in replicas[expert]
-                )
-            )
-            for expert in range(len(primary))
-        )
-        for source in range(num_ranks)
-    )
-    return ReplicaPlacement(
-        replicas,
-        tuple(tuple(int(rank) for rank in row) for row in routing),
-        _route_quota(arrays, quota, source_demand, replicas),
-        extra_copies,
-        quota_by_source=serialized_quota,
-        source_demand=source_demand,
-    )
-
-
-def _affinity_replicas(
-    arrays: RoutedArrays,
-    primary: Mapping[int, int],
-    *,
-    num_ranks: int,
-    max_extra_per_rank: int,
-) -> tuple[dict[int, tuple[int, ...]], int]:
-    """Choose source-local replica pairs by communication-relevant affinity."""
-
-    primary_rank = np.asarray([primary[expert] for expert in range(len(primary))])
-    affinity: dict[tuple[int, int, int], int] = {}
-    topk = arrays.topk_experts
-    for left_column in range(topk.shape[1]):
-        left = topk[:, left_column]
-        for right_column in range(left_column + 1, topk.shape[1]):
-            right = topk[:, right_column]
-            low = np.minimum(left, right)
-            high = np.maximum(left, right)
-            destination = primary_rank[low]
-            useful = (destination == primary_rank[high]) & (
-                arrays.source_rank != destination
-            )
-            if not np.any(useful):
-                continue
-            source_values = arrays.source_rank[useful].astype(np.int64, copy=False)
-            low_values = low[useful].astype(np.int64, copy=False)
-            high_values = high[useful].astype(np.int64, copy=False)
-            keys = (source_values * len(primary_rank) + low_values) * len(
-                primary_rank
-            ) + high_values
-            unique, inverse = np.unique(keys, return_inverse=True)
-            weights = np.zeros(len(unique), dtype=np.int64)
-            np.add.at(weights, inverse, arrays.count[useful])
-            for key, weight in zip(unique, weights):
-                right_expert = int(key % len(primary_rank))
-                value = int(key // len(primary_rank))
-                left_expert = value % len(primary_rank)
-                source = value // len(primary_rank)
-                affinity[source, left_expert, right_expert] = int(weight)
-
-    replicas = {expert: (rank,) for expert, rank in primary.items()}
-    extra_by_rank = np.zeros(num_ranks, dtype=np.int64)
-    for (source, left, right), _ in sorted(
-        affinity.items(), key=lambda item: (-item[1], item[0])
-    ):
-        missing = tuple(
-            expert for expert in (left, right) if source not in replicas[expert]
-        )
-        if len(missing) > max_extra_per_rank - extra_by_rank[source]:
-            continue
-        for expert in missing:
-            replicas[expert] += (source,)
-        extra_by_rank[source] += len(missing)
-    return replicas, int(extra_by_rank.sum())
-
-
 def replicate_source_top_experts(
     tokens: Sequence[RoutedToken] | RoutedArrays,
     primary: Mapping[int, int],
     *,
     num_ranks: int,
     max_extra_per_rank: int,
-    compute_imbalance_limit: float = 1.25,
-) -> ReplicaPlacement:
-    """Use single-expert gain, with source affinity as a conservative fallback."""
+) -> tuple[dict[int, tuple[int, ...]], tuple[int, ...]]:
+    """Copy each source rank's most frequent remote experts."""
 
-    if compute_imbalance_limit < 1 or not np.isfinite(compute_imbalance_limit):
-        raise ValueError("invalid compute imbalance limit")
     arrays = as_routed_arrays(tokens)
-    communication = replicate_hot_experts(
-        arrays,
-        primary,
-        num_ranks=num_ranks,
-        objective="remote",
-        hot_experts=len(primary),
-        candidate_ranks=num_ranks,
-        compute_imbalance_limit=float("inf"),
-        max_extra_per_rank=max_extra_per_rank,
-    )
-    source_demand = communication.source_demand
-    assert source_demand is not None
-    single = _quota_source_replicas(
-        arrays,
-        communication.replicas_by_expert,
-        source_demand,
-        num_ranks=num_ranks,
-        extra_copies=communication.extra_copies,
-        compute_imbalance_limit=compute_imbalance_limit,
-    )
-    affinity_replicas, affinity_copies = _affinity_replicas(
-        arrays,
-        primary,
-        num_ranks=num_ranks,
-        max_extra_per_rank=max_extra_per_rank,
-    )
-    affinity = _quota_source_replicas(
-        arrays,
-        affinity_replicas,
-        source_demand,
-        num_ranks=num_ranks,
-        extra_copies=affinity_copies,
-        compute_imbalance_limit=compute_imbalance_limit,
-    )
-    old = single.metrics
-    new = affinity.metrics
-    return (
-        affinity
-        if new.max_ingress <= old.max_ingress
-        and new.max_egress <= old.max_egress
-        and (
-            new.max_ingress,
-            new.max_egress,
-            new.max_pair_traffic,
-            new.remote,
-        )
-        < (old.max_ingress, old.max_egress, old.max_pair_traffic, old.remote)
-        else single
-    )
+    demand = _source_demand(arrays, len(primary), num_ranks)
+    primary_rank = np.asarray([primary[expert] for expert in range(len(primary))])
+    replicas = {expert: (rank,) for expert, rank in primary.items()}
+    copies = []
+    for rank in range(num_ranks):
+        candidates = np.flatnonzero((demand[:, rank] > 0) & (primary_rank != rank))
+        selected = sorted(
+            candidates, key=lambda expert: (-demand[expert, rank], expert)
+        )[:max_extra_per_rank]
+        for expert in selected:
+            replicas[int(expert)] += (rank,)
+        copies.append(len(selected))
+    return replicas, tuple(copies)
 
 
 def _waterfill(loads: np.ndarray, ranks: Sequence[int], demand: int) -> np.ndarray:

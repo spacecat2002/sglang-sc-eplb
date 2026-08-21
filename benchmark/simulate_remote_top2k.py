@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import math
 import time
 from pathlib import Path
 from typing import Sequence
@@ -39,12 +38,6 @@ def main() -> None:
         type=int,
         help="remote expert replica limit per rank (default: 2 * trace Top-K)",
     )
-    parser.add_argument(
-        "--compute-imbalance-limit",
-        type=float,
-        default=1.25,
-        help="maximum rank load / average load, when feasible (default: 1.25)",
-    )
     args = parser.parse_args()
     if Path(args.input).suffix != ".pt":
         parser.error("--input must be a compact .pt routing trace")
@@ -53,12 +46,6 @@ def main() -> None:
         and args.max_extra_experts_per_rank < 0
     ):
         parser.error("--max-extra-experts-per-rank must be non-negative")
-    if (
-        not math.isfinite(args.compute_imbalance_limit)
-        or args.compute_imbalance_limit < 1
-    ):
-        parser.error("--compute-imbalance-limit must be at least 1")
-
     raw, layers = _load(args.input)
     num_ranks = int(raw["num_ranks"])
     top_k = int(raw["top_k"])
@@ -98,22 +85,18 @@ def main() -> None:
         )
 
         started = time.perf_counter()
-        optimized = replicate_source_top_experts(
+        replicas, copies = replicate_source_top_experts(
             tokens,
             primary,
             num_ranks=num_ranks,
             max_extra_per_rank=max_extra,
-            compute_imbalance_limit=args.compute_imbalance_limit,
         )
-        copies = [0] * num_ranks
-        for ranks in optimized.replicas_by_expert.values():
-            for rank in ranks[1:]:
-                copies[rank] += 1
+        optimized = evaluate_replicated_placement(tokens, replicas, num_ranks=num_ranks)
         rows.append(
             _rows(
                 layer,
                 f"remote-top{max_extra}",
-                optimized.metrics,
+                optimized,
                 copies,
                 time.perf_counter() - started,
             )
@@ -121,7 +104,7 @@ def main() -> None:
 
     print(
         f"trace={args.input}  EP={num_ranks}  K={top_k}  "
-        f"remote replica cap/rank={max_extra}  compute limit={args.compute_imbalance_limit:.2f}x"
+        f"remote replica cap/rank={max_extra}"
     )
     print(_table(rows))
 

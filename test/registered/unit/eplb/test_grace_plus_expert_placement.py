@@ -5,7 +5,6 @@ import numpy as np
 from sglang.srt.eplb.expert_affinity_graph import (
     RoutedArrays,
     RoutedToken,
-    as_routed_arrays,
     build_co_routing_graph,
     evaluate_primary_remote,
 )
@@ -18,7 +17,6 @@ from sglang.srt.eplb.grace_plus_replication import (
     _instance_quotas,
     _greedy_instance_quotas,
     _joint_quotas,
-    _quota_source_replicas,
     _quota_prefix,
     _route_quota,
     balance_replica_compute,
@@ -150,102 +148,23 @@ def test_replication_uses_source_local_routing_and_respects_slots():
     assert max(congestion.metrics.max_ingress, congestion.metrics.max_egress) == 15
 
 
-def test_source_top_experts_uses_bundle_communication_gain():
+def test_source_top_experts_copies_at_most_the_per_rank_limit():
     tokens = [
-        RoutedToken(0, (0, 1), 100),
-        RoutedToken(0, (2, 3), 10),
+        RoutedToken(0, (2,), 10),
+        RoutedToken(0, (3,), 7),
+        RoutedToken(0, (1,), 20),
+        RoutedToken(1, (0,), 9),
     ]
 
-    result = replicate_source_top_experts(
+    replicas, copies = replicate_source_top_experts(
         tokens,
-        {0: 1, 1: 1, 2: 2, 3: 0},
-        num_ranks=3,
+        {0: 0, 1: 0, 2: 1, 3: 1},
+        num_ranks=2,
         max_extra_per_rank=1,
     )
 
-    assert result.replicas_by_expert == {0: (1,), 1: (1,), 2: (2, 0), 3: (0,)}
-    assert result.extra_copies == 1
-
-
-def test_source_top_experts_quota_limits_local_compute():
-    tokens = [
-        RoutedToken(0, (0,), 20),
-        RoutedToken(1, (0,), 80),
-        RoutedToken(1, (1,), 50),
-    ]
-
-    result = replicate_source_top_experts(
-        tokens,
-        {0: 0, 1: 1},
-        num_ranks=2,
-        max_extra_per_rank=1,
-        compute_imbalance_limit=1,
-    )
-
-    assert result.replicas_by_expert == {0: (0, 1), 1: (1,)}
-    assert result.metrics.compute_load == (75, 75)
-    assert result.metrics.remote == 55
-
-
-def test_source_top_experts_uses_affinity_to_cross_zero_single_gain():
-    tokens = [
-        RoutedToken(0, (0, 1), 100),
-        RoutedToken(1, (2, 3), 10),
-    ]
-
-    result = replicate_source_top_experts(
-        tokens,
-        {0: 1, 1: 1, 2: 0, 3: 0},
-        num_ranks=2,
-        max_extra_per_rank=2,
-        compute_imbalance_limit=2,
-    )
-
-    assert result.replicas_by_expert == {
-        0: (1, 0),
-        1: (1, 0),
-        2: (0, 1),
-        3: (0, 1),
-    }
-    assert result.metrics.remote == 0
-
-
-def test_source_top_experts_affinity_never_worsens_ingress_or_egress():
-    tokens = [
-        RoutedToken(0, (0, 1), 100),
-        RoutedToken(0, (2, 4), 150),
-    ]
-    primary = {0: 1, 1: 1, 2: 1, 3: 0, 4: 0}
-    arrays = as_routed_arrays(tokens)
-    communication = replicate_hot_experts(
-        arrays,
-        primary,
-        num_ranks=2,
-        objective="remote",
-        hot_experts=len(primary),
-        candidate_ranks=2,
-        compute_imbalance_limit=float("inf"),
-        max_extra_per_rank=2,
-    )
-    single = _quota_source_replicas(
-        arrays,
-        communication.replicas_by_expert,
-        communication.source_demand,
-        num_ranks=2,
-        extra_copies=communication.extra_copies,
-        compute_imbalance_limit=2,
-    )
-
-    result = replicate_source_top_experts(
-        tokens,
-        primary,
-        num_ranks=2,
-        max_extra_per_rank=2,
-        compute_imbalance_limit=2,
-    )
-
-    assert result.replicas_by_expert == single.replicas_by_expert
-    assert result.metrics == single.metrics
+    assert replicas == {0: (0, 1), 1: (0,), 2: (1, 0), 3: (1,)}
+    assert copies == (1, 1)
 
 
 def test_compute_balancing_adds_replica_and_reroutes_static_demand():
