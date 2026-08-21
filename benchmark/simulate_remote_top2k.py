@@ -45,11 +45,6 @@ def main() -> None:
         default=1.25,
         help="maximum rank load / average load, when feasible (default: 1.25)",
     )
-    parser.add_argument(
-        "--objective",
-        choices=("remote", "ingress-egress"),
-        default="ingress-egress",
-    )
     args = parser.parse_args()
     if Path(args.input).suffix != ".pt":
         parser.error("--input must be a compact .pt routing trace")
@@ -109,7 +104,6 @@ def main() -> None:
             num_ranks=num_ranks,
             max_extra_per_rank=max_extra,
             compute_imbalance_limit=args.compute_imbalance_limit,
-            objective=args.objective,
         )
         copies = [0] * num_ranks
         for ranks in optimized.replicas_by_expert.values():
@@ -118,7 +112,7 @@ def main() -> None:
         rows.append(
             _rows(
                 layer,
-                f"bundle-top{max_extra}",
+                f"remote-top{max_extra}",
                 optimized.metrics,
                 copies,
                 time.perf_counter() - started,
@@ -127,8 +121,7 @@ def main() -> None:
 
     print(
         f"trace={args.input}  EP={num_ranks}  K={top_k}  "
-        f"remote replica cap/rank={max_extra}  compute limit={args.compute_imbalance_limit:.2f}x  "
-        f"objective={args.objective}"
+        f"remote replica cap/rank={max_extra}  compute limit={args.compute_imbalance_limit:.2f}x"
     )
     print(_table(rows))
 

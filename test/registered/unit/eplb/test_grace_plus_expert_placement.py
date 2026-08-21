@@ -5,6 +5,7 @@ import numpy as np
 from sglang.srt.eplb.expert_affinity_graph import (
     RoutedArrays,
     RoutedToken,
+    as_routed_arrays,
     build_co_routing_graph,
     evaluate_primary_remote,
 )
@@ -17,6 +18,7 @@ from sglang.srt.eplb.grace_plus_replication import (
     _instance_quotas,
     _greedy_instance_quotas,
     _joint_quotas,
+    _quota_source_replicas,
     _quota_prefix,
     _route_quota,
     balance_replica_compute,
@@ -165,23 +167,6 @@ def test_source_top_experts_uses_bundle_communication_gain():
     assert result.extra_copies == 1
 
 
-def test_source_top_experts_copies_a_complete_destination_group():
-    result = replicate_source_top_experts(
-        [RoutedToken(0, (0, 1), 100)],
-        {0: 1, 1: 1},
-        num_ranks=2,
-        max_extra_per_rank=2,
-        compute_imbalance_limit=2,
-    )
-
-    assert result.replicas_by_expert == {0: (1, 0), 1: (1, 0)}
-    assert result.extra_copies == 2
-    assert result.metrics.remote == 0
-    assert result.quota_by_source is None
-    assert result.bundle_actions == ((0, 1, (0, 1), 100),)
-    assert result.routing_by_source == ((1, 1), (1, 1))
-
-
 def test_source_top_experts_quota_limits_local_compute():
     tokens = [
         RoutedToken(0, (0,), 20),
@@ -202,59 +187,65 @@ def test_source_top_experts_quota_limits_local_compute():
     assert result.metrics.remote == 55
 
 
-def test_source_top_experts_scores_compute_limited_gain():
+def test_source_top_experts_uses_affinity_to_cross_zero_single_gain():
     tokens = [
         RoutedToken(0, (0, 1), 100),
-        RoutedToken(0, (2, 3), 8),
-        RoutedToken(0, (3, 4), 80),
+        RoutedToken(1, (2, 3), 10),
     ]
 
     result = replicate_source_top_experts(
         tokens,
-        {0: 1, 1: 1, 2: 1, 3: 0, 4: 0},
+        {0: 1, 1: 1, 2: 0, 3: 0},
         num_ranks=2,
         max_extra_per_rank=2,
-        compute_imbalance_limit=1,
+        compute_imbalance_limit=2,
     )
 
     assert result.replicas_by_expert == {
-        0: (1,),
-        1: (1,),
-        2: (1, 0),
-        3: (0,),
-        4: (0,),
+        0: (1, 0),
+        1: (1, 0),
+        2: (0, 1),
+        3: (0, 1),
     }
-    assert result.metrics.remote == 100
+    assert result.metrics.remote == 0
 
 
-def test_source_top_experts_supports_ingress_egress_objective():
+def test_source_top_experts_affinity_never_worsens_ingress_or_egress():
     tokens = [
-        RoutedToken(0, (0, 4), 70),
-        RoutedToken(0, (1, 4), 60),
-        RoutedToken(1, (2, 3), 60),
+        RoutedToken(0, (0, 1), 100),
+        RoutedToken(0, (2, 4), 150),
     ]
-    primary = {0: 1, 1: 2, 2: 2, 3: 2, 4: 0}
-
-    remote = replicate_source_top_experts(
-        tokens,
+    primary = {0: 1, 1: 1, 2: 1, 3: 0, 4: 0}
+    arrays = as_routed_arrays(tokens)
+    communication = replicate_hot_experts(
+        arrays,
         primary,
-        num_ranks=3,
-        max_extra_per_rank=1,
-        compute_imbalance_limit=10,
+        num_ranks=2,
         objective="remote",
+        hot_experts=len(primary),
+        candidate_ranks=2,
+        compute_imbalance_limit=float("inf"),
+        max_extra_per_rank=2,
     )
-    congestion = replicate_source_top_experts(
-        tokens,
-        primary,
-        num_ranks=3,
-        max_extra_per_rank=1,
-        compute_imbalance_limit=10,
-        objective="ingress-egress",
+    single = _quota_source_replicas(
+        arrays,
+        communication.replicas_by_expert,
+        communication.source_demand,
+        num_ranks=2,
+        extra_copies=communication.extra_copies,
+        compute_imbalance_limit=2,
     )
 
-    assert remote.replicas_by_expert[0] == (1, 0)
-    assert congestion.replicas_by_expert[1] == (2, 0)
-    assert congestion.metrics.max_ingress < remote.metrics.max_ingress
+    result = replicate_source_top_experts(
+        tokens,
+        primary,
+        num_ranks=2,
+        max_extra_per_rank=2,
+        compute_imbalance_limit=2,
+    )
+
+    assert result.replicas_by_expert == single.replicas_by_expert
+    assert result.metrics == single.metrics
 
 
 def test_compute_balancing_adds_replica_and_reroutes_static_demand():
