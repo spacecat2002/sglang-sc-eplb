@@ -43,33 +43,6 @@ def _plan_entry(placement):
     }
 
 
-def _print_plan(gate: str, placement) -> None:
-    copies = [[] for _ in placement.routing_by_source]
-    for expert, ranks in placement.replicas_by_expert.items():
-        for rank in ranks[1:]:
-            copies[rank].append(expert)
-    print(f"[replicas] {gate}")
-    for rank, experts in enumerate(copies):
-        values = ", ".join(
-            f"expert {expert} <- rank {placement.replicas_by_expert[expert][0]}"
-            for expert in experts
-        )
-        print(f"  rank {rank}: {values or 'none'}")
-    print(f"[token-quota] {gate}")
-    for source, row in enumerate(placement.quota_by_source or ()):
-        for expert, values in enumerate(row):
-            ranks = placement.replicas_by_expert[expert]
-            if (
-                len(ranks) > 1
-                and placement.source_demand is not None
-                and placement.source_demand[expert, source]
-            ):
-                allocation = ", ".join(
-                    f"rank {rank}={value}" for rank, value in zip(ranks, values)
-                )
-                print(f"  source {source}, expert {expert}: {allocation}")
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", required=True, help="compact routing trace (.pt)")
@@ -81,8 +54,7 @@ def main() -> None:
     parser.add_argument(
         "--compute-imbalance-limit",
         type=float,
-        default=1.25,
-        help="maximum rank load / average load, when feasible (default: 1.25)",
+        help="maximum rank load / average load; omit for original all-local Top-N",
     )
     parser.add_argument(
         "--output-plan",
@@ -96,7 +68,7 @@ def main() -> None:
         and args.max_extra_experts_per_rank < 0
     ):
         parser.error("--max-extra-experts-per-rank must be non-negative")
-    if (
+    if args.compute_imbalance_limit is not None and (
         not math.isfinite(args.compute_imbalance_limit)
         or args.compute_imbalance_limit < 1
     ):
@@ -150,7 +122,6 @@ def main() -> None:
         )
         if args.output_plan:
             plan[gate] = _plan_entry(optimized)
-            _print_plan(gate, optimized)
         copies = [0] * num_ranks
         for ranks in optimized.replicas_by_expert.values():
             for rank in ranks[1:]:
@@ -165,10 +136,14 @@ def main() -> None:
             )
         )
 
+    compute = (
+        f"{args.compute_imbalance_limit:.2f}x"
+        if args.compute_imbalance_limit is not None
+        else "none (all-local)"
+    )
     print(
         f"trace={args.input}  EP={num_ranks}  K={top_k}  "
-        f"remote replica cap/rank={max_extra}  "
-        f"compute limit={args.compute_imbalance_limit:.2f}x"
+        f"remote replica cap/rank={max_extra}  compute limit={compute}"
     )
     print(_table(rows))
     if args.output_plan:

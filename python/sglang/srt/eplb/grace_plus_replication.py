@@ -302,13 +302,15 @@ def replicate_source_top_experts(
     *,
     num_ranks: int,
     max_extra_per_rank: int,
-    compute_imbalance_limit: float = 1.25,
+    compute_imbalance_limit: float | None = None,
 ) -> ReplicaPlacement:
-    """Copy each source's top remote experts, then quota-route their compute."""
+    """Copy each source's top remote experts, optionally quota-routing compute."""
 
     if max_extra_per_rank < 0:
         raise ValueError("max_extra_per_rank must be non-negative")
-    if compute_imbalance_limit < 1 or not np.isfinite(compute_imbalance_limit):
+    if compute_imbalance_limit is not None and (
+        compute_imbalance_limit < 1 or not np.isfinite(compute_imbalance_limit)
+    ):
         raise ValueError("invalid compute imbalance limit")
     arrays = as_routed_arrays(tokens)
     demand = _source_demand(arrays, len(primary), num_ranks)
@@ -326,6 +328,14 @@ def replicate_source_top_experts(
 
     replicas, primary_rank, replica_mask = _replica_arrays(arrays, replicas, num_ranks)
     routing = _default_routing(primary_rank, replica_mask, num_ranks)
+    if compute_imbalance_limit is None:
+        return ReplicaPlacement(
+            replicas,
+            tuple(tuple(int(rank) for rank in row) for row in routing),
+            _route(arrays, primary_rank, replica_mask, num_ranks=num_ranks),
+            extra_copies,
+            source_demand=demand,
+        )
     instance_quota, compute = _greedy_instance_quotas(
         demand.sum(axis=1), replicas, num_ranks
     )

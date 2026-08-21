@@ -170,6 +170,10 @@ def test_source_top_experts_copies_at_most_the_per_rank_limit():
         3: (1,),
     }
     assert result.extra_copies == 2
+    assert result.quota_by_source is None
+    assert result.metrics == evaluate_replicated_placement(
+        tokens, result.replicas_by_expert, num_ranks=2
+    )
 
 
 def test_source_top_experts_quota_limits_local_compute():
