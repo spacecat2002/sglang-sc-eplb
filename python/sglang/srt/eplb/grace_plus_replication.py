@@ -37,6 +37,8 @@ class ReplicaPlacement:
     balance_copies: int = 0
     quota_by_source: tuple[tuple[tuple[int, ...], ...], ...] | None = None
     source_demand: np.ndarray | None = field(default=None, repr=False, compare=False)
+    # (source, primary destination, co-routed experts, token quota) local overrides.
+    bundle_actions: tuple[tuple[int, int, tuple[int, ...], int], ...] | None = None
 
 
 def _replica_arrays(
@@ -296,6 +298,44 @@ def _source_demand(
     return demand
 
 
+def _action_metric_keys(
+    traffic: np.ndarray,
+    source: np.ndarray,
+    destination: np.ndarray,
+    amount: np.ndarray,
+    objective: str,
+) -> np.ndarray:
+    """Evaluate all single-edge traffic reductions without copying the matrix."""
+
+    def max_excluding(values: np.ndarray) -> np.ndarray:
+        maximum = values.max(initial=0)
+        second = values[values < maximum].max(initial=0)
+        return np.where(
+            (values == maximum) & (np.count_nonzero(values == maximum) == 1),
+            second,
+            maximum,
+        )
+
+    ingress = traffic.sum(axis=0)
+    egress = traffic.sum(axis=1)
+    other_ingress = max_excluding(ingress)
+    other_egress = max_excluding(egress)
+    flat = traffic.ravel()
+    other_pair = max_excluding(flat).reshape(traffic.shape)
+    next_ingress = np.maximum(other_ingress[destination], ingress[destination] - amount)
+    next_egress = np.maximum(other_egress[source], egress[source] - amount)
+    congestion = np.maximum(next_ingress, next_egress)
+    pair = np.maximum(
+        other_pair[source, destination], traffic[source, destination] - amount
+    )
+    remote = int(traffic.sum()) - amount
+    return np.column_stack(
+        (congestion, pair, remote)
+        if objective == "ingress-egress"
+        else (remote, congestion, pair)
+    )
+
+
 def replicate_source_top_experts(
     tokens: Sequence[RoutedToken] | RoutedArrays,
     primary: Mapping[int, int],
@@ -303,74 +343,137 @@ def replicate_source_top_experts(
     num_ranks: int,
     max_extra_per_rank: int,
     compute_imbalance_limit: float = 1.25,
+    objective: str = "remote",
 ) -> ReplicaPlacement:
-    """Select replicas by exact bundle gain, then quota-route within the load limit."""
+    """Greedily copy complete bundle destination groups within rank load limits."""
 
+    if objective not in {"remote", "ingress-egress"}:
+        raise ValueError("invalid replication objective")
+    if max_extra_per_rank < 0:
+        raise ValueError("max_extra_per_rank must be non-negative")
     if compute_imbalance_limit < 1 or not np.isfinite(compute_imbalance_limit):
         raise ValueError("invalid compute imbalance limit")
     arrays = as_routed_arrays(tokens)
-    communication = replicate_hot_experts(
-        arrays,
-        primary,
-        num_ranks=num_ranks,
-        objective="remote",
-        hot_experts=len(primary),
-        candidate_ranks=num_ranks,
-        compute_imbalance_limit=float("inf"),
-        max_extra_per_rank=max_extra_per_rank,
-    )
-    source_demand = communication.source_demand
-    assert source_demand is not None
-    replicas = communication.replicas_by_expert
-    routing = np.asarray(communication.routing_by_source, dtype=np.intp)
-    instance_quota, compute = _greedy_instance_quotas(
-        source_demand.sum(axis=1), replicas, num_ranks
-    )
-    quota = _source_quotas(source_demand, instance_quota, routing)
-    average = source_demand.sum() / num_ranks
-    capacity = max(int(compute.max()), int(np.ceil(average * compute_imbalance_limit)))
-    # ponytail: greedy local fill; use joint quotas only if this leaves measurable A2A.
-    changed = True
-    while changed:
-        changed = False
-        for source in range(num_ranks):
-            room = capacity - int(compute[source])
-            local_experts = sorted(
-                (expert for expert, ranks in replicas.items() if source in ranks),
-                key=lambda expert: (-source_demand[expert, source], expert),
-            )
-            for expert in local_experts:
-                for target in replicas[expert]:
-                    if target == source or not room:
-                        continue
-                    moved = min(room, int(quota[source, expert, target]))
-                    quota[source, expert, target] -= moved
-                    quota[source, expert, source] += moved
-                    compute[target] -= moved
-                    compute[source] += moved
-                    room -= moved
-                    changed |= bool(moved)
-    routing = np.where(quota.sum(axis=2) > 0, quota.argmax(axis=2), routing)
-    serialized_quota = tuple(
-        tuple(
-            (
-                tuple(int(quota[source, expert, rank]) for rank in replicas[expert])
-                if source_demand[expert, source]
-                else tuple(
-                    int(rank == routing[source, expert]) for rank in replicas[expert]
-                )
-            )
-            for expert in range(len(primary))
+    replicas, primary_rank, replica_mask = _replica_arrays(arrays, primary, num_ranks)
+    source_demand = _source_demand(arrays, len(primary_rank), num_ranks)
+    expert_demand = source_demand.sum(axis=1)
+    compute = np.zeros(num_ranks, dtype=np.int64)
+    np.add.at(compute, primary_rank, expert_demand)
+    capacity = int(np.ceil(compute.sum() / num_ranks * compute_imbalance_limit))
+    traffic = np.zeros((num_ranks, num_ranks), dtype=np.int64)
+    actions: dict[tuple[int, int, tuple[int, ...]], int] = {}
+    destinations = primary_rank[arrays.topk_experts]
+    for destination in range(num_ranks):
+        active = (arrays.source_rank != destination) & np.any(
+            destinations == destination, axis=1
         )
-        for source in range(num_ranks)
+        if not np.any(active):
+            continue
+        source = arrays.source_rank[active]
+        count = arrays.count[active]
+        np.add.at(traffic[:, destination], source, count)
+        groups = np.where(
+            destinations[active] == destination, arrays.topk_experts[active], -1
+        )
+        encoded = np.column_stack((source, groups))
+        unique, inverse = np.unique(encoded, axis=0, return_inverse=True)
+        weights = np.zeros(len(unique), dtype=np.int64)
+        np.add.at(weights, inverse, count)
+        for row, weight in zip(unique, weights):
+            experts = tuple(int(expert) for expert in row[1:] if expert >= 0)
+            actions[(int(row[0]), destination, experts)] = int(weight)
+
+    action_items = sorted(actions.items())
+    action_source = np.asarray([key[0] for key, _ in action_items], dtype=np.intp)
+    action_destination = np.asarray([key[1] for key, _ in action_items], dtype=np.intp)
+    action_size = np.asarray([len(key[2]) for key, _ in action_items], dtype=np.intp)
+    action_experts = np.full(
+        (len(action_items), arrays.topk_experts.shape[1]), -1, dtype=np.intp
     )
+    for index, ((_, _, experts), _) in enumerate(action_items):
+        action_experts[index, : len(experts)] = experts
+    action_remaining = np.asarray(
+        [weight for _, weight in action_items], dtype=np.int64
+    )
+    valid_expert = action_experts >= 0
+    extra_by_rank = np.zeros(num_ranks, dtype=np.int64)
+    selected_actions: list[tuple[int, int, tuple[int, ...], int]] = []
+    current_key = np.asarray(_key(traffic, 0, 0, 0, objective))
+    while True:
+        present = replica_mask[np.maximum(action_experts, 0), action_source[:, None]]
+        missing_mask = valid_expert & ~present
+        slots = missing_mask.sum(axis=1)
+        room = np.maximum(capacity - compute[action_source], 0)
+        amount = np.minimum(action_remaining, room // action_size)
+        feasible = (amount > 0) & (
+            slots <= max_extra_per_rank - extra_by_rank[action_source]
+        )
+        if not np.any(feasible):
+            break
+        next_keys = _action_metric_keys(
+            traffic, action_source, action_destination, amount, objective
+        )
+        different = next_keys != current_key
+        first_difference = different.argmax(axis=1)
+        improves = different.any(axis=1) & (
+            next_keys[np.arange(len(next_keys)), first_difference]
+            < current_key[first_difference]
+        )
+        feasible &= improves
+        candidates = np.flatnonzero(feasible)
+        if not len(candidates):
+            break
+        cost = np.maximum(slots, 1)
+        improvement = (current_key - next_keys) / cost[:, None]
+        score = (
+            -np.arange(len(action_items)),
+            -action_destination,
+            -action_source,
+            -slots,
+            amount / cost,
+            slots == 0,
+            improvement[:, 2],
+            improvement[:, 1],
+            improvement[:, 0],
+        )
+        best = int(candidates[np.lexsort(tuple(key[candidates] for key in score))[-1]])
+        source = int(action_source[best])
+        destination = int(action_destination[best])
+        experts = action_experts[best, valid_expert[best]]
+        selected_amount = int(amount[best])
+        for expert in action_experts[best, missing_mask[best]]:
+            replicas[expert] += (source,)
+            replica_mask[expert, source] = True
+        extra_by_rank[source] += int(slots[best])
+        action_remaining[best] -= selected_amount
+        traffic[source, destination] -= selected_amount
+        work = selected_amount * len(experts)
+        compute[source] += work
+        compute[destination] -= work
+        selected_actions.append(
+            (
+                source,
+                destination,
+                tuple(int(expert) for expert in experts),
+                selected_amount,
+            )
+        )
+        current_key = next_keys[best]
+
+    routing = np.broadcast_to(primary_rank, (num_ranks, len(primary_rank)))
     return ReplicaPlacement(
         replicas,
         tuple(tuple(int(rank) for rank in row) for row in routing),
-        _route_quota(arrays, quota, source_demand, replicas),
-        communication.extra_copies,
-        quota_by_source=serialized_quota,
+        ReplicaMetrics(
+            remote=int(traffic.sum()),
+            max_pair_traffic=int(traffic.max(initial=0)),
+            max_ingress=int(traffic.sum(axis=0).max(initial=0)),
+            max_egress=int(traffic.sum(axis=1).max(initial=0)),
+            compute_load=tuple(int(load) for load in compute),
+        ),
+        int(extra_by_rank.sum()),
         source_demand=source_demand,
+        bundle_actions=tuple(selected_actions),
     )
 
 
