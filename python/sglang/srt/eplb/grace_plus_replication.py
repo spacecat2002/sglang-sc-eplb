@@ -296,6 +296,31 @@ def _source_demand(
     return demand
 
 
+def replicate_source_top_experts(
+    tokens: Sequence[RoutedToken] | RoutedArrays,
+    primary: Mapping[int, int],
+    *,
+    num_ranks: int,
+    max_extra_per_rank: int,
+) -> tuple[dict[int, tuple[int, ...]], tuple[int, ...]]:
+    """Copy each source rank's most frequent remote experts."""
+
+    arrays = as_routed_arrays(tokens)
+    demand = _source_demand(arrays, len(primary), num_ranks)
+    primary_rank = np.asarray([primary[expert] for expert in range(len(primary))])
+    replicas = {expert: (rank,) for expert, rank in primary.items()}
+    copies = []
+    for rank in range(num_ranks):
+        candidates = np.flatnonzero((demand[:, rank] > 0) & (primary_rank != rank))
+        selected = sorted(
+            candidates, key=lambda expert: (-demand[expert, rank], expert)
+        )[:max_extra_per_rank]
+        for expert in selected:
+            replicas[int(expert)] += (rank,)
+        copies.append(len(selected))
+    return replicas, tuple(copies)
+
+
 def _waterfill(loads: np.ndarray, ranks: Sequence[int], demand: int) -> np.ndarray:
     """Split integer demand to minimize the maximum selected-rank load."""
 

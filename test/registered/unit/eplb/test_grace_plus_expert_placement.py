@@ -22,6 +22,7 @@ from sglang.srt.eplb.grace_plus_replication import (
     balance_replica_compute,
     evaluate_replicated_placement,
     replicate_hot_experts,
+    replicate_source_top_experts,
 )
 
 
@@ -145,6 +146,25 @@ def test_replication_uses_source_local_routing_and_respects_slots():
     )
     assert congestion.extra_copies == 1
     assert max(congestion.metrics.max_ingress, congestion.metrics.max_egress) == 15
+
+
+def test_source_top_experts_copies_at_most_the_per_rank_limit():
+    tokens = [
+        RoutedToken(0, (2,), 10),
+        RoutedToken(0, (3,), 7),
+        RoutedToken(0, (1,), 20),
+        RoutedToken(1, (0,), 9),
+    ]
+
+    replicas, copies = replicate_source_top_experts(
+        tokens,
+        {0: 0, 1: 0, 2: 1, 3: 1},
+        num_ranks=2,
+        max_extra_per_rank=1,
+    )
+
+    assert replicas == {0: (0, 1), 1: (0,), 2: (1, 0), 3: (1,)}
+    assert copies == (1, 1)
 
 
 def test_compute_balancing_adds_replica_and_reroutes_static_demand():
