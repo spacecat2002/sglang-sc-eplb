@@ -60,6 +60,8 @@ def _engine_args(args: argparse.Namespace) -> dict[str, Any]:
         result["quantization"] = args.quantization
     if args.mem_fraction_static is not None:
         result["mem_fraction_static"] = args.mem_fraction_static
+    if args.moe_a2a_backend == "hybridep":
+        result.setdefault("moe_runner_backend", "deep_gemm")
     return result
 
 
@@ -166,7 +168,16 @@ def main() -> None:
     )
     parser.add_argument(
         "--moe-a2a-backend",
-        choices=["none", "deepep", "flashinfer", "mooncake", "nixl", "mori", "megamoe"],
+        choices=[
+            "none",
+            "deepep",
+            "hybridep",
+            "flashinfer",
+            "mooncake",
+            "nixl",
+            "mori",
+            "megamoe",
+        ],
         default="none",
     )
     parser.add_argument("--dtype", default="auto")
@@ -178,7 +189,7 @@ def main() -> None:
     parser.add_argument(
         "--show-stage-timing",
         action="store_true",
-        help="report DeepEP dispatch/combine communication versus expert compute time",
+        help="report MoE dispatch/combine communication versus expert compute time",
     )
     parser.add_argument("--stage-timing-interval", type=int, help=argparse.SUPPRESS)
 

@@ -4,7 +4,7 @@
 
 import logging
 from enum import Enum
-from functools import cached_property
+from functools import cached_property, partial
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -33,6 +33,7 @@ from sglang.srt.layers.moe.kt_ep_wrapper import (
     KTEPWrapperMethod,
     create_kt_config_from_server_args,
 )
+from sglang.srt.layers.moe.stage_timing import _get_moe_stage_timer
 from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
     AscendTPDispatcher,
@@ -426,6 +427,21 @@ class FusedMoE(torch.nn.Module):
 
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
         self.dispatcher = create_moe_dispatcher(self.moe_runner_config)
+        self._stage_timer = _get_moe_stage_timer()
+        if self._stage_timer is not None:
+            self._stage_timer.register_layer(self.layer_id)
+            self.dispatcher.register_pre_dispatch_hook(
+                partial(self._stage_timer.pre_dispatch, self.layer_id)
+            )
+            self.dispatcher.register_post_dispatch_hook(
+                partial(self._stage_timer.post_dispatch, self.layer_id)
+            )
+            self.dispatcher.register_pre_combine_hook(
+                partial(self._stage_timer.pre_combine, self.layer_id)
+            )
+            self.dispatcher.register_post_combine_hook(
+                partial(self._stage_timer.post_combine, self.layer_id)
+            )
         self._use_ascend_fuseep = get_moe_a2a_backend().is_ascend_fuseep()
 
         if (
@@ -1486,7 +1502,7 @@ class FusedMoE(torch.nn.Module):
                 hidden_states_pre_quant=pre_quant_input
             )
 
-        combine_input = self.run_moe_core(
+        combine_input = self._run_moe_core_with_timing(
             dispatch_output=dispatch_output,
         )
 
@@ -1521,7 +1537,9 @@ class FusedMoE(torch.nn.Module):
         )
 
         with flashinfer_trtllm_deferred_finalize_context():
-            combine_input = self.run_moe_core(dispatch_output=dispatch_output)
+            combine_input = self._run_moe_core_with_timing(
+                dispatch_output=dispatch_output
+            )
 
         return self.dispatcher.combine(combine_input=combine_input)
 
@@ -1531,6 +1549,17 @@ class FusedMoE(torch.nn.Module):
             layer=self,
             dispatch_output=dispatch_output,
         )
+
+    def _run_moe_core_with_timing(
+        self, dispatch_output: DispatchOutput
+    ) -> CombineInput:
+        if self._stage_timer is not None:
+            self._stage_timer.begin_compute(self.layer_id)
+        try:
+            return self.run_moe_core(dispatch_output)
+        finally:
+            if self._stage_timer is not None:
+                self._stage_timer.end_compute(self.layer_id)
 
     @classmethod
     def make_expert_params_mapping(

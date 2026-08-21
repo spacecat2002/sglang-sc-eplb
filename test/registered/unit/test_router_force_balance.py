@@ -3,8 +3,8 @@ import io
 import unittest
 
 import torch
-from sglang.srt.layers.moe.ep_moe.layer import (
-    _build_force_balanced_topk_ids,
+from sglang.srt.layers.moe.ep_moe.layer import _build_force_balanced_topk_ids
+from sglang.srt.layers.moe.stage_timing import (
     _format_moe_stage_timing,
     _MoEStageTimer,
 )
@@ -38,6 +38,11 @@ class TestRouterForceBalance(unittest.TestCase):
         self.assertIn("[rank=2][prefill=3] layers=4", report)
         self.assertIn("communication_pct=40.00% compute_pct=60.00%", report)
 
+        decode_report = _format_moe_stage_timing(
+            3, 4, 10.0, 30.0, 10.0, rank=2, is_prefill=False
+        )
+        self.assertIn("[rank=2][decode=3] layers=4", decode_report)
+
     def test_stage_timing_resets_each_prefill(self):
         class Event:
             def __init__(self, timestamp):
@@ -52,11 +57,12 @@ class TestRouterForceBalance(unittest.TestCase):
             timer._report_batch()
 
         timer.pending.append(tuple(Event(t) for t in (0, 2, 2, 3, 3, 7)))
+        timer.is_prefill = False
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             timer._report_batch()
 
-        self.assertIn("[prefill=2] layers=1", output.getvalue())
+        self.assertIn("[decode=2] layers=1", output.getvalue())
         self.assertIn("communication_ms=6.000 compute_ms=1.000", output.getvalue())
 
 
