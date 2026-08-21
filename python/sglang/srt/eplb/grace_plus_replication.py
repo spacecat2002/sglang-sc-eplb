@@ -302,23 +302,76 @@ def replicate_source_top_experts(
     *,
     num_ranks: int,
     max_extra_per_rank: int,
-) -> tuple[dict[int, tuple[int, ...]], tuple[int, ...]]:
-    """Copy each source rank's most frequent remote experts."""
+    compute_imbalance_limit: float = 1.25,
+) -> ReplicaPlacement:
+    """Select replicas by exact bundle gain, then quota-route within the load limit."""
 
+    if compute_imbalance_limit < 1 or not np.isfinite(compute_imbalance_limit):
+        raise ValueError("invalid compute imbalance limit")
     arrays = as_routed_arrays(tokens)
-    demand = _source_demand(arrays, len(primary), num_ranks)
-    primary_rank = np.asarray([primary[expert] for expert in range(len(primary))])
-    replicas = {expert: (rank,) for expert, rank in primary.items()}
-    copies = []
-    for rank in range(num_ranks):
-        candidates = np.flatnonzero((demand[:, rank] > 0) & (primary_rank != rank))
-        selected = sorted(
-            candidates, key=lambda expert: (-demand[expert, rank], expert)
-        )[:max_extra_per_rank]
-        for expert in selected:
-            replicas[int(expert)] += (rank,)
-        copies.append(len(selected))
-    return replicas, tuple(copies)
+    communication = replicate_hot_experts(
+        arrays,
+        primary,
+        num_ranks=num_ranks,
+        objective="remote",
+        hot_experts=len(primary),
+        candidate_ranks=num_ranks,
+        compute_imbalance_limit=float("inf"),
+        max_extra_per_rank=max_extra_per_rank,
+    )
+    source_demand = communication.source_demand
+    assert source_demand is not None
+    replicas = communication.replicas_by_expert
+    routing = np.asarray(communication.routing_by_source, dtype=np.intp)
+    instance_quota, compute = _greedy_instance_quotas(
+        source_demand.sum(axis=1), replicas, num_ranks
+    )
+    quota = _source_quotas(source_demand, instance_quota, routing)
+    average = source_demand.sum() / num_ranks
+    capacity = max(int(compute.max()), int(np.ceil(average * compute_imbalance_limit)))
+    # ponytail: greedy local fill; use joint quotas only if this leaves measurable A2A.
+    changed = True
+    while changed:
+        changed = False
+        for source in range(num_ranks):
+            room = capacity - int(compute[source])
+            local_experts = sorted(
+                (expert for expert, ranks in replicas.items() if source in ranks),
+                key=lambda expert: (-source_demand[expert, source], expert),
+            )
+            for expert in local_experts:
+                for target in replicas[expert]:
+                    if target == source or not room:
+                        continue
+                    moved = min(room, int(quota[source, expert, target]))
+                    quota[source, expert, target] -= moved
+                    quota[source, expert, source] += moved
+                    compute[target] -= moved
+                    compute[source] += moved
+                    room -= moved
+                    changed |= bool(moved)
+    routing = np.where(quota.sum(axis=2) > 0, quota.argmax(axis=2), routing)
+    serialized_quota = tuple(
+        tuple(
+            (
+                tuple(int(quota[source, expert, rank]) for rank in replicas[expert])
+                if source_demand[expert, source]
+                else tuple(
+                    int(rank == routing[source, expert]) for rank in replicas[expert]
+                )
+            )
+            for expert in range(len(primary))
+        )
+        for source in range(num_ranks)
+    )
+    return ReplicaPlacement(
+        replicas,
+        tuple(tuple(int(rank) for rank in row) for row in routing),
+        _route_quota(arrays, quota, source_demand, replicas),
+        communication.extra_copies,
+        quota_by_source=serialized_quota,
+        source_demand=source_demand,
+    )
 
 
 def _waterfill(loads: np.ndarray, ranks: Sequence[int], demand: int) -> np.ndarray:

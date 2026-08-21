@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import time
 from pathlib import Path
 from typing import Sequence
@@ -33,13 +34,39 @@ def _rows(layer: int, method: str, metrics, copies: Sequence[int], elapsed: floa
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", required=True, help="compact routing trace (.pt)")
+    parser.add_argument(
+        "--max-extra-experts-per-rank",
+        type=int,
+        help="remote expert replica limit per rank (default: 2 * trace Top-K)",
+    )
+    parser.add_argument(
+        "--compute-imbalance-limit",
+        type=float,
+        default=1.25,
+        help="maximum rank load / average load, when feasible (default: 1.25)",
+    )
     args = parser.parse_args()
     if Path(args.input).suffix != ".pt":
         parser.error("--input must be a compact .pt routing trace")
+    if (
+        args.max_extra_experts_per_rank is not None
+        and args.max_extra_experts_per_rank < 0
+    ):
+        parser.error("--max-extra-experts-per-rank must be non-negative")
+    if (
+        not math.isfinite(args.compute_imbalance_limit)
+        or args.compute_imbalance_limit < 1
+    ):
+        parser.error("--compute-imbalance-limit must be at least 1")
 
     raw, layers = _load(args.input)
     num_ranks = int(raw["num_ranks"])
     top_k = int(raw["top_k"])
+    max_extra = (
+        args.max_extra_experts_per_rank
+        if args.max_extra_experts_per_rank is not None
+        else 2 * top_k
+    )
     rows = [
         [
             "layer",
@@ -71,21 +98,30 @@ def main() -> None:
         )
 
         started = time.perf_counter()
-        replicas, copies = replicate_source_top_experts(
+        optimized = replicate_source_top_experts(
             tokens,
             primary,
             num_ranks=num_ranks,
-            max_extra_per_rank=2 * top_k,
+            max_extra_per_rank=max_extra,
+            compute_imbalance_limit=args.compute_imbalance_limit,
         )
-        optimized = evaluate_replicated_placement(tokens, replicas, num_ranks=num_ranks)
+        copies = [0] * num_ranks
+        for ranks in optimized.replicas_by_expert.values():
+            for rank in ranks[1:]:
+                copies[rank] += 1
         rows.append(
             _rows(
-                layer, "remote-top2k", optimized, copies, time.perf_counter() - started
+                layer,
+                f"remote-top{max_extra}",
+                optimized.metrics,
+                copies,
+                time.perf_counter() - started,
             )
         )
 
     print(
-        f"trace={args.input}  EP={num_ranks}  K={top_k}  remote replica cap/rank={2 * top_k}"
+        f"trace={args.input}  EP={num_ranks}  K={top_k}  "
+        f"remote replica cap/rank={max_extra}  compute limit={args.compute_imbalance_limit:.2f}x"
     )
     print(_table(rows))
 

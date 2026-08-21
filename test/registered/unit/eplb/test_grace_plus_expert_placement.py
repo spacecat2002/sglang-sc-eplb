@@ -148,23 +148,41 @@ def test_replication_uses_source_local_routing_and_respects_slots():
     assert max(congestion.metrics.max_ingress, congestion.metrics.max_egress) == 15
 
 
-def test_source_top_experts_copies_at_most_the_per_rank_limit():
+def test_source_top_experts_uses_bundle_communication_gain():
     tokens = [
-        RoutedToken(0, (2,), 10),
-        RoutedToken(0, (3,), 7),
-        RoutedToken(0, (1,), 20),
-        RoutedToken(1, (0,), 9),
+        RoutedToken(0, (0, 1), 100),
+        RoutedToken(0, (2, 3), 10),
     ]
 
-    replicas, copies = replicate_source_top_experts(
+    result = replicate_source_top_experts(
         tokens,
-        {0: 0, 1: 0, 2: 1, 3: 1},
-        num_ranks=2,
+        {0: 1, 1: 1, 2: 2, 3: 0},
+        num_ranks=3,
         max_extra_per_rank=1,
     )
 
-    assert replicas == {0: (0, 1), 1: (0,), 2: (1, 0), 3: (1,)}
-    assert copies == (1, 1)
+    assert result.replicas_by_expert == {0: (1,), 1: (1,), 2: (2, 0), 3: (0,)}
+    assert result.extra_copies == 1
+
+
+def test_source_top_experts_quota_limits_local_compute():
+    tokens = [
+        RoutedToken(0, (0,), 20),
+        RoutedToken(1, (0,), 80),
+        RoutedToken(1, (1,), 50),
+    ]
+
+    result = replicate_source_top_experts(
+        tokens,
+        {0: 0, 1: 1},
+        num_ranks=2,
+        max_extra_per_rank=1,
+        compute_imbalance_limit=1,
+    )
+
+    assert result.replicas_by_expert == {0: (0, 1), 1: (1,)}
+    assert result.metrics.compute_load == (75, 75)
+    assert result.metrics.remote == 55
 
 
 def test_compute_balancing_adds_replica_and_reroutes_static_demand():
