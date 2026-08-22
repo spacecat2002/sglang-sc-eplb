@@ -89,11 +89,11 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             device_topk_size=topk_size + num_fused_shared_experts,
         )
 
-        # Rank-local a2a paths only see each attn-TP rank's scattered topk_ids.
-        # All-gather across attn-TP at capture time so device_cache
+        # DeepEP a2a path: each attn-TP rank only sees its scattered slice of
+        # topk_ids. All-gather across attn-TP at capture time so device_cache
         # holds the full batch and the existing _get_local_slice / D2H sync
         # paths work unchanged. Pre-allocate the gather target.
-        if self._uses_rank_local_a2a():
+        if get_moe_a2a_backend().is_deepep():
             attn_tp_size = (
                 get_parallel().attn_tp_size if is_dp_attention_enabled() else 1
             )
@@ -107,7 +107,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             )
 
     def capture(self, layer_id: int, topk_indices: torch.Tensor):
-        if self._uses_rank_local_a2a():
+        if get_moe_a2a_backend().is_deepep():
             local_topk = topk_indices
             topk_indices = self.gather_buffer[
                 : local_topk.size(0) * get_parallel().attn_tp_size
@@ -121,10 +121,10 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         can_run_graph: bool,
         cuda_graph_batch: Optional[int],
     ) -> torch.Tensor:
-        # Under rank-local a2a, capture() already gathered into the head of
+        # Under DeepEP, capture() already attn_tp_all_gathered into the head of
         # the per-rank buffer, so the local DP rank's data lives at [0:N_local]
         # rather than at the global [start_pos:end_pos] offset.
-        if is_dp_attention_enabled() and not self._uses_rank_local_a2a():
+        if is_dp_attention_enabled() and not get_moe_a2a_backend().is_deepep():
             # GPU->CPU sync would break overlap; operate on CPU directly.
             local_start_pos, local_num_tokens = get_dp_local_slice_cpu(
                 forward_batch, can_run_graph, cuda_graph_batch
@@ -135,11 +135,6 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         return self.device_cache.buffer[
             local_start_pos:local_end_pos, :, : self.topk_size
         ]
-
-    @staticmethod
-    def _uses_rank_local_a2a() -> bool:
-        backend = get_moe_a2a_backend()
-        return backend.is_deepep() or backend.is_hybridep()
 
 
 def get_global_experts_capturer() -> Optional[RoutedExpertsCapturer]:

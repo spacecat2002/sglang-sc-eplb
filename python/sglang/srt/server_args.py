@@ -2280,7 +2280,6 @@ class ServerArgs:
         Literal[
             "none",
             "deepep",
-            "hybridep",
             "mooncake",
             "nixl",
             "mori",
