@@ -19,6 +19,13 @@ def test_kernels() -> None:
         [False, True],
     ]
 
+    fused_demand, fused_replicas, fused_routing = _C.fused_source_topn(
+        source, topk, count, primary, 4, 2, 0
+    )
+    assert torch.equal(fused_demand, demand)
+    assert torch.equal(fused_replicas, replicas)
+    assert fused_routing.cpu().tolist() == [[0, 0, 1, 1], [0, 0, 1, 1]]
+
     traffic, compute = _C.traffic(source, topk, count, primary, replicas, 2)
     assert traffic.cpu().tolist() == [[0, 5], [3, 0]]
     assert compute.cpu().tolist() == [7, 13]

@@ -32,6 +32,15 @@ def _record(timing: dict[str, float] | None, key: str, started: float) -> None:
 def _cuda_arrays(
     tokens: Sequence[RoutedToken] | RoutedArrays, device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if (
+        isinstance(tokens, tuple)
+        and len(tokens) == 3
+        and all(isinstance(value, torch.Tensor) for value in tokens)
+    ):
+        return tuple(
+            value.to(device=device, dtype=torch.int64, copy=False).contiguous()
+            for value in tokens
+        )  # type: ignore[return-value]
     arrays = as_routed_arrays(tokens)
     return (
         torch.as_tensor(arrays.source_rank, device=device, dtype=torch.int64),
@@ -247,6 +256,77 @@ def _communication_quota_cuda(
     return candidates[best[1]]
 
 
+class GraceCudaRuntime:
+    """GPU-resident state for repeated plans with fixed EP geometry."""
+
+    def __init__(
+        self, num_experts: int, num_ranks: int, device: str | torch.device = "cuda"
+    ) -> None:
+        self.num_experts = int(num_experts)
+        self.num_ranks = int(num_ranks)
+        self.device = torch.device(device)
+        if self.device.type != "cuda":
+            raise ValueError("CUDA runtime requires a CUDA device")
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA runtime requested but torch.cuda is unavailable")
+        self.primary: torch.Tensor | None = None
+
+    def _primary_tensor(self, primary: Mapping[int, int] | torch.Tensor) -> torch.Tensor:
+        if isinstance(primary, torch.Tensor):
+            value = primary.to(device=self.device, dtype=torch.int64, copy=False)
+            if value.numel() != self.num_experts:
+                raise ValueError("primary has the wrong number of experts")
+            return value.contiguous()
+        return torch.as_tensor(
+            [primary[e] for e in range(self.num_experts)],
+            device=self.device,
+            dtype=torch.int64,
+        )
+
+    def source_topn(
+        self,
+        source: torch.Tensor,
+        topk: torch.Tensor,
+        count: torch.Tensor,
+        primary: Mapping[int, int] | torch.Tensor,
+        max_extra_per_rank: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build demand, replicas, and default routing without CPU round-trips."""
+        source = source.to(
+            device=self.device, dtype=torch.int64, copy=False
+        ).contiguous()
+        topk = topk.to(device=self.device, dtype=torch.int64, copy=False).contiguous()
+        count = count.to(device=self.device, dtype=torch.int64, copy=False).contiguous()
+        self.primary = self._primary_tensor(primary)
+        return _C.fused_source_topn(
+            source,
+            topk,
+            count,
+            self.primary,
+            self.num_experts,
+            self.num_ranks,
+            int(max_extra_per_rank),
+        )
+
+    def plan(
+        self,
+        source: torch.Tensor,
+        topk: torch.Tensor,
+        count: torch.Tensor,
+        primary: Mapping[int, int] | torch.Tensor,
+        **kwargs,
+    ) -> ReplicaPlacement:
+        """Run the full planner from GPU tensors; CPU copies happen only at return."""
+        return replicate_source_top_experts_cuda(
+            (source, topk, count),
+            primary,
+            num_ranks=self.num_ranks,
+            device=self.device,
+            runtime=self,
+            **kwargs,
+        )
+
+
 def evaluate_replicated_placement_cuda(
     tokens: Sequence[RoutedToken] | RoutedArrays,
     placement: Mapping[int, int | Sequence[int]],
@@ -285,6 +365,7 @@ def replicate_source_top_experts_cuda(
     device: str | torch.device = "cuda",
     timing: dict[str, float] | None = None,
     materialize_quota: bool = True,
+    runtime: GraceCudaRuntime | None = None,
 ) -> ReplicaPlacement:
     """Run source-aware Top-N replication with CUDA trace processing.
 
@@ -317,16 +398,36 @@ def replicate_source_top_experts_cuda(
         raise RuntimeError("CUDA backend requested but torch.cuda is unavailable")
     started = time.perf_counter()
     source, topk, count = _cuda_arrays(tokens, device)
-    num_experts = len(primary)
-    demand = _source_demand_cuda(source, topk, count, num_experts, num_ranks)
-    primary_np = np.asarray([primary[e] for e in range(num_experts)], dtype=np.int64)
-    primary_tensor = torch.as_tensor(primary_np, device=device)
-    replica_mask = _C.select_topn(demand, primary_tensor, max_extra_per_rank)
-    routing_tensor = torch.where(
-        replica_mask.t(),
-        torch.arange(num_ranks, device=device, dtype=torch.int64)[:, None],
-        primary_tensor[None, :],
-    )
+    num_experts = runtime.num_experts if runtime is not None else len(primary)
+    if runtime is not None and runtime.num_ranks != num_ranks:
+        raise ValueError("runtime rank count does not match num_ranks")
+    if runtime is not None:
+        primary_tensor = runtime._primary_tensor(primary)
+        primary_np = None
+    elif isinstance(primary, torch.Tensor):
+        primary_tensor = primary.to(
+            device=device, dtype=torch.int64, copy=False
+        ).contiguous()
+        primary_np = None
+    else:
+        primary_np = np.asarray(
+            [primary[e] for e in range(num_experts)], dtype=np.int64
+        )
+        primary_tensor = torch.as_tensor(primary_np, device=device)
+    if runtime is None:
+        demand, replica_mask, routing_tensor = _C.fused_source_topn(
+            source,
+            topk,
+            count,
+            primary_tensor,
+            num_experts,
+            num_ranks,
+            max_extra_per_rank,
+        )
+    else:
+        demand, replica_mask, routing_tensor = runtime.source_topn(
+            source, topk, count, primary_tensor, max_extra_per_rank
+        )
     _record(timing, "communication_replication_ms", started)
 
     quota = None
@@ -478,6 +579,8 @@ def replicate_source_top_experts_cuda(
     replica_mask_np = replica_mask.cpu().numpy()
     demand_np = demand.cpu().numpy()
     routing_np = routing_tensor.cpu().numpy()
+    if primary_np is None:
+        primary_np = primary_tensor.cpu().numpy()
     balance_copy_count = int(balance_copies.item()) if balance_copies is not None else 0
     addition_order_np = addition_order.cpu().numpy()
     placement = {

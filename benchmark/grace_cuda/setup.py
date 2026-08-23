@@ -14,6 +14,7 @@ setup(
                 str(root / "csrc" / "placement.cu"),
                 str(root / "csrc" / "quota.cu"),
                 str(root / "csrc" / "traffic.cu"),
+                str(root / "csrc" / "runtime.cu"),
             ],
             include_dirs=[str(root / "csrc")],
             extra_compile_args={
