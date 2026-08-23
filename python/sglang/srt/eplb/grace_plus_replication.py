@@ -12,6 +12,7 @@ from .expert_affinity_graph import RoutedArrays, RoutedToken, as_routed_arrays
 
 
 _CHUNK_SIZE = 200_000
+_MAX_EXACT_COMPUTE_CANDIDATES = 4
 
 
 @dataclass(frozen=True)
@@ -1053,7 +1054,12 @@ def balance_replica_compute(
             int(np.square(current_metrics.compute_load).sum()),
         )
         while added < num_ranks * max_extra_per_rank:
-            best = None
+            # Waterfill is a cheap lower-cost proxy for the global quota solve.
+            # Use it to rank candidates, then run the exact (and expensive)
+            # quota/traffic evaluation only for the most promising few.
+            instance_quota = quota.sum(axis=0, dtype=np.int64)
+            base_compute = np.asarray(current_metrics.compute_load, dtype=np.int64)
+            approximate = []
             for expert in expert_order:
                 if not expert_demand[expert]:
                     continue
@@ -1063,43 +1069,66 @@ def balance_replica_compute(
                         balance_by_rank[target] >= max_extra_per_rank
                     ):
                         continue
-                    candidate_replicas = dict(replicas)
-                    candidate_replicas[int(expert)] = replicas[int(expert)] + (
-                        target,
+                    base = base_compute - instance_quota[expert]
+                    allocation = _waterfill(
+                        base,
+                        replicas[int(expert)] + (target,),
+                        int(expert_demand[expert]),
                     )
-                    candidate = _quota_for_replicas(
-                        arrays,
-                        source_demand,
-                        candidate_replicas,
-                        routing,
-                        communication_budgets,
-                    )
-                    if candidate is None:
-                        continue
-                    candidate_quota, candidate_metrics = candidate
+                    next_compute = base + allocation
                     compute_key = (
-                        max(candidate_metrics.compute_load, default=0),
-                        int(np.square(candidate_metrics.compute_load).sum()),
+                        int(next_compute.max()),
+                        int(np.square(next_compute).sum()),
                     )
                     if compute_key >= current_key:
                         continue
-                    key = compute_key + (
-                        candidate_metrics.remote,
-                        candidate_metrics.max_pair_traffic,
-                        candidate_metrics.max_ingress,
-                        candidate_metrics.max_egress,
-                        -int(source_demand[expert, target]),
-                        int(expert),
-                        target,
-                    )
-                    if best is None or key < best[0]:
-                        best = (
-                            key,
+                    approximate.append(
+                        (
+                            compute_key,
+                            -int(source_demand[expert, target]),
                             int(expert),
                             target,
-                            candidate_quota,
-                            candidate_metrics,
                         )
+                    )
+
+            best = None
+            shortlist = sorted(approximate)[:_MAX_EXACT_COMPUTE_CANDIDATES]
+            for _, _, expert, target in shortlist:
+                candidate_replicas = dict(replicas)
+                candidate_replicas[expert] = replicas[expert] + (target,)
+                candidate = _quota_for_replicas(
+                    arrays,
+                    source_demand,
+                    candidate_replicas,
+                    routing,
+                    communication_budgets,
+                )
+                if candidate is None:
+                    continue
+                candidate_quota, candidate_metrics = candidate
+                compute_key = (
+                    max(candidate_metrics.compute_load, default=0),
+                    int(np.square(candidate_metrics.compute_load).sum()),
+                )
+                if compute_key >= current_key:
+                    continue
+                key = compute_key + (
+                    candidate_metrics.remote,
+                    candidate_metrics.max_pair_traffic,
+                    candidate_metrics.max_ingress,
+                    candidate_metrics.max_egress,
+                    -int(source_demand[expert, target]),
+                    expert,
+                    target,
+                )
+                if best is None or key < best[0]:
+                    best = (
+                        key,
+                        int(expert),
+                        target,
+                        candidate_quota,
+                        candidate_metrics,
+                    )
             if best is None:
                 break
             _, expert, target, quota, current_metrics = best
