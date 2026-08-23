@@ -220,7 +220,7 @@ def test_compute_balancing_adds_replica_and_reroutes_static_demand():
     assert balanced.metrics.remote < communication.metrics.remote
 
 
-def test_compute_replica_is_rejected_when_it_breaks_communication_budget():
+def test_compute_replica_is_retained_when_budget_is_infeasible():
     tokens = [
         RoutedToken(0, (0,), 100),
         RoutedToken(1, (1,), 10),
@@ -241,11 +241,10 @@ def test_compute_replica_is_rejected_when_it_breaks_communication_budget():
         communication_budget_ratio=1.0,
     )
 
-    assert balanced.balance_copies == 0
-    assert balanced.metrics.remote <= communication.metrics.remote
-    assert balanced.metrics.max_pair_traffic <= communication.metrics.max_pair_traffic
-    assert balanced.metrics.max_ingress <= communication.metrics.max_ingress
-    assert balanced.metrics.max_egress <= communication.metrics.max_egress
+    assert balanced.balance_copies == 1
+    assert max(balanced.metrics.compute_load) < max(communication.metrics.compute_load)
+    assert balanced.replicas_by_expert[0] == (0, 1)
+    assert balanced.metrics.remote > communication.metrics.remote
 
 
 def test_compute_replica_is_added_when_budget_allows_compute_balance():
