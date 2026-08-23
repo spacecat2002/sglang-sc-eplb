@@ -211,17 +211,18 @@ def main() -> None:
         quota_elapsed = sum(
             phase_ms.get(key, 0.0) for key in ("quota_solve_ms", "quota_allocation_ms")
         )
-        phase_ms["compute_replication_ms"] = (
-            max(
-                0.0,
-                replication_elapsed * 1000.0
-                - phase_ms.get("communication_replication_ms", 0.0)
-                - quota_elapsed,
+        if "compute_replication_ms" not in phase_ms:
+            phase_ms["compute_replication_ms"] = (
+                max(
+                    0.0,
+                    replication_elapsed * 1000.0
+                    - phase_ms.get("communication_replication_ms", 0.0)
+                    - quota_elapsed,
+                )
+                if args.compute_imbalance_limit is not None
+                or args.max_compute_extra_experts_per_rank
+                else 0.0
             )
-            if args.compute_imbalance_limit is not None
-            or args.max_compute_extra_experts_per_rank
-            else 0.0
-        )
         if args.max_compute_extra_experts_per_rank and not args.cuda:
             compute_started = time.perf_counter()
             before_quota = {

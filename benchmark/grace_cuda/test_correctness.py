@@ -83,7 +83,11 @@ def test_kernels() -> None:
 
     unbalanced = torch.tensor([[10, 0], [10, 0]], device="cuda", dtype=torch.int64)
     initial = torch.tensor([[True, False], [True, False]], device="cuda")
-    balanced, added, addition_order = _C.select_compute_replicas(unbalanced, initial, 1)
+    expert_demand = unbalanced.sum(dim=1)
+    expert_order = torch.tensor([0, 1], device="cuda", dtype=torch.int64)
+    balanced, added, addition_order = _C.select_compute_replicas(
+        unbalanced, initial, expert_demand, expert_order, 1
+    )
     assert balanced.cpu().tolist() == [[True, True], [True, False]]
     assert added.item() == 1
     assert addition_order.cpu().tolist() == [[0, 1], [0, 0]]

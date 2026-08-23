@@ -336,8 +336,14 @@ def replicate_source_top_experts_cuda(
             )
             _record(timing, "quota_solve_ms", quota_started)
         compute_started = time.perf_counter()
+        expert_demand = demand.sum(dim=1)
+        expert_order = torch.argsort(expert_demand, descending=True, stable=True)
         replica_mask, balance_copies, addition_order = _C.select_compute_replicas(
-            demand, replica_mask, max_compute_extra_per_rank
+            demand,
+            replica_mask,
+            expert_demand,
+            expert_order,
+            max_compute_extra_per_rank,
         )
         _record(timing, "compute_replication_ms", compute_started)
         if communication_budget_ratio is not None:

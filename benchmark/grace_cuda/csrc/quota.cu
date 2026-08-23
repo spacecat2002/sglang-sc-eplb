@@ -12,11 +12,12 @@ namespace {
 
 constexpr int kMaxRanks = 128;
 
+template <int MaxRanks = kMaxRanks>
 __device__ void waterfill(const int64_t* loads, const bool* replicas,
                           int64_t expert, int extra_rank, int64_t total,
                           int64_t* allocation, int64_t ranks) {
-  int rank_order[kMaxRanks];
-  bool selected[kMaxRanks];
+  int rank_order[MaxRanks];
+  bool selected[MaxRanks];
   int replica_count = 0;
   for (int rank = 0; rank < ranks; ++rank) {
     allocation[rank] = 0;
@@ -135,116 +136,135 @@ __device__ bool better_candidate(
   return target < best_target;
 }
 
+struct ComputeCandidate {
+  int64_t next_max;
+  int64_t next_square;
+  int64_t remote;
+  int64_t local_demand;
+  int64_t expert;
+  int target;
+};
+
+__device__ bool better_candidate(const ComputeCandidate& candidate,
+                                 const ComputeCandidate& best) {
+  if (candidate.expert < 0) return false;
+  if (best.expert < 0) return true;
+  return better_candidate(
+      candidate.next_max, candidate.next_square, candidate.remote,
+      candidate.local_demand, candidate.expert, candidate.target,
+      best.next_max, best.next_square, best.remote, best.local_demand,
+      best.expert, best.target);
+}
+
+template <int MaxRanks>
 __global__ void select_compute_replicas_kernel(
-    const int64_t* demand, bool* replicas, int64_t* instance_quota,
-    int64_t* loads, bool* processed, int64_t* added_by_rank,
+    const int64_t* demand, const int64_t* expert_demand,
+    const int64_t* expert_order, bool* replicas, int64_t* instance_quota,
+    int64_t* loads, int64_t* added_by_rank,
     int64_t* addition_order, int64_t* added_out, int64_t experts, int64_t ranks,
     int64_t max_extra_per_rank) {
-  // ponytail: serial control preserves the exact greedy order; parallelize
-  // candidate scoring only if this kernel remains dominant after profiling.
-  if (blockIdx.x || threadIdx.x) return;
-  int64_t allocation[kMaxRanks];
-  int64_t base[kMaxRanks];
-  int64_t added = 0;
+  if (blockIdx.x) return;
+  constexpr int kThreads = 128;
+  __shared__ ComputeCandidate candidates[kThreads];
+  __shared__ int64_t current_max;
+  __shared__ int64_t current_square;
+  __shared__ int64_t added;
+  __shared__ bool done;
+  int64_t allocation[MaxRanks];
+  int64_t base[MaxRanks];
+  if (threadIdx.x == 0) added = 0;
+  __syncthreads();
   while (added < ranks * max_extra_per_rank) {
-    for (int rank = 0; rank < ranks; ++rank) loads[rank] = 0;
-    for (int64_t expert = 0; expert < experts; ++expert) {
-      processed[expert] = false;
-      for (int rank = 0; rank < ranks; ++rank) {
-        instance_quota[expert * ranks + rank] = 0;
-      }
-    }
-    for (int64_t position = 0; position < experts; ++position) {
-      int64_t expert = -1;
-      int64_t best_demand = 0;
-      bool best_flexible = false;
-      for (int64_t candidate = 0; candidate < experts; ++candidate) {
-        if (processed[candidate]) continue;
-        int64_t total = 0;
-        int replica_count = 0;
+    if (threadIdx.x == 0) {
+      for (int rank = 0; rank < ranks; ++rank) loads[rank] = 0;
+      for (int64_t expert = 0; expert < experts; ++expert) {
         for (int rank = 0; rank < ranks; ++rank) {
-          total += demand[candidate * ranks + rank];
-          replica_count += replicas[candidate * ranks + rank];
-        }
-        const bool flexible = replica_count > 1;
-        if (expert < 0 || flexible < best_flexible ||
-            (flexible == best_flexible &&
-             (total > best_demand ||
-              (total == best_demand && candidate < expert)))) {
-          expert = candidate;
-          best_demand = total;
-          best_flexible = flexible;
+          instance_quota[expert * ranks + rank] = 0;
         }
       }
-      processed[expert] = true;
-      waterfill(loads, replicas, expert, -1, best_demand, allocation, ranks);
+      // The Python key is (is_flexible, -demand, expert). Demand order is
+      // fixed, so only the two flexibility passes change after each addition.
+      for (int flexible = 0; flexible < 2; ++flexible) {
+        for (int64_t position = 0; position < experts; ++position) {
+          const int64_t expert = expert_order[position];
+          int replica_count = 0;
+          for (int rank = 0; rank < ranks; ++rank) {
+            replica_count += replicas[expert * ranks + rank];
+          }
+          if ((replica_count > 1) != flexible) continue;
+          waterfill<MaxRanks>(loads, replicas, expert, -1,
+                              expert_demand[expert], allocation, ranks);
+          for (int rank = 0; rank < ranks; ++rank) {
+            instance_quota[expert * ranks + rank] = allocation[rank];
+            loads[rank] += allocation[rank];
+          }
+        }
+      }
+      current_max = 0;
+      current_square = 0;
       for (int rank = 0; rank < ranks; ++rank) {
-        instance_quota[expert * ranks + rank] = allocation[rank];
-        loads[rank] += allocation[rank];
+        current_max = max(current_max, loads[rank]);
+        current_square += loads[rank] * loads[rank];
       }
     }
+    __syncthreads();
 
-    int64_t current_max = 0;
-    int64_t current_square = 0;
-    for (int rank = 0; rank < ranks; ++rank) {
-      current_max = max(current_max, loads[rank]);
-      current_square += loads[rank] * loads[rank];
-    }
-    int64_t best_expert = -1;
-    int best_target = -1;
-    int64_t best_max = 0;
-    int64_t best_square = 0;
-    int64_t best_remote = 0;
-    int64_t best_local_demand = 0;
-    for (int64_t expert = 0; expert < experts; ++expert) {
-      int64_t total = 0;
+    ComputeCandidate best = {0, 0, 0, 0, -1, -1};
+    for (int64_t index = threadIdx.x; index < experts * ranks;
+         index += blockDim.x) {
+      const int64_t expert = index / ranks;
+      const int target = index % ranks;
+      const int64_t total = expert_demand[expert];
+      if (!total || replicas[expert * ranks + target] ||
+          added_by_rank[target] >= max_extra_per_rank) {
+        continue;
+      }
       for (int rank = 0; rank < ranks; ++rank) {
-        total += demand[expert * ranks + rank];
         base[rank] = loads[rank] - instance_quota[expert * ranks + rank];
       }
-      if (!total) continue;
-      for (int target = 0; target < ranks; ++target) {
-        if (replicas[expert * ranks + target] ||
-            added_by_rank[target] >= max_extra_per_rank) {
-          continue;
-        }
-        waterfill(base, replicas, expert, target, total, allocation, ranks);
-        int64_t next_max = 0;
-        int64_t next_square = 0;
-        int64_t local = 0;
-        for (int rank = 0; rank < ranks; ++rank) {
-          const int64_t next = base[rank] + allocation[rank];
-          next_max = max(next_max, next);
-          next_square += next * next;
-          local += min(demand[expert * ranks + rank], allocation[rank]);
-        }
-        if (next_max > current_max ||
-            (next_max == current_max && next_square >= current_square)) {
-          continue;
-        }
-        const int64_t remote = total - local;
-        const int64_t local_demand = demand[expert * ranks + target];
-        if (best_expert < 0 ||
-            better_candidate(
-                next_max, next_square, remote, local_demand, expert, target,
-                best_max, best_square, best_remote, best_local_demand,
-                best_expert, best_target)) {
-          best_expert = expert;
-          best_target = target;
-          best_max = next_max;
-          best_square = next_square;
-          best_remote = remote;
-          best_local_demand = local_demand;
-        }
+      waterfill<MaxRanks>(base, replicas, expert, target, total, allocation,
+                          ranks);
+      ComputeCandidate candidate = {0, 0, 0, demand[expert * ranks + target],
+                                    expert, target};
+      int64_t local = 0;
+      for (int rank = 0; rank < ranks; ++rank) {
+        const int64_t next = base[rank] + allocation[rank];
+        candidate.next_max = max(candidate.next_max, next);
+        candidate.next_square += next * next;
+        local += min(demand[expert * ranks + rank], allocation[rank]);
+      }
+      if (candidate.next_max > current_max ||
+          (candidate.next_max == current_max &&
+           candidate.next_square >= current_square)) {
+        continue;
+      }
+      candidate.remote = total - local;
+      if (better_candidate(candidate, best)) best = candidate;
+    }
+    candidates[threadIdx.x] = best;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride; stride /= 2) {
+      if (threadIdx.x < stride &&
+          better_candidate(candidates[threadIdx.x + stride],
+                           candidates[threadIdx.x])) {
+        candidates[threadIdx.x] = candidates[threadIdx.x + stride];
+      }
+      __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+      const ComputeCandidate winner = candidates[0];
+      done = winner.expert < 0;
+      if (!done) {
+        replicas[winner.expert * ranks + winner.target] = true;
+        addition_order[winner.expert * ranks + winner.target] = added + 1;
+        ++added_by_rank[winner.target];
+        ++added;
       }
     }
-    if (best_expert < 0) break;
-    replicas[best_expert * ranks + best_target] = true;
-    addition_order[best_expert * ranks + best_target] = added + 1;
-    ++added_by_rank[best_target];
-    ++added;
+    __syncthreads();
+    if (done) break;
   }
-  added_out[0] = added;
+  if (threadIdx.x == 0) added_out[0] = added;
 }
 
 __global__ void localize_quota_kernel(
@@ -431,29 +451,49 @@ std::tuple<torch::Tensor, torch::Tensor> solve_quota(
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> select_compute_replicas(
-    torch::Tensor demand, torch::Tensor replicas, int64_t max_extra_per_rank) {
-  TORCH_CHECK(demand.is_cuda() && replicas.is_cuda());
+    torch::Tensor demand, torch::Tensor replicas, torch::Tensor expert_demand,
+    torch::Tensor expert_order, int64_t max_extra_per_rank) {
+  TORCH_CHECK(demand.is_cuda() && replicas.is_cuda() &&
+              expert_demand.is_cuda() && expert_order.is_cuda());
   TORCH_CHECK(demand.scalar_type() == torch::kInt64 &&
               replicas.scalar_type() == torch::kBool &&
+              expert_demand.scalar_type() == torch::kInt64 &&
+              expert_order.scalar_type() == torch::kInt64 &&
               demand.sizes() == replicas.sizes());
   const int64_t experts = demand.size(0);
   const int64_t ranks = demand.size(1);
   TORCH_CHECK(ranks > 0 && ranks <= kMaxRanks, "compute replicas support 1-128 ranks");
-  TORCH_CHECK(max_extra_per_rank >= 0);
+  TORCH_CHECK(expert_demand.numel() == experts &&
+              expert_order.numel() == experts && max_extra_per_rank >= 0);
   auto next_replicas = replicas.clone();
   auto instance = torch::zeros_like(demand);
   auto loads = torch::zeros({ranks}, demand.options());
-  auto processed = torch::zeros({experts}, replicas.options());
   auto added_by_rank = torch::zeros({ranks}, demand.options());
   auto addition_order = torch::zeros_like(demand);
   auto added = torch::zeros({1}, demand.options());
   auto stream = c10::cuda::getCurrentCUDAStream(demand.get_device());
-  launch(select_compute_replicas_kernel, dim3(1), dim3(1), stream.stream(),
-         demand.data_ptr<int64_t>(), next_replicas.data_ptr<bool>(),
-         instance.data_ptr<int64_t>(), loads.data_ptr<int64_t>(),
-         processed.data_ptr<bool>(), added_by_rank.data_ptr<int64_t>(),
-         addition_order.data_ptr<int64_t>(), added.data_ptr<int64_t>(), experts,
-         ranks, max_extra_per_rank);
+  if (ranks <= 32) {
+    launch(select_compute_replicas_kernel<32>, dim3(1), dim3(128), stream.stream(),
+           demand.data_ptr<int64_t>(), expert_demand.data_ptr<int64_t>(),
+           expert_order.data_ptr<int64_t>(), next_replicas.data_ptr<bool>(),
+           instance.data_ptr<int64_t>(), loads.data_ptr<int64_t>(),
+           added_by_rank.data_ptr<int64_t>(), addition_order.data_ptr<int64_t>(),
+           added.data_ptr<int64_t>(), experts, ranks, max_extra_per_rank);
+  } else if (ranks <= 64) {
+    launch(select_compute_replicas_kernel<64>, dim3(1), dim3(128), stream.stream(),
+           demand.data_ptr<int64_t>(), expert_demand.data_ptr<int64_t>(),
+           expert_order.data_ptr<int64_t>(), next_replicas.data_ptr<bool>(),
+           instance.data_ptr<int64_t>(), loads.data_ptr<int64_t>(),
+           added_by_rank.data_ptr<int64_t>(), addition_order.data_ptr<int64_t>(),
+           added.data_ptr<int64_t>(), experts, ranks, max_extra_per_rank);
+  } else {
+    launch(select_compute_replicas_kernel<128>, dim3(1), dim3(128), stream.stream(),
+           demand.data_ptr<int64_t>(), expert_demand.data_ptr<int64_t>(),
+           expert_order.data_ptr<int64_t>(), next_replicas.data_ptr<bool>(),
+           instance.data_ptr<int64_t>(), loads.data_ptr<int64_t>(),
+           added_by_rank.data_ptr<int64_t>(), addition_order.data_ptr<int64_t>(),
+           added.data_ptr<int64_t>(), experts, ranks, max_extra_per_rank);
+  }
   check_cuda(cudaGetLastError());
   return {next_replicas, added, addition_order};
 }
