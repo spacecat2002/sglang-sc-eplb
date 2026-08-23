@@ -298,7 +298,14 @@ def _scale_quota(values: Sequence[int], amount: int) -> list[int]:
     return result
 
 
-def _quota_topk(logical_topk, physical_replicas, quota, source: int, slots: int):
+def _quota_topk(
+    logical_topk,
+    physical_replicas,
+    quota,
+    source: int,
+    slots: int,
+    ordinals=None,
+):
     import torch
 
     result = torch.empty_like(logical_topk)
@@ -307,26 +314,31 @@ def _quota_topk(logical_topk, physical_replicas, quota, source: int, slots: int)
         replicas = physical_replicas[expert]
         valid = replicas >= 0
         replicas = replicas[valid]
-        values = quota[source, expert, : len(replicas)]
         local = replicas // slots == source
         order = torch.cat(
             (torch.nonzero(local).flatten(), torch.nonzero(~local).flatten())
         )
         replicas = replicas[order]
-        values = values[order]
-        amount = int(selected.sum())
-        total = int(values.sum())
-        if total < 1:
-            raise ValueError("quota must contain positive demand")
-        numerators = values * amount
-        counts = torch.div(numerators, total, rounding_mode="floor")
-        remainder = amount - int(counts.sum())
-        if remainder:
-            residual_order = torch.argsort(
-                numerators % total, descending=True, stable=True
-            )
-            counts[residual_order[:remainder]] += 1
-        result[selected] = torch.repeat_interleave(replicas, counts)
+        values = quota[source, expert, : len(replicas)][order]
+        if ordinals is None:
+            amount = int(selected.sum())
+            total = int(values.sum())
+            if total < 1:
+                raise ValueError("quota must contain positive demand")
+            numerators = values * amount
+            counts = torch.div(numerators, total, rounding_mode="floor")
+            remainder = amount - int(counts.sum())
+            if remainder:
+                residual_order = torch.argsort(
+                    numerators % total, descending=True, stable=True
+                )
+                counts[residual_order[:remainder]] += 1
+            result[selected] = torch.repeat_interleave(replicas, counts)
+            continue
+        boundaries = torch.cumsum(values, dim=0)
+        positions = ordinals[selected]
+        replica_index = torch.searchsorted(boundaries, positions, right=True)
+        result[selected] = replicas[replica_index]
     return result
 
 
@@ -337,13 +349,31 @@ def _sample(layer, rank: int, num_tokens: int, seed: int):
     if not bool(selected.any()):
         raise ValueError(f"trace layer contains no bundles for source rank {rank}")
     generator = torch.Generator().manual_seed(seed + rank)
+    selected_indexes = torch.nonzero(selected).flatten()
     indexes = torch.multinomial(
         layer["count"][selected].double(),
         num_tokens,
         replacement=True,
         generator=generator,
     )
-    return layer["topk_experts"][selected][indexes].long()
+    bundle_indexes = selected_indexes[indexes]
+    counts = layer["count"][bundle_indexes].long()
+    generator = torch.Generator().manual_seed(seed + 7919 + rank)
+    offsets = (
+        torch.rand(counts.shape, generator=generator, dtype=torch.float64)
+        * counts.double()
+    ).long()
+    bundle_topk = layer["topk_experts"][selected].long()
+    prefix = torch.zeros_like(bundle_topk, dtype=torch.int64)
+    running = torch.zeros(
+        int(layer["topk_experts"].max().item()) + 1, dtype=torch.int64
+    )
+    for row, experts in enumerate(bundle_topk):
+        for column, expert in enumerate(experts.tolist()):
+            prefix[row, column] = running[expert]
+            running[expert] += int(layer["count"][selected][row])
+    ordinals = prefix[indexes] + offsets[:, None]
+    return bundle_topk[indexes], ordinals
 
 
 def _measure(
@@ -461,7 +491,11 @@ def _worker(local_rank: int, args: argparse.Namespace) -> None:
         dtype=torch.int64,
         device="cuda",
     )
-    logical_topk = _sample(layer, local_rank, args.tokens_per_rank, args.seed).cuda()
+    logical_topk, ordinals = _sample(
+        layer, local_rank, args.tokens_per_rank, args.seed
+    )
+    logical_topk = logical_topk.cuda()
+    ordinals = ordinals.cuda()
     x = torch.randn(
         (args.tokens_per_rank, args.hidden), dtype=torch.bfloat16, device="cuda"
     )
@@ -478,6 +512,7 @@ def _worker(local_rank: int, args: argparse.Namespace) -> None:
                     quota,
                     local_rank,
                     slots,
+                    ordinals,
                 )
                 if name == "plan" and quota is not None
                 else maps[name][local_rank, logical_topk]

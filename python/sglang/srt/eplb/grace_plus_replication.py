@@ -866,34 +866,35 @@ def _communication_aware_quotas(
             rank_cost=rank_cost,
             remote_cost=remote_cost,
         )
-        metrics = _route_quota(arrays, quota, source_demand, replicas)
+        summary = _quota_summary(quota)
         violation = max(
-            (metrics.remote / budgets[0]) if budgets[0] else float(metrics.remote),
-            (metrics.max_pair_traffic / budgets[1])
+            (summary.remote / budgets[0]) if budgets[0] else float(summary.remote),
+            (summary.max_pair_traffic / budgets[1])
             if budgets[1]
-            else float(metrics.max_pair_traffic),
-            (metrics.max_ingress / budgets[2])
+            else float(summary.max_pair_traffic),
+            (summary.max_ingress / budgets[2])
             if budgets[2]
-            else float(metrics.max_ingress),
-            (metrics.max_egress / budgets[3])
+            else float(summary.max_ingress),
+            (summary.max_egress / budgets[3])
             if budgets[3]
-            else float(metrics.max_egress),
+            else float(summary.max_egress),
         )
         key = (
             violation,
-            max(metrics.compute_load, default=0),
-            int(np.square(metrics.compute_load).sum()),
-            metrics.remote,
-            metrics.max_pair_traffic,
+            max(summary.compute_load, default=0),
+            int(np.square(summary.compute_load).sum()),
+            summary.remote,
+            summary.max_pair_traffic,
         )
         if best is None or key < best[0]:
-            best = (key, quota, metrics)
+            best = (key, quota)
         traffic = quota.sum(axis=1, dtype=np.int64)
         np.fill_diagonal(traffic, 0)
         rank_cost = traffic.sum(axis=0) + traffic.sum(axis=1)
         remote_cost *= 2
     assert best is not None
-    return best[1], best[2]
+    quota = best[1]
+    return quota, _route_quota(arrays, quota, source_demand, replicas)
 
 
 def _gains_and_traffic(
