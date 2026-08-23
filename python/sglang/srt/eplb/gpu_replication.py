@@ -25,7 +25,6 @@ from .grace_plus_replication import (
 
 def _record(timing: dict[str, float] | None, key: str, started: float) -> None:
     if timing is not None:
-        torch.cuda.synchronize()
         timing[key] = timing.get(key, 0.0) + (time.perf_counter() - started) * 1000.0
 
 
@@ -604,6 +603,8 @@ def replicate_source_top_experts_cuda(
         )
         _record(timing, "quota_allocation_ms", allocation_started)
 
+    # One synchronization at the API boundary; per-kernel syncs destroy overlap.
+    torch.cuda.synchronize(device)
     replica_mask_np = replica_mask.cpu().numpy()
     demand_np = demand.cpu().numpy()
     routing_np = routing_tensor.cpu().numpy()
