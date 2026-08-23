@@ -336,6 +336,154 @@ __global__ void localize_quota_kernel(
   }
 }
 
+template <int MaxRanks>
+__global__ void fused_quota_kernel(
+    const int64_t* demand, const bool* replicas, const int64_t* primary,
+    const int64_t* routing, const int64_t* expert_order,
+    const int64_t* source_order, double imbalance_limit, int64_t* quota,
+    int64_t* next_routing, int64_t* instance, int64_t* loads, int64_t experts,
+    int64_t ranks) {
+  if (blockIdx.x) return;
+  const int tid = threadIdx.x;
+  int64_t allocation[MaxRanks];
+  int64_t remaining[MaxRanks];
+  bool selected[MaxRanks];
+
+  const int64_t quota_size = experts * ranks * ranks;
+  for (int64_t index = tid; index < quota_size; index += blockDim.x) {
+    quota[index] = 0;
+  }
+  const int64_t routing_size = experts * ranks;
+  for (int64_t index = tid; index < routing_size; index += blockDim.x) {
+    next_routing[index] = routing[index];
+  }
+  if (tid == 0) {
+    for (int rank = 0; rank < ranks; ++rank) loads[rank] = 0;
+    for (int64_t position = 0; position < experts; ++position) {
+      const int64_t expert = expert_order[position];
+      int64_t total = 0;
+      for (int rank = 0; rank < ranks; ++rank) {
+        total += demand[expert * ranks + rank];
+      }
+      waterfill_fast<MaxRanks>(loads, replicas, expert, -1, total, allocation,
+                               ranks);
+      for (int rank = 0; rank < ranks; ++rank) {
+        instance[expert * ranks + rank] = allocation[rank];
+        loads[rank] += allocation[rank];
+      }
+    }
+  }
+  __syncthreads();
+
+  for (int64_t expert = tid; expert < experts; expert += blockDim.x) {
+    for (int source = 0; source < ranks; ++source) {
+      const int64_t value = demand[expert * ranks + source];
+      const int64_t local = min(value, instance[expert * ranks + source]);
+      const int64_t offset = (source * experts + expert) * ranks;
+      quota[offset + source] = local;
+      remaining[source] = value - local;
+      instance[expert * ranks + source] -= local;
+      selected[source] = false;
+    }
+    for (int position = 0; position < ranks; ++position) {
+      int source = -1;
+      for (int candidate = 0; candidate < ranks; ++candidate) {
+        if (selected[candidate]) continue;
+        if (source < 0 || remaining[candidate] > remaining[source] ||
+            (remaining[candidate] == remaining[source] && candidate < source)) {
+          source = candidate;
+        }
+      }
+      selected[source] = true;
+      int64_t amount = remaining[source];
+      while (amount) {
+        int target = -1;
+        const int preferred_target = routing[source * experts + expert];
+        for (int rank = 0; rank < ranks; ++rank) {
+          const int64_t available = instance[expert * ranks + rank];
+          if (!available) continue;
+          if (target < 0 || rank == preferred_target ||
+              (target != preferred_target &&
+               (available > instance[expert * ranks + target] ||
+                (available == instance[expert * ranks + target] && rank < target)))) {
+            target = rank;
+          }
+        }
+        const int64_t moved = min(amount, instance[expert * ranks + target]);
+        const int64_t offset = (source * experts + expert) * ranks;
+        quota[offset + target] += moved;
+        instance[expert * ranks + target] -= moved;
+        amount -= moved;
+      }
+    }
+  }
+  __syncthreads();
+
+  if (tid == 0 && imbalance_limit >= 1.0) {
+    int64_t capacity = 0;
+    for (int rank = 0; rank < ranks; ++rank) capacity = max(capacity, loads[rank]);
+    int64_t total = 0;
+    for (int64_t index = 0; index < experts * ranks; ++index) total += demand[index];
+    capacity = max(capacity, static_cast<int64_t>(ceil(
+        static_cast<double>(total) / ranks * imbalance_limit)));
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (int source = 0; source < ranks; ++source) {
+        int64_t room = capacity - loads[source];
+        for (int64_t index = 0; index < experts && room; ++index) {
+          const int64_t expert = source_order[source * experts + index];
+          if (!replicas[expert * ranks + source]) continue;
+          for (int pass = 0; pass < ranks && room; ++pass) {
+            const int primary_rank = primary[expert];
+            const int secondary = pass - 1;
+            const int target = pass == 0
+                                   ? primary_rank
+                                   : secondary + (secondary >= primary_rank);
+            if (target == source || !replicas[expert * ranks + target]) continue;
+            const int64_t offset = (source * experts + expert) * ranks;
+            const int64_t moved = min(room, quota[offset + target]);
+            quota[offset + target] -= moved;
+            quota[offset + source] += moved;
+            loads[target] -= moved;
+            loads[source] += moved;
+            room -= moved;
+            changed |= moved != 0;
+          }
+        }
+      }
+    }
+  }
+  __syncthreads();
+
+  for (int64_t index = tid; index < routing_size; index += blockDim.x) {
+    const int64_t source = index / experts;
+    const int64_t expert = index % experts;
+    const int64_t offset = index * ranks;
+    int target = 0;
+    int64_t best = quota[offset];
+    for (int rank = 1; rank < ranks; ++rank) {
+      if (quota[offset + rank] > best) {
+        best = quota[offset + rank];
+        target = rank;
+      }
+    }
+    if (best) next_routing[index] = target;
+  }
+}
+
+template <int MaxRanks>
+void launch_fused_quota(
+    const int64_t* demand, const bool* replicas, const int64_t* primary,
+    const int64_t* routing, const int64_t* expert_order,
+    const int64_t* source_order, double imbalance_limit, int64_t* quota,
+    int64_t* next_routing, int64_t* instance, int64_t* loads, int64_t experts,
+    int64_t ranks, cudaStream_t stream) {
+  launch(fused_quota_kernel<MaxRanks>, dim3(1), dim3(128), stream,
+         demand, replicas, primary, routing, expert_order, source_order,
+         imbalance_limit, quota, next_routing, instance, loads, experts, ranks);
+}
+
 __global__ void quota_routing_kernel(const int64_t* quota, int64_t* routing,
                                      int64_t experts, int64_t ranks) {
   const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -460,25 +608,56 @@ void solve_quota_into(
               instance.sizes() == demand.sizes());
   TORCH_CHECK(loads.is_cuda() && loads.scalar_type() == torch::kInt64 &&
               loads.dim() == 1 && loads.size(0) == ranks);
-  quota.zero_();
-  next_routing.copy_(routing);
   auto stream = c10::cuda::getCurrentCUDAStream(demand.get_device());
-  launch(instance_quota_kernel, dim3(1), dim3(1), stream.stream(),
-         demand.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
-         expert_order.data_ptr<int64_t>(), instance.data_ptr<int64_t>(),
-         loads.data_ptr<int64_t>(), experts, ranks);
-  launch(source_quota_kernel, dim3(experts), dim3(1), stream.stream(),
-         demand.data_ptr<int64_t>(), instance.data_ptr<int64_t>(),
-         routing.data_ptr<int64_t>(), quota.data_ptr<int64_t>(), experts, ranks);
-  launch(localize_quota_kernel, dim3(1), dim3(1), stream.stream(),
-         demand.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
-         primary.data_ptr<int64_t>(), source_order.data_ptr<int64_t>(),
-         quota.data_ptr<int64_t>(), loads.data_ptr<int64_t>(), imbalance_limit,
-         experts, ranks);
-  const int64_t total = experts * ranks;
-  launch(quota_routing_kernel, dim3((total + 255) / 256), dim3(256),
-         stream.stream(), quota.data_ptr<int64_t>(),
-         next_routing.data_ptr<int64_t>(), experts, ranks);
+  if (ranks <= 4) {
+    launch_fused_quota<4>(
+        demand.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
+        primary.data_ptr<int64_t>(), routing.data_ptr<int64_t>(),
+        expert_order.data_ptr<int64_t>(), source_order.data_ptr<int64_t>(),
+        imbalance_limit, quota.data_ptr<int64_t>(),
+        next_routing.data_ptr<int64_t>(), instance.data_ptr<int64_t>(),
+        loads.data_ptr<int64_t>(), experts, ranks, stream.stream());
+  } else if (ranks <= 8) {
+    launch_fused_quota<8>(
+        demand.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
+        primary.data_ptr<int64_t>(), routing.data_ptr<int64_t>(),
+        expert_order.data_ptr<int64_t>(), source_order.data_ptr<int64_t>(),
+        imbalance_limit, quota.data_ptr<int64_t>(),
+        next_routing.data_ptr<int64_t>(), instance.data_ptr<int64_t>(),
+        loads.data_ptr<int64_t>(), experts, ranks, stream.stream());
+  } else if (ranks <= 16) {
+    launch_fused_quota<16>(
+        demand.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
+        primary.data_ptr<int64_t>(), routing.data_ptr<int64_t>(),
+        expert_order.data_ptr<int64_t>(), source_order.data_ptr<int64_t>(),
+        imbalance_limit, quota.data_ptr<int64_t>(),
+        next_routing.data_ptr<int64_t>(), instance.data_ptr<int64_t>(),
+        loads.data_ptr<int64_t>(), experts, ranks, stream.stream());
+  } else if (ranks <= 32) {
+    launch_fused_quota<32>(
+        demand.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
+        primary.data_ptr<int64_t>(), routing.data_ptr<int64_t>(),
+        expert_order.data_ptr<int64_t>(), source_order.data_ptr<int64_t>(),
+        imbalance_limit, quota.data_ptr<int64_t>(),
+        next_routing.data_ptr<int64_t>(), instance.data_ptr<int64_t>(),
+        loads.data_ptr<int64_t>(), experts, ranks, stream.stream());
+  } else if (ranks <= 64) {
+    launch_fused_quota<64>(
+        demand.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
+        primary.data_ptr<int64_t>(), routing.data_ptr<int64_t>(),
+        expert_order.data_ptr<int64_t>(), source_order.data_ptr<int64_t>(),
+        imbalance_limit, quota.data_ptr<int64_t>(),
+        next_routing.data_ptr<int64_t>(), instance.data_ptr<int64_t>(),
+        loads.data_ptr<int64_t>(), experts, ranks, stream.stream());
+  } else {
+    launch_fused_quota<128>(
+        demand.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
+        primary.data_ptr<int64_t>(), routing.data_ptr<int64_t>(),
+        expert_order.data_ptr<int64_t>(), source_order.data_ptr<int64_t>(),
+        imbalance_limit, quota.data_ptr<int64_t>(),
+        next_routing.data_ptr<int64_t>(), instance.data_ptr<int64_t>(),
+        loads.data_ptr<int64_t>(), experts, ranks, stream.stream());
+  }
   check_cuda(cudaGetLastError());
 }
 
