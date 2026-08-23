@@ -154,7 +154,9 @@ def main() -> None:
 
         started = time.perf_counter()
         if args.cuda:
-            from sglang.srt.eplb.gpu_replication import evaluate_replicated_placement_cuda
+            from sglang.srt.eplb.gpu_replication import (
+                evaluate_replicated_placement_cuda,
+            )
 
             baseline = evaluate_replicated_placement_cuda(
                 tokens, primary, num_ranks=num_ranks
@@ -186,10 +188,12 @@ def main() -> None:
                 primary,
                 num_ranks=num_ranks,
                 max_extra_per_rank=max_extra,
+                max_compute_extra_per_rank=args.max_compute_extra_experts_per_rank,
                 compute_imbalance_limit=args.compute_imbalance_limit,
                 communication_budget_ratio=budget_ratio,
                 device="cuda",
                 timing=phase_ms,
+                materialize_quota=bool(args.output_plan),
             )
         else:
             optimized = replicate_source_top_experts(
@@ -205,8 +209,7 @@ def main() -> None:
         # compute balancing is requested, the remainder is the quota/compute
         # stage; keep it separate from the communication candidate search.
         quota_elapsed = sum(
-            phase_ms.get(key, 0.0)
-            for key in ("quota_solve_ms", "quota_allocation_ms")
+            phase_ms.get(key, 0.0) for key in ("quota_solve_ms", "quota_allocation_ms")
         )
         phase_ms["compute_replication_ms"] = (
             max(
@@ -216,9 +219,10 @@ def main() -> None:
                 - quota_elapsed,
             )
             if args.compute_imbalance_limit is not None
+            or args.max_compute_extra_experts_per_rank
             else 0.0
         )
-        if args.max_compute_extra_experts_per_rank:
+        if args.max_compute_extra_experts_per_rank and not args.cuda:
             compute_started = time.perf_counter()
             before_quota = {
                 key: value

@@ -12,6 +12,7 @@ setup(
                 str(root / "csrc" / "bindings.cpp"),
                 str(root / "csrc" / "demand.cu"),
                 str(root / "csrc" / "placement.cu"),
+                str(root / "csrc" / "quota.cu"),
                 str(root / "csrc" / "traffic.cu"),
             ],
             include_dirs=[str(root / "csrc")],
