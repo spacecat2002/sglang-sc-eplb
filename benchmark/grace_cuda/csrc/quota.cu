@@ -172,7 +172,17 @@ __global__ void select_compute_replicas_kernel(
   __shared__ bool done;
   int64_t allocation[MaxRanks];
   int64_t base[MaxRanks];
-  if (threadIdx.x == 0) added = 0;
+  if (threadIdx.x == 0) {
+    added = 0;
+    for (int rank = 0; rank < ranks; ++rank) {
+      loads[rank] = 0;
+      added_by_rank[rank] = 0;
+    }
+    for (int64_t index = 0; index < experts * ranks; ++index) {
+      instance_quota[index] = 0;
+      addition_order[index] = 0;
+    }
+  }
   __syncthreads();
   while (added < ranks * max_extra_per_rank) {
     if (threadIdx.x == 0) {
@@ -405,10 +415,11 @@ __global__ void quota_traffic_kernel(
 
 }  // namespace
 
-std::tuple<torch::Tensor, torch::Tensor> solve_quota(
+void solve_quota_into(
     torch::Tensor demand, torch::Tensor replicas, torch::Tensor primary,
     torch::Tensor routing, torch::Tensor expert_order,
-    torch::Tensor source_order, double imbalance_limit) {
+    torch::Tensor source_order, double imbalance_limit, torch::Tensor quota,
+    torch::Tensor next_routing, torch::Tensor instance, torch::Tensor loads) {
   TORCH_CHECK(demand.is_cuda() && replicas.is_cuda() && primary.is_cuda() &&
               routing.is_cuda() && expert_order.is_cuda() && source_order.is_cuda());
   TORCH_CHECK(demand.scalar_type() == torch::kInt64 &&
@@ -425,10 +436,17 @@ std::tuple<torch::Tensor, torch::Tensor> solve_quota(
               routing.size(1) == experts && expert_order.numel() == experts &&
               source_order.sizes() == routing.sizes());
 
-  auto instance = torch::zeros_like(demand);
-  auto loads = torch::zeros({ranks}, demand.options());
-  auto quota = torch::zeros({ranks, experts, ranks}, demand.options());
-  auto next_routing = routing.clone();
+  TORCH_CHECK(quota.is_cuda() && quota.scalar_type() == torch::kInt64 &&
+              quota.dim() == 3 && quota.size(0) == ranks &&
+              quota.size(1) == experts && quota.size(2) == ranks);
+  TORCH_CHECK(next_routing.is_cuda() && next_routing.scalar_type() == torch::kInt64 &&
+              next_routing.sizes() == routing.sizes());
+  TORCH_CHECK(instance.is_cuda() && instance.scalar_type() == torch::kInt64 &&
+              instance.sizes() == demand.sizes());
+  TORCH_CHECK(loads.is_cuda() && loads.scalar_type() == torch::kInt64 &&
+              loads.dim() == 1 && loads.size(0) == ranks);
+  quota.zero_();
+  next_routing.copy_(routing);
   auto stream = c10::cuda::getCurrentCUDAStream(demand.get_device());
   launch(instance_quota_kernel, dim3(1), dim3(1), stream.stream(),
          demand.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
@@ -447,12 +465,28 @@ std::tuple<torch::Tensor, torch::Tensor> solve_quota(
          stream.stream(), quota.data_ptr<int64_t>(),
          next_routing.data_ptr<int64_t>(), experts, ranks);
   check_cuda(cudaGetLastError());
+}
+
+std::tuple<torch::Tensor, torch::Tensor> solve_quota(
+    torch::Tensor demand, torch::Tensor replicas, torch::Tensor primary,
+    torch::Tensor routing, torch::Tensor expert_order,
+    torch::Tensor source_order, double imbalance_limit) {
+  const int64_t experts = demand.size(0);
+  const int64_t ranks = demand.size(1);
+  auto quota = torch::zeros({ranks, experts, ranks}, demand.options());
+  auto next_routing = routing.clone();
+  auto instance = torch::zeros_like(demand);
+  auto loads = torch::zeros({ranks}, demand.options());
+  solve_quota_into(demand, replicas, primary, routing, expert_order, source_order,
+                   imbalance_limit, quota, next_routing, instance, loads);
   return {quota, next_routing};
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> select_compute_replicas(
+void select_compute_replicas_into(
     torch::Tensor demand, torch::Tensor replicas, torch::Tensor expert_demand,
-    torch::Tensor expert_order, int64_t max_extra_per_rank) {
+    torch::Tensor expert_order, int64_t max_extra_per_rank,
+    torch::Tensor instance, torch::Tensor loads, torch::Tensor added_by_rank,
+    torch::Tensor addition_order, torch::Tensor added) {
   TORCH_CHECK(demand.is_cuda() && replicas.is_cuda() &&
               expert_demand.is_cuda() && expert_order.is_cuda());
   TORCH_CHECK(demand.scalar_type() == torch::kInt64 &&
@@ -465,57 +499,74 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> select_compute_replicas(
   TORCH_CHECK(ranks > 0 && ranks <= kMaxRanks, "compute replicas support 1-128 ranks");
   TORCH_CHECK(expert_demand.numel() == experts &&
               expert_order.numel() == experts && max_extra_per_rank >= 0);
-  auto next_replicas = replicas.clone();
-  auto instance = torch::zeros_like(demand);
-  auto loads = torch::zeros({ranks}, demand.options());
-  auto added_by_rank = torch::zeros({ranks}, demand.options());
-  auto addition_order = torch::zeros_like(demand);
-  auto added = torch::zeros({1}, demand.options());
+  TORCH_CHECK(instance.is_cuda() && instance.scalar_type() == torch::kInt64 &&
+              instance.sizes() == demand.sizes());
+  TORCH_CHECK(loads.is_cuda() && loads.scalar_type() == torch::kInt64 &&
+              loads.numel() == ranks);
+  TORCH_CHECK(added_by_rank.is_cuda() && added_by_rank.scalar_type() == torch::kInt64 &&
+              added_by_rank.numel() == ranks);
+  TORCH_CHECK(addition_order.is_cuda() && addition_order.scalar_type() == torch::kInt64 &&
+              addition_order.sizes() == demand.sizes());
+  TORCH_CHECK(added.is_cuda() && added.scalar_type() == torch::kInt64 && added.numel() == 1);
   auto stream = c10::cuda::getCurrentCUDAStream(demand.get_device());
   if (ranks <= 4) {
     launch(select_compute_replicas_kernel<4>, dim3(1), dim3(128), stream.stream(),
            demand.data_ptr<int64_t>(), expert_demand.data_ptr<int64_t>(),
-           expert_order.data_ptr<int64_t>(), next_replicas.data_ptr<bool>(),
+           expert_order.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
            instance.data_ptr<int64_t>(), loads.data_ptr<int64_t>(),
            added_by_rank.data_ptr<int64_t>(), addition_order.data_ptr<int64_t>(),
            added.data_ptr<int64_t>(), experts, ranks, max_extra_per_rank);
   } else if (ranks <= 8) {
     launch(select_compute_replicas_kernel<8>, dim3(1), dim3(128), stream.stream(),
            demand.data_ptr<int64_t>(), expert_demand.data_ptr<int64_t>(),
-           expert_order.data_ptr<int64_t>(), next_replicas.data_ptr<bool>(),
+           expert_order.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
            instance.data_ptr<int64_t>(), loads.data_ptr<int64_t>(),
            added_by_rank.data_ptr<int64_t>(), addition_order.data_ptr<int64_t>(),
            added.data_ptr<int64_t>(), experts, ranks, max_extra_per_rank);
   } else if (ranks <= 16) {
     launch(select_compute_replicas_kernel<16>, dim3(1), dim3(128), stream.stream(),
            demand.data_ptr<int64_t>(), expert_demand.data_ptr<int64_t>(),
-           expert_order.data_ptr<int64_t>(), next_replicas.data_ptr<bool>(),
+           expert_order.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
            instance.data_ptr<int64_t>(), loads.data_ptr<int64_t>(),
            added_by_rank.data_ptr<int64_t>(), addition_order.data_ptr<int64_t>(),
            added.data_ptr<int64_t>(), experts, ranks, max_extra_per_rank);
   } else if (ranks <= 32) {
     launch(select_compute_replicas_kernel<32>, dim3(1), dim3(128), stream.stream(),
            demand.data_ptr<int64_t>(), expert_demand.data_ptr<int64_t>(),
-           expert_order.data_ptr<int64_t>(), next_replicas.data_ptr<bool>(),
+           expert_order.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
            instance.data_ptr<int64_t>(), loads.data_ptr<int64_t>(),
            added_by_rank.data_ptr<int64_t>(), addition_order.data_ptr<int64_t>(),
            added.data_ptr<int64_t>(), experts, ranks, max_extra_per_rank);
   } else if (ranks <= 64) {
     launch(select_compute_replicas_kernel<64>, dim3(1), dim3(128), stream.stream(),
            demand.data_ptr<int64_t>(), expert_demand.data_ptr<int64_t>(),
-           expert_order.data_ptr<int64_t>(), next_replicas.data_ptr<bool>(),
+           expert_order.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
            instance.data_ptr<int64_t>(), loads.data_ptr<int64_t>(),
            added_by_rank.data_ptr<int64_t>(), addition_order.data_ptr<int64_t>(),
            added.data_ptr<int64_t>(), experts, ranks, max_extra_per_rank);
   } else {
     launch(select_compute_replicas_kernel<128>, dim3(1), dim3(128), stream.stream(),
            demand.data_ptr<int64_t>(), expert_demand.data_ptr<int64_t>(),
-           expert_order.data_ptr<int64_t>(), next_replicas.data_ptr<bool>(),
+           expert_order.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
            instance.data_ptr<int64_t>(), loads.data_ptr<int64_t>(),
            added_by_rank.data_ptr<int64_t>(), addition_order.data_ptr<int64_t>(),
            added.data_ptr<int64_t>(), experts, ranks, max_extra_per_rank);
   }
   check_cuda(cudaGetLastError());
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> select_compute_replicas(
+    torch::Tensor demand, torch::Tensor replicas, torch::Tensor expert_demand,
+    torch::Tensor expert_order, int64_t max_extra_per_rank) {
+  auto next_replicas = replicas.clone();
+  auto instance = torch::zeros_like(demand);
+  auto loads = torch::zeros({demand.size(1)}, demand.options());
+  auto added_by_rank = torch::zeros_like(loads);
+  auto addition_order = torch::zeros_like(demand);
+  auto added = torch::zeros({1}, demand.options());
+  select_compute_replicas_into(demand, next_replicas, expert_demand, expert_order,
+                               max_extra_per_rank, instance, loads, added_by_rank,
+                               addition_order, added);
   return {next_replicas, added, addition_order};
 }
 

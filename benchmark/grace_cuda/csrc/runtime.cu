@@ -25,19 +25,29 @@ __global__ void default_routing_kernel(const bool* replicas,
 
 }  // namespace
 
-torch::Tensor default_routing(torch::Tensor replicas, torch::Tensor primary) {
+void default_routing_into(torch::Tensor replicas, torch::Tensor primary,
+                          torch::Tensor routing) {
   TORCH_CHECK(replicas.is_cuda() && primary.is_cuda());
   TORCH_CHECK(replicas.scalar_type() == torch::kBool &&
               primary.scalar_type() == torch::kInt64 && replicas.dim() == 2 &&
               primary.numel() == replicas.size(0));
   const int64_t experts = replicas.size(0);
   const int64_t ranks = replicas.size(1);
-  auto routing = torch::empty({ranks, experts}, primary.options());
+  TORCH_CHECK(routing.is_cuda() && routing.scalar_type() == torch::kInt64 &&
+              routing.dim() == 2 && routing.size(0) == ranks &&
+              routing.size(1) == experts);
   auto stream = c10::cuda::getCurrentCUDAStream(replicas.get_device());
   launch(default_routing_kernel, dim3((ranks * experts + 255) / 256), dim3(256),
          stream.stream(), replicas.data_ptr<bool>(), primary.data_ptr<int64_t>(),
          routing.data_ptr<int64_t>(), experts, ranks);
   check_cuda(cudaGetLastError());
+}
+
+torch::Tensor default_routing(torch::Tensor replicas, torch::Tensor primary) {
+  const int64_t experts = replicas.size(0);
+  const int64_t ranks = replicas.size(1);
+  auto routing = torch::empty({ranks, experts}, primary.options());
+  default_routing_into(replicas, primary, routing);
   return routing;
 }
 

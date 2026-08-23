@@ -30,18 +30,28 @@ __global__ void topn_kernel(const int64_t* demand, const int64_t* primary,
   }
 }
 
-torch::Tensor select_topn(torch::Tensor demand, torch::Tensor primary,
-                          int64_t max_extra) {
+void select_topn_into(torch::Tensor demand, torch::Tensor primary,
+                      int64_t max_extra, torch::Tensor replicas) {
   TORCH_CHECK(demand.is_cuda() && primary.is_cuda());
   const auto experts = demand.size(0);
   const auto ranks = demand.size(1);
-  auto replicas = torch::zeros({experts, ranks},
-                               demand.options().dtype(torch::kBool));
+  TORCH_CHECK(replicas.is_cuda() && replicas.scalar_type() == torch::kBool &&
+              replicas.sizes() == demand.sizes());
+  replicas.zero_();
   auto stream = c10::cuda::getCurrentCUDAStream(demand.get_device());
   launch(topn_kernel, dim3(ranks), dim3(1), stream.stream(),
          demand.data_ptr<int64_t>(), primary.data_ptr<int64_t>(),
          replicas.data_ptr<bool>(), experts, ranks, max_extra);
   check_cuda(cudaGetLastError());
+}
+
+torch::Tensor select_topn(torch::Tensor demand, torch::Tensor primary,
+                          int64_t max_extra) {
+  const auto experts = demand.size(0);
+  const auto ranks = demand.size(1);
+  auto replicas = torch::zeros({experts, ranks},
+                               demand.options().dtype(torch::kBool));
+  select_topn_into(demand, primary, max_extra, replicas);
   return replicas;
 }
 

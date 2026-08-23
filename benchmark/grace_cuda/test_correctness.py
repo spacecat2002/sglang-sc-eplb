@@ -9,6 +9,9 @@ def test_kernels() -> None:
     count = torch.tensor([2, 3, 5], device="cuda", dtype=torch.int64)
     demand = _C.source_demand(source, topk, count, 4, 2)
     assert demand.cpu().tolist() == [[2, 0], [2, 3], [5, 3], [5, 0]]
+    demand_into = torch.empty_like(demand)
+    _C.source_demand_into(source, topk, count, 4, 2, demand_into)
+    assert torch.equal(demand_into, demand)
 
     primary = torch.tensor([0, 0, 1, 1], device="cuda", dtype=torch.int64)
     replicas = _C.select_topn(demand, primary, 0)
@@ -25,6 +28,12 @@ def test_kernels() -> None:
     assert torch.equal(fused_demand, demand)
     assert torch.equal(fused_replicas, replicas)
     assert fused_routing.cpu().tolist() == [[0, 0, 1, 1], [0, 0, 1, 1]]
+    into_replicas = torch.empty_like(replicas)
+    into_routing = torch.empty_like(fused_routing)
+    _C.select_topn_into(demand, primary, 0, into_replicas)
+    _C.default_routing_into(into_replicas, primary, into_routing)
+    assert torch.equal(into_replicas, replicas)
+    assert torch.equal(into_routing, fused_routing)
 
     traffic, compute = _C.traffic(source, topk, count, primary, replicas, 2)
     assert traffic.cpu().tolist() == [[0, 5], [3, 0]]
@@ -51,6 +60,25 @@ def test_kernels() -> None:
         [[0, 0], [0, 3], [0, 3], [0, 0]],
     ]
     assert routing.cpu().tolist() == [[0, 0, 0, 1], [0, 1, 1, 1]]
+    quota_into = torch.empty_like(quota)
+    routing_into = torch.empty_like(routing)
+    instance_into = torch.empty_like(demand)
+    loads_into = torch.empty((2,), device="cuda", dtype=torch.int64)
+    _C.solve_quota_into(
+        demand,
+        replicas,
+        primary,
+        routing,
+        expert_order,
+        source_order,
+        1.25,
+        quota_into,
+        routing_into,
+        instance_into,
+        loads_into,
+    )
+    assert torch.equal(quota_into, quota)
+    assert torch.equal(routing_into, routing)
 
     ordinals = torch.zeros_like(topk)
     traffic, compute = _C.quota_traffic(
@@ -98,6 +126,27 @@ def test_kernels() -> None:
     assert balanced.cpu().tolist() == [[True, True], [True, False]]
     assert added.item() == 1
     assert addition_order.cpu().tolist() == [[0, 1], [0, 0]]
+    into_replicas = initial.clone()
+    into_instance = torch.empty_like(unbalanced)
+    into_loads = torch.empty((2,), device="cuda", dtype=torch.int64)
+    into_added_by_rank = torch.empty_like(into_loads)
+    into_order = torch.empty_like(unbalanced)
+    into_added = torch.empty((1,), device="cuda", dtype=torch.int64)
+    _C.select_compute_replicas_into(
+        unbalanced,
+        into_replicas,
+        expert_demand,
+        expert_order,
+        1,
+        into_instance,
+        into_loads,
+        into_added_by_rank,
+        into_order,
+        into_added,
+    )
+    assert torch.equal(into_replicas, balanced)
+    assert torch.equal(into_order, addition_order)
+    assert into_added.item() == added.item()
 
 
 if __name__ == "__main__":

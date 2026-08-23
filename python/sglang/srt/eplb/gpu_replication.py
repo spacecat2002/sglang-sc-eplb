@@ -25,6 +25,7 @@ from .grace_plus_replication import (
 
 def _record(timing: dict[str, float] | None, key: str, started: float) -> None:
     if timing is not None:
+        torch.cuda.synchronize()
         timing[key] = timing.get(key, 0.0) + (time.perf_counter() - started) * 1000.0
 
 
@@ -87,6 +88,10 @@ def _quota_cuda(
     demand_order: torch.Tensor | None = None,
     source_order: torch.Tensor | None = None,
     expert_order: torch.Tensor | None = None,
+    quota_out: torch.Tensor | None = None,
+    routing_out: torch.Tensor | None = None,
+    instance_out: torch.Tensor | None = None,
+    loads_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if expert_demand is None:
         expert_demand = demand.sum(dim=1)
@@ -99,7 +104,22 @@ def _quota_cuda(
         ]
     if source_order is None:
         source_order = torch.argsort(demand.t(), dim=1, descending=True, stable=True)
-    return _C.solve_quota(
+    if (
+        quota_out is None
+        or routing_out is None
+        or instance_out is None
+        or loads_out is None
+    ):
+        return _C.solve_quota(
+            demand,
+            replica_mask,
+            primary,
+            routing,
+            expert_order,
+            source_order,
+            compute_imbalance_limit,
+        )
+    _C.solve_quota_into(
         demand,
         replica_mask,
         primary,
@@ -107,7 +127,12 @@ def _quota_cuda(
         expert_order,
         source_order,
         compute_imbalance_limit,
+        quota_out,
+        routing_out,
+        instance_out,
+        loads_out,
     )
+    return quota_out, routing_out
 
 
 def _bundle_ordinals_cuda(
@@ -175,6 +200,7 @@ def _communication_quota_cuda(
     demand_order: torch.Tensor | None = None,
     source_order: torch.Tensor | None = None,
     expert_order: torch.Tensor | None = None,
+    workspaces: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     ranks = demand.shape[1]
     rank_ids = torch.arange(ranks, device=demand.device, dtype=torch.int64)
@@ -200,7 +226,7 @@ def _communication_quota_cuda(
     summaries = []
     rank_cost = None
     preferred = routing
-    for _ in range(4):
+    for candidate_index in range(4):
         if rank_cost is not None:
             scores = rank_cost * ranks + rank_ids
             scores = torch.where(
@@ -210,6 +236,7 @@ def _communication_quota_cuda(
             )
             preferred = scores.argmin(dim=2)
             preferred = torch.where(replica_mask.t(), source_ids, preferred)
+        workspace = workspaces[candidate_index] if workspaces is not None else None
         quota, quota_routing = _quota_cuda(
             demand,
             replica_mask,
@@ -220,6 +247,10 @@ def _communication_quota_cuda(
             demand_order=demand_order,
             source_order=source_order,
             expert_order=expert_order,
+            quota_out=workspace[0] if workspace else None,
+            routing_out=workspace[1] if workspace else None,
+            instance_out=workspace[2] if workspace else None,
+            loads_out=workspace[3] if workspace else None,
         )
         traffic = quota.sum(dim=1)
         traffic.fill_diagonal_(0)
@@ -278,6 +309,48 @@ class GraceCudaRuntime:
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA runtime requested but torch.cuda is unavailable")
         self.primary: torch.Tensor | None = None
+        self.demand = torch.empty(
+            (self.num_experts, self.num_ranks),
+            device=self.device,
+            dtype=torch.int64,
+        )
+        self.quota = torch.empty(
+            (self.num_ranks, self.num_experts, self.num_ranks),
+            device=self.device,
+            dtype=torch.int64,
+        )
+        self.routing = torch.empty(
+            (self.num_ranks, self.num_experts),
+            device=self.device,
+            dtype=torch.int64,
+        )
+        self.instance = torch.empty(
+            (self.num_experts, self.num_ranks),
+            device=self.device,
+            dtype=torch.int64,
+        )
+        self.loads = torch.empty(
+            (self.num_ranks,), device=self.device, dtype=torch.int64
+        )
+        self.candidate_workspaces = [
+            (
+                torch.empty_like(self.quota),
+                torch.empty_like(self.routing),
+                torch.empty_like(self.instance),
+                torch.empty_like(self.loads),
+            )
+            for _ in range(4)
+        ]
+        self.replicas = torch.empty(
+            (self.num_experts, self.num_ranks), device=self.device, dtype=torch.bool
+        )
+        self.compute_instance = torch.empty_like(self.replicas, dtype=torch.int64)
+        self.compute_loads = torch.empty(
+            (self.num_ranks,), device=self.device, dtype=torch.int64
+        )
+        self.compute_added_by_rank = torch.empty_like(self.compute_loads)
+        self.compute_addition_order = torch.empty_like(self.compute_instance)
+        self.compute_added = torch.empty((1,), device=self.device, dtype=torch.int64)
 
     def _primary_tensor(self, primary: Mapping[int, int] | torch.Tensor) -> torch.Tensor:
         if isinstance(primary, torch.Tensor):
@@ -306,15 +379,15 @@ class GraceCudaRuntime:
         topk = topk.to(device=self.device, dtype=torch.int64, copy=False).contiguous()
         count = count.to(device=self.device, dtype=torch.int64, copy=False).contiguous()
         self.primary = self._primary_tensor(primary)
-        return _C.fused_source_topn(
-            source,
-            topk,
-            count,
-            self.primary,
-            self.num_experts,
-            self.num_ranks,
-            int(max_extra_per_rank),
+        _C.source_demand_into(
+            source, topk, count, self.num_experts, self.num_ranks, self.demand
         )
+        demand = self.demand
+        _C.select_topn_into(
+            demand, self.primary, int(max_extra_per_rank), self.replicas
+        )
+        _C.default_routing_into(self.replicas, self.primary, self.routing)
+        return demand, self.replicas, self.routing
 
     def build_demand(
         self, source: torch.Tensor, topk: torch.Tensor, count: torch.Tensor
@@ -324,9 +397,10 @@ class GraceCudaRuntime:
         ).contiguous()
         topk = topk.to(device=self.device, dtype=torch.int64, copy=False).contiguous()
         count = count.to(device=self.device, dtype=torch.int64, copy=False).contiguous()
-        return _source_demand_cuda(
-            source, topk, count, self.num_experts, self.num_ranks
+        _C.source_demand_into(
+            source, topk, count, self.num_experts, self.num_ranks, self.demand
         )
+        return self.demand
 
     def plan(
         self,
@@ -438,29 +512,55 @@ def replicate_source_top_experts_cuda(
         )
         primary_tensor = torch.as_tensor(primary_np, device=device)
     if demand_tensor is None:
-        demand, replica_mask, routing_tensor = _C.fused_source_topn(
-            source,
-            topk,
-            count,
-            primary_tensor,
-            num_experts,
-            num_ranks,
-            max_extra_per_rank,
-        )
+        if runtime is None:
+            demand, replica_mask, routing_tensor = _C.fused_source_topn(
+                source,
+                topk,
+                count,
+                primary_tensor,
+                num_experts,
+                num_ranks,
+                max_extra_per_rank,
+            )
+        else:
+            _C.source_demand_into(
+                source, topk, count, num_experts, num_ranks, runtime.demand
+            )
+            demand = runtime.demand
+            _C.select_topn_into(
+                demand, primary_tensor, max_extra_per_rank, runtime.replicas
+            )
+            _C.default_routing_into(runtime.replicas, primary_tensor, runtime.routing)
+            replica_mask, routing_tensor = runtime.replicas, runtime.routing
     else:
         demand = demand_tensor.to(
             device=device, dtype=torch.int64, copy=False
         ).contiguous()
         if demand.shape != (num_experts, num_ranks):
             raise ValueError("demand has the wrong shape")
-        replica_mask = _C.select_topn(demand, primary_tensor, max_extra_per_rank)
-        routing_tensor = _C.default_routing(replica_mask, primary_tensor)
+        if runtime is None:
+            replica_mask = _C.select_topn(demand, primary_tensor, max_extra_per_rank)
+            routing_tensor = _C.default_routing(replica_mask, primary_tensor)
+        else:
+            _C.select_topn_into(
+                demand, primary_tensor, max_extra_per_rank, runtime.replicas
+            )
+            _C.default_routing_into(runtime.replicas, primary_tensor, runtime.routing)
+            replica_mask, routing_tensor = runtime.replicas, runtime.routing
     _record(timing, "communication_replication_ms", started)
 
     quota = None
     balance_copies = None
     budget_baseline = None
-    addition_order = torch.zeros_like(demand)
+    if runtime is None:
+        addition_order = torch.zeros_like(demand)
+    else:
+        addition_order = runtime.compute_addition_order
+        addition_order.zero_()
+    quota_out = runtime.quota if runtime is not None else None
+    routing_out = runtime.routing if runtime is not None else None
+    instance_out = runtime.instance if runtime is not None else None
+    loads_out = runtime.loads if runtime is not None else None
     needs_quota = compute_imbalance_limit is not None or max_compute_extra_per_rank > 0
     if needs_quota:
         expert_demand = demand.sum(dim=1)
@@ -487,6 +587,9 @@ def replicate_source_top_experts_cuda(
                 expert_demand,
                 demand_order,
                 source_order,
+                workspaces=runtime.candidate_workspaces
+                if runtime is not None
+                else None,
             )
             _record(timing, "quota_solve_ms", quota_started)
             allocation_started = time.perf_counter()
@@ -513,16 +616,36 @@ def replicate_source_top_experts_cuda(
                 expert_demand,
                 demand_order,
                 source_order,
+                quota_out=quota_out,
+                routing_out=routing_out,
+                instance_out=instance_out,
+                loads_out=loads_out,
             )
             _record(timing, "quota_solve_ms", quota_started)
         compute_started = time.perf_counter()
-        replica_mask, balance_copies, addition_order = _C.select_compute_replicas(
-            demand,
-            replica_mask,
-            expert_demand,
-            demand_order,
-            max_compute_extra_per_rank,
-        )
+        if runtime is None:
+            replica_mask, balance_copies, addition_order = _C.select_compute_replicas(
+                demand,
+                replica_mask,
+                expert_demand,
+                demand_order,
+                max_compute_extra_per_rank,
+            )
+        else:
+            _C.select_compute_replicas_into(
+                demand,
+                replica_mask,
+                expert_demand,
+                demand_order,
+                max_compute_extra_per_rank,
+                runtime.compute_instance,
+                runtime.compute_loads,
+                runtime.compute_added_by_rank,
+                runtime.compute_addition_order,
+                runtime.compute_added,
+            )
+            balance_copies = runtime.compute_added
+            addition_order = runtime.compute_addition_order
         _record(timing, "compute_replication_ms", compute_started)
         if communication_budget_ratio is not None:
             quota_started = time.perf_counter()
@@ -535,6 +658,10 @@ def replicate_source_top_experts_cuda(
                 expert_demand=expert_demand,
                 demand_order=demand_order,
                 source_order=source_order,
+                quota_out=quota_out,
+                routing_out=routing_out,
+                instance_out=instance_out,
+                loads_out=loads_out,
             )
             _record(timing, "quota_solve_ms", quota_started)
     if not needs_quota:
@@ -554,6 +681,10 @@ def replicate_source_top_experts_cuda(
             expert_demand,
             demand_order,
             source_order,
+            quota_out=quota_out,
+            routing_out=routing_out,
+            instance_out=instance_out,
+            loads_out=loads_out,
         )
         _record(timing, "quota_solve_ms", quota_started)
         allocation_started = time.perf_counter()
@@ -587,6 +718,7 @@ def replicate_source_top_experts_cuda(
             expert_demand,
             demand_order,
             source_order,
+            workspaces=runtime.candidate_workspaces if runtime is not None else None,
         )
         _record(timing, "quota_solve_ms", quota_started)
         allocation_started = time.perf_counter()
@@ -603,8 +735,6 @@ def replicate_source_top_experts_cuda(
         )
         _record(timing, "quota_allocation_ms", allocation_started)
 
-    # One synchronization at the API boundary; per-kernel syncs destroy overlap.
-    torch.cuda.synchronize(device)
     replica_mask_np = replica_mask.cpu().numpy()
     demand_np = demand.cpu().numpy()
     routing_np = routing_tensor.cpu().numpy()
