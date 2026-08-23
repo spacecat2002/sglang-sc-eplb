@@ -90,6 +90,11 @@ def main() -> None:
         "--output-plan",
         help="write replicas/routing/quota JSON for benchmark_a2a_plan.py",
     )
+    parser.add_argument(
+        "--cuda",
+        action="store_true",
+        help="run the source-demand, Top-N replication and traffic evaluation on CUDA",
+    )
     args = parser.parse_args()
     if Path(args.input).suffix != ".pt":
         parser.error("--input must be a compact .pt routing trace")
@@ -148,7 +153,16 @@ def main() -> None:
         primary = _baseline_placement(experts, num_ranks)
 
         started = time.perf_counter()
-        baseline = evaluate_replicated_placement(tokens, primary, num_ranks=num_ranks)
+        if args.cuda:
+            from sglang.srt.eplb.gpu_replication import evaluate_replicated_placement_cuda
+
+            baseline = evaluate_replicated_placement_cuda(
+                tokens, primary, num_ranks=num_ranks
+            )
+        else:
+            baseline = evaluate_replicated_placement(
+                tokens, primary, num_ranks=num_ranks
+            )
         baseline_elapsed = time.perf_counter() - started
         rows.append(
             _rows(
@@ -162,14 +176,30 @@ def main() -> None:
 
         phase_ms: dict[str, float] = {}
         started = time.perf_counter()
-        optimized = replicate_source_top_experts(
-            tokens,
-            primary,
-            num_ranks=num_ranks,
-            max_extra_per_rank=max_extra,
-            compute_imbalance_limit=args.compute_imbalance_limit,
-            timing=phase_ms,
-        )
+        if args.cuda:
+            from sglang.srt.eplb.gpu_replication import (
+                replicate_source_top_experts_cuda,
+            )
+
+            optimized = replicate_source_top_experts_cuda(
+                tokens,
+                primary,
+                num_ranks=num_ranks,
+                max_extra_per_rank=max_extra,
+                compute_imbalance_limit=args.compute_imbalance_limit,
+                communication_budget_ratio=budget_ratio,
+                device="cuda",
+                timing=phase_ms,
+            )
+        else:
+            optimized = replicate_source_top_experts(
+                tokens,
+                primary,
+                num_ranks=num_ranks,
+                max_extra_per_rank=max_extra,
+                compute_imbalance_limit=args.compute_imbalance_limit,
+                timing=phase_ms,
+            )
         replication_elapsed = time.perf_counter() - started
         # The first call contains communication-oriented placement.  When
         # compute balancing is requested, the remainder is the quota/compute
@@ -240,6 +270,7 @@ def main() -> None:
     )
     print(
         f"trace={args.input}  EP={num_ranks}  K={top_k}  "
+        f"backend={'cuda' if args.cuda else 'cpu'}  "
         f"remote replica cap/rank={max_extra}  compute limit={compute}  "
         f"compute replica cap/rank={args.max_compute_extra_experts_per_rank}  "
         f"communication budget={budget_ratio if budget_ratio is not None else 'none'}"
