@@ -834,6 +834,38 @@ def _quota_summary(quota: np.ndarray) -> ReplicaMetrics:
     )
 
 
+def _fast_communication_quota(
+    source_demand: np.ndarray,
+    replicas: Mapping[int, Sequence[int]],
+    routing: np.ndarray,
+    rank_cost: np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build a compute-balanced quota without min-cost-flow iterations."""
+
+    num_experts, num_ranks = source_demand.shape
+    instance_quota, _ = _greedy_instance_quotas(
+        source_demand.sum(axis=1), replicas, num_ranks
+    )
+    if rank_cost is None:
+        return _source_quotas(source_demand, instance_quota, routing), routing
+    preferred = np.empty_like(routing)
+    for source in range(num_ranks):
+        for expert in range(num_experts):
+            ranks = replicas[expert]
+            preferred[source, expert] = min(
+                ranks,
+                key=lambda rank: (
+                    rank != source,
+                    int(rank_cost[rank]),
+                    rank,
+                ),
+            )
+    return (
+        _source_quotas(source_demand, instance_quota, preferred),
+        preferred,
+    )
+
+
 def _communication_aware_quotas(
     arrays: RoutedArrays,
     source_demand: np.ndarray,
@@ -845,14 +877,12 @@ def _communication_aware_quotas(
 
     best = None
     rank_cost = None
-    remote_cost = 1
     for _ in range(4):
-        quota = _joint_quotas(
+        quota, routing = _fast_communication_quota(
             source_demand,
             replicas,
             routing,
-            rank_cost=rank_cost,
-            remote_cost=remote_cost,
+            rank_cost,
         )
         summary = _quota_summary(quota)
         violation = max(
@@ -879,7 +909,6 @@ def _communication_aware_quotas(
         traffic = quota.sum(axis=1, dtype=np.int64)
         np.fill_diagonal(traffic, 0)
         rank_cost = traffic.sum(axis=0) + traffic.sum(axis=1)
-        remote_cost *= 2
     assert best is not None
     quota = best[1]
     return quota, _route_quota(arrays, quota, source_demand, replicas)
@@ -1425,7 +1454,9 @@ def balance_replica_compute(
             replica_mask[expert, target] = True
             balance_by_rank[target] += 1
             added += 1
-        quota = _joint_quotas(source_demand, replicas, routing)
+        quota, routing = _fast_communication_quota(
+            source_demand, replicas, routing, None
+        )
         routing = np.where(quota.sum(axis=2) > 0, quota.argmax(axis=2), routing)
         metrics = _route_quota(
             arrays,
