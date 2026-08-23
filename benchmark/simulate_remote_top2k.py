@@ -76,7 +76,7 @@ def main() -> None:
         type=float,
         help=(
             "communication budget relative to the source-top placement; "
-            "defaults to 1.0 when compute replicas are enabled"
+            "disabled by default"
         ),
     )
     parser.add_argument(
@@ -111,11 +111,7 @@ def main() -> None:
         if args.max_extra_experts_per_rank is not None
         else 2 * top_k
     )
-    budget_ratio = (
-        args.communication_budget_ratio
-        if args.communication_budget_ratio is not None
-        else (1.0 if args.max_compute_extra_experts_per_rank else None)
-    )
+    budget_ratio = args.communication_budget_ratio
     rows = [
         [
             "layer",

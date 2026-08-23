@@ -1161,8 +1161,6 @@ def balance_replica_compute(
                 # Prefer the largest remote source for the historical path.
                 for target_value in remote_sources[expert]:
                     target = int(target_value)
-                    if not remote_demand[expert, target]:
-                        break
                     if replica_mask[expert, target] or (
                         balance_by_rank[target] >= max_extra_per_rank
                     ):
@@ -1200,7 +1198,6 @@ def balance_replica_compute(
                         )
                         if best is None or candidate[0] < best[0]:
                             best = candidate
-                    break
             if best is None:
                 break
             _, expert, target = best

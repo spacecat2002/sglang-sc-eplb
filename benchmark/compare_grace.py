@@ -260,11 +260,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             replication,
             num_ranks=args.num_ranks,
             max_extra_per_rank=args.max_comp_expert_per_rank,
-            communication_budget_ratio=(
-                args.communication_budget_ratio
-                if args.communication_budget_ratio is not None
-                else (1.0 if args.max_comp_expert_per_rank else None)
-            ),
+            communication_budget_ratio=args.communication_budget_ratio,
         )
         plus_seconds = time.perf_counter() - started
         total_tokens = (
@@ -398,7 +394,7 @@ def main() -> None:
         type=float,
         help=(
             "maximum communication metrics as a multiple of the placement "
-            "before compute balancing (default: 1.0 when compute replicas are enabled)"
+            "before compute balancing (disabled by default)"
         ),
     )
     parser.add_argument("--save-grace")
