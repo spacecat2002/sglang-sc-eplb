@@ -1,3 +1,4 @@
+#include <c10/cuda/CUDAStream.h>
 #include <torch/extension.h>
 
 #include "launch.cuh"
@@ -36,7 +37,7 @@ torch::Tensor select_topn(torch::Tensor demand, torch::Tensor primary,
   const auto ranks = demand.size(1);
   auto replicas = torch::zeros({experts, ranks},
                                demand.options().dtype(torch::kBool));
-  auto stream = at::cuda::getDefaultCUDAStream();
+  auto stream = c10::cuda::getCurrentCUDAStream(demand.get_device());
   launch(topn_kernel, dim3(ranks), dim3(1), stream.stream(),
          demand.data_ptr<int64_t>(), primary.data_ptr<int64_t>(),
          replicas.data_ptr<bool>(), experts, ranks, max_extra);

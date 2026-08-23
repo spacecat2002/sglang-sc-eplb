@@ -1,3 +1,4 @@
+#include <c10/cuda/CUDAStream.h>
 #include <torch/extension.h>
 #include <tuple>
 
@@ -40,7 +41,7 @@ std::tuple<torch::Tensor, torch::Tensor> traffic(
                                   source.options().dtype(torch::kInt64));
   auto compute = torch::zeros({num_ranks},
                               source.options().dtype(torch::kInt64));
-  auto stream = at::cuda::getDefaultCUDAStream();
+  auto stream = c10::cuda::getCurrentCUDAStream(source.get_device());
   const int64_t tokens = source.size(0);
   launch(traffic_kernel, dim3((tokens + 255) / 256), dim3(256), stream.stream(),
          source.data_ptr<int64_t>(), topk.data_ptr<int64_t>(),
