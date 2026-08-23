@@ -220,6 +220,62 @@ def test_compute_balancing_adds_replica_and_reroutes_static_demand():
     assert balanced.metrics.remote < communication.metrics.remote
 
 
+def test_compute_replica_is_rejected_when_it_breaks_communication_budget():
+    tokens = [
+        RoutedToken(0, (0,), 100),
+        RoutedToken(1, (1,), 10),
+        RoutedToken(0, (2,), 10),
+    ]
+    communication = replicate_hot_experts(
+        tokens,
+        {0: 0, 1: 1, 2: 1},
+        num_ranks=2,
+        max_extra_per_rank=0,
+    )
+
+    balanced = balance_replica_compute(
+        tokens,
+        communication,
+        num_ranks=2,
+        max_extra_per_rank=1,
+        communication_budget_ratio=1.0,
+    )
+
+    assert balanced.balance_copies == 0
+    assert balanced.metrics.remote <= communication.metrics.remote
+    assert balanced.metrics.max_pair_traffic <= communication.metrics.max_pair_traffic
+    assert balanced.metrics.max_ingress <= communication.metrics.max_ingress
+    assert balanced.metrics.max_egress <= communication.metrics.max_egress
+
+
+def test_compute_replica_is_added_when_budget_allows_compute_balance():
+    tokens = [
+        RoutedToken(0, (0,), 100),
+        RoutedToken(1, (1,), 10),
+        RoutedToken(0, (2,), 40),
+    ]
+    communication = replicate_hot_experts(
+        tokens,
+        {0: 0, 1: 1, 2: 1},
+        num_ranks=2,
+        max_extra_per_rank=0,
+    )
+
+    balanced = balance_replica_compute(
+        tokens,
+        communication,
+        num_ranks=2,
+        max_extra_per_rank=1,
+        communication_budget_ratio=3.0,
+    )
+
+    assert balanced.balance_copies == 1
+    assert balanced.replicas_by_expert[0] == (0, 1)
+    assert max(balanced.metrics.compute_load) < max(communication.metrics.compute_load)
+    budget = 3 * communication.metrics.remote
+    assert balanced.metrics.remote <= budget
+
+
 def test_replication_caches_source_demand_without_an_extra_scan():
     communication = replicate_hot_experts(
         [

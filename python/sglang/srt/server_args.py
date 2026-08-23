@@ -3353,6 +3353,11 @@ class ServerArgs:
         "Save draft model weights to CPU memory during release_weights_occupation and resume_weights_occupation",
         NS("exec.features"),
     ] = False
+    enable_moe_cpu_pinned_memory: A[
+        bool,
+        "Keep one node-shared pinned CPU copy of all checkpoint MoE expert weights",
+        NS("exec.features"),
+    ] = False
     enable_custom_logit_processor: A[
         bool,
         "Enable users to pass custom logit processors to the server (disabled by default for security)",

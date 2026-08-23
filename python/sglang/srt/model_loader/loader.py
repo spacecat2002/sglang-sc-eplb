@@ -24,6 +24,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from contextlib import contextmanager, suppress
+from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -54,6 +55,8 @@ from sglang.srt.runtime_context import (
     get_server_args,
 )
 from sglang.srt.utils import get_available_gpu_memory
+from sglang.srt.utils.host_shared_memory import register_host_tensor
+from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 
 # Try to import accelerate (optional dependency)
 try:
@@ -138,6 +141,9 @@ _is_npu = is_npu()
 # which contains the complete mapping of quantization config choices
 
 logger = logging.getLogger(__name__)
+
+_MOE_EXPERT_WEIGHT_RE = re.compile(r"(?:^|\.)experts\.")
+_MOE_EXPERT_ID_RE = re.compile(r"(?:^|\.)experts\.(\d+)\.")
 
 
 @contextmanager
@@ -339,11 +345,202 @@ def _post_load_weights(model: nn.Module) -> None:
         model.post_load_weights()
 
 
+class _MoeCpuWeightStore:
+    """One CUDA-registered checkpoint copy shared by all ranks on a node."""
+
+    def __init__(
+        self, model: nn.Module, model_config: ModelConfig, target_device: torch.device
+    ):
+        if target_device.type != "cuda":
+            raise RuntimeError(
+                "enable_moe_cpu_pinned_memory currently requires a CUDA device"
+            )
+        if not is_pin_memory_available(target_device):
+            raise RuntimeError(
+                "enable_moe_cpu_pinned_memory requires pinned CPU memory support"
+            )
+        if not torch.distributed.is_initialized():
+            raise RuntimeError(
+                "enable_moe_cpu_pinned_memory requires distributed initialization"
+            )
+
+        server_args = get_server_args()
+        world_size = torch.distributed.get_world_size()
+        if server_args is None or world_size % server_args.nnodes != 0:
+            raise RuntimeError("Cannot determine ranks in the current GB200 node")
+
+        self.local_size = world_size // server_args.nnodes
+        rank = torch.distributed.get_rank()
+        node_index = rank // self.local_size
+        if node_index != server_args.node_rank:
+            raise RuntimeError(
+                f"node_rank={server_args.node_rank} does not match global rank {rank}"
+            )
+
+        self.local_rank = rank % self.local_size
+        self.node_root = node_index * self.local_size
+        self.group = None
+        for i in range(server_args.nnodes):
+            ranks = list(range(i * self.local_size, (i + 1) * self.local_size))
+            group = torch.distributed.new_group(ranks, backend="gloo")
+            if i == node_index:
+                self.group = group
+
+        path = [None]
+        if self.local_rank == 0:
+            path[0] = str(Path("/dev/shm") / make_shm_name("moe_weights"))
+            fd = os.open(path[0], os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        torch.distributed.broadcast_object_list(
+            path, src=self.node_root, group=self.group
+        )
+        self.path = path[0]
+        self.fd = fd if self.local_rank == 0 else os.open(self.path, os.O_RDWR)
+
+        # GB200's four GPU ranks are normally local ranks 0/1 on CPU0 and 2/3 on CPU1.
+        self.writer_ranks = (0, self.local_size // 2) if self.local_size >= 4 else (0,)
+        hf_config = model_config.hf_config
+        self.num_experts = next(
+            (
+                value
+                for name in ("n_routed_experts", "num_experts", "num_local_experts")
+                if (value := getattr(hf_config, name, None)) is not None
+            ),
+            None,
+        )
+        self.offset = 0
+        self.signature = hashlib.sha1()
+        self.metadata = {} if self.local_rank == 0 else None
+        self.buffer = None
+        self.weights: Dict[str, torch.Tensor] = {}
+        model.moe_cpu_weight_store = self
+        model.moe_cpu_weights = self.weights
+
+    @staticmethod
+    def _write_all(fd: int, tensor: torch.Tensor, offset: int) -> None:
+        data = (
+            tensor.detach()
+            .contiguous()
+            .reshape(-1)
+            .view(torch.uint8)
+            .cpu()
+            .numpy()
+        )
+        view = memoryview(data)
+        while view:
+            written = os.pwrite(fd, view, offset)
+            if written == 0:
+                raise OSError("pwrite returned zero while storing MoE weights")
+            view = view[written:]
+            offset += written
+
+    def capture(
+        self, weights: Iterable[Tuple[str, torch.Tensor]]
+    ) -> Generator[Tuple[str, torch.Tensor], None, None]:
+        for name, weight in weights:
+            if _MOE_EXPERT_WEIGHT_RE.search(name):
+                nbytes = weight.numel() * weight.element_size()
+                self.signature.update(
+                    repr((name, tuple(weight.shape), str(weight.dtype), nbytes)).encode()
+                )
+                if self.metadata is not None:
+                    self.metadata[name] = (
+                        self.offset,
+                        nbytes,
+                        tuple(weight.shape),
+                        weight.dtype,
+                    )
+
+                match = _MOE_EXPERT_ID_RE.search(name)
+                if match is not None:
+                    expert_id = int(match.group(1))
+                    writer = self.writer_ranks[expert_id % len(self.writer_ranks)]
+                    if self.local_rank == writer:
+                        self._write_all(self.fd, weight, self.offset)
+                elif (
+                    len(self.writer_ranks) > 1
+                    and weight.ndim > 0
+                    and weight.shape[0] == self.num_experts
+                ):
+                    expert_nbytes = nbytes // self.num_experts
+                    if self.local_rank in self.writer_ranks:
+                        writer_index = self.writer_ranks.index(self.local_rank)
+                        for expert_id in range(
+                            writer_index, self.num_experts, len(self.writer_ranks)
+                        ):
+                            self._write_all(
+                                self.fd,
+                                weight[expert_id],
+                                self.offset + expert_id * expert_nbytes,
+                            )
+                elif self.local_rank == self.writer_ranks[0]:
+                    self._write_all(self.fd, weight, self.offset)
+                self.offset += nbytes
+            yield name, weight
+
+    def finalize(self) -> None:
+        torch.distributed.barrier(group=self.group)
+        if self.local_rank == 0:
+            os.ftruncate(self.fd, self.offset)
+        torch.distributed.barrier(group=self.group)
+        os.close(self.fd)
+
+        payload = (
+            [(self.offset, self.signature.hexdigest(), self.metadata)]
+            if self.local_rank == 0
+            else [None]
+        )
+        torch.distributed.broadcast_object_list(
+            payload, src=self.node_root, group=self.group
+        )
+        total_bytes, signature, metadata = payload[0]
+        if total_bytes != self.offset or signature != self.signature.hexdigest():
+            raise RuntimeError("Ranks observed different MoE checkpoint weight streams")
+
+        if total_bytes:
+            self.buffer = torch.from_file(
+                self.path, shared=True, size=total_bytes, dtype=torch.uint8
+            )
+            register_host_tensor(self.buffer)
+            for name, (offset, nbytes, shape, dtype) in metadata.items():
+                self.weights[name] = (
+                    self.buffer.narrow(0, offset, nbytes).view(dtype).view(shape)
+                )
+
+        torch.distributed.barrier(group=self.group)
+        if self.local_rank == 0:
+            os.unlink(self.path)
+        logger.info(
+            "Mapped %d MoE checkpoint tensors (%d bytes) from node-shared "
+            "pinned CPU memory",
+            len(self.weights),
+            total_bytes,
+        )
+
+
+def _finalize_moe_cpu_weight_store(model: nn.Module) -> None:
+    store = getattr(model, "moe_cpu_weight_store", None)
+    if store is not None:
+        store.finalize()
+
+
 class BaseModelLoader(ABC):
     """Base class for model loaders."""
 
     def __init__(self, load_config: LoadConfig):
         self.load_config = load_config
+
+    def _maybe_enable_moe_cpu_pinned_memory(
+        self,
+        model: nn.Module,
+        model_config: ModelConfig,
+        weights: Iterable[Tuple[str, torch.Tensor]],
+        target_device: torch.device,
+    ) -> Iterable[Tuple[str, torch.Tensor]]:
+        if self.load_config.enable_moe_cpu_pinned_memory:
+            return _MoeCpuWeightStore(
+                model, model_config, target_device
+            ).capture(weights)
+        return weights
 
     @abstractmethod
     def download_model(self, model_config: ModelConfig) -> None:
@@ -542,6 +739,8 @@ class DefaultModelLoader(BaseModelLoader):
         # Sort and optionally stagger weight files (see SGLANG_SORT_WEIGHT_FILES).
         # k=-1: no sort; k=0: sort only; k>0: sort + stagger by (tp_rank*k).
         k = envs.SGLANG_SORT_WEIGHT_FILES.get()
+        if self.load_config.enable_moe_cpu_pinned_memory:
+            k = 0
         if k >= 0:
             hf_weights_files.sort()
             if k > 0:
@@ -813,9 +1012,13 @@ class DefaultModelLoader(BaseModelLoader):
                     quant_config,
                 )
 
-            self.load_weights_and_postprocess(
-                model, self._get_all_weights(model_config, model), target_device
+            weights = self._maybe_enable_moe_cpu_pinned_memory(
+                model,
+                model_config,
+                self._get_all_weights(model_config, model),
+                target_device,
             )
+            self.load_weights_and_postprocess(model, weights, target_device)
 
         self.counter_after_loading_weights = time.perf_counter()
         return model.eval()
@@ -868,6 +1071,8 @@ class DefaultModelLoader(BaseModelLoader):
                 with device_loading_context(module, target_device):
                     quant_method.process_weights_after_loading(module)
 
+        _finalize_moe_cpu_weight_store(model)
+
 
 class LayeredModelLoader(DefaultModelLoader):
     """Model loader that loads weights layer by layer so that one can quantize a
@@ -908,7 +1113,12 @@ class LayeredModelLoader(DefaultModelLoader):
                 )
 
             # Get all weights from disk
-            weights = self._get_all_weights(model_config, model)
+            weights = self._maybe_enable_moe_cpu_pinned_memory(
+                model,
+                model_config,
+                self._get_all_weights(model_config, model),
+                target_device,
+            )
 
             # Helper function to recursively fill the weights of a module
             def fill_module(module, fqn: List[str], weights):
@@ -935,6 +1145,8 @@ class LayeredModelLoader(DefaultModelLoader):
 
             # Start calling on root module
             fill_module(model, [], weights)
+
+            _finalize_moe_cpu_weight_store(model)
 
         if torchao_config:
             model.torchao_applied = True
@@ -1702,6 +1914,13 @@ class PreshardedModelLoader(DefaultModelLoader):
         model_config: ModelConfig,
         device_config: DeviceConfig,
     ) -> nn.Module:
+        if self.load_config.enable_moe_cpu_pinned_memory:
+            logger.info(
+                "Bypassing presharded weights to build the complete node-local MoE CPU weight store"
+            )
+            return DefaultModelLoader.load_model(
+                self, model_config=model_config, device_config=device_config
+            )
         shard_config = self._collect_shard_config(model_config)
         presharded_dir = self._presharded_dir(model_config, shard_config)
         if self._presharded_ready(presharded_dir) and self._shard_config_matches(
@@ -2062,11 +2281,13 @@ class PreshardedModelLoader(DefaultModelLoader):
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = _initialize_model(model_config, self.load_config, quant_config)
-            self.load_weights_and_postprocess(
+            weights = self._maybe_enable_moe_cpu_pinned_memory(
                 model,
+                model_config,
                 self._get_all_weights(model_config, model),
                 target_device,
             )
+            self.load_weights_and_postprocess(model, weights, target_device)
 
             state_dict = dict(model.state_dict())
             extras = self._collect_extra_tensors(model)
@@ -3512,9 +3733,13 @@ class IncModelLoader(DefaultModelLoader):
                     quant_config,
                 )
 
-            self.load_weights_and_postprocess(
-                model, iter(quant_model.state_dict().items()), target_device
+            weights = self._maybe_enable_moe_cpu_pinned_memory(
+                model,
+                model_config,
+                iter(quant_model.state_dict().items()),
+                target_device,
             )
+            self.load_weights_and_postprocess(model, weights, target_device)
         return model.eval()
 
     def _parse_quantization(self, quantization: str):
@@ -4074,8 +4299,14 @@ class RunaiModelStreamerLoader(BaseModelLoader):
                     quant_config,
                 )
 
+            weights = self._maybe_enable_moe_cpu_pinned_memory(
+                model,
+                model_config,
+                self._get_all_weights(model_config, model),
+                target_device,
+            )
             DefaultModelLoader.load_weights_and_postprocess(
-                model, self._get_all_weights(model_config, model), target_device
+                model, weights, target_device
             )
 
         return model.eval()

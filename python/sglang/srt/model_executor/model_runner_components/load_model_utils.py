@@ -218,6 +218,7 @@ def build_load_config(
         draft_model_idx=draft_model_idx,
         weight_cache_mode=weight_cache_mode,
         weight_cache_socket=weight_cache_socket,
+        enable_moe_cpu_pinned_memory=server_args.enable_moe_cpu_pinned_memory,
     )
 
 

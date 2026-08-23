@@ -13,6 +13,16 @@ from sglang.srt.utils import check_cuda_result
 logger = logging.getLogger(__name__)
 
 
+def register_host_tensor(tensor: torch.Tensor) -> None:
+    import cuda.bindings.runtime as cuda_rt
+
+    check_cuda_result(
+        cuda_rt.cudaHostRegister(
+            tensor.data_ptr(), tensor.nbytes, cuda_rt.cudaHostRegisterPortable
+        )
+    )
+
+
 class HostSharedMemoryManager:
     def __init__(self, base_name: str):
         self._base_name = Path(base_name)
@@ -25,8 +35,6 @@ class HostSharedMemoryManager:
         return raw.view(dtype).view(*shape)
 
     def _malloc_raw(self, *, num_bytes: int) -> torch.Tensor:
-        import cuda.bindings.runtime as cuda_rt
-
         self._operation_index += 1
         shm_name = f"{self._base_name}_op{self._operation_index}"
 
@@ -42,11 +50,7 @@ class HostSharedMemoryManager:
         np_array = np.ndarray((num_bytes,), dtype=np.uint8, buffer=shm.buf)
         tensor = torch.from_numpy(np_array)
 
-        check_cuda_result(
-            cuda_rt.cudaHostRegister(
-                tensor.data_ptr(), num_bytes, cuda_rt.cudaHostRegisterPortable
-            )
-        )
+        register_host_tensor(tensor)
 
         get_naive_distributed().barrier()
 

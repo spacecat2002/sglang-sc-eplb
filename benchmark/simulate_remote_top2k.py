@@ -12,12 +12,20 @@ from typing import Sequence
 
 from compare_grace import _baseline_placement, _load, _table, _tokens
 from sglang.srt.eplb.grace_plus_replication import (
+    balance_replica_compute,
     evaluate_replicated_placement,
     replicate_source_top_experts,
 )
 
 
-def _rows(layer: int, method: str, metrics, copies: Sequence[int], elapsed: float):
+def _rows(
+    layer: int,
+    method: str,
+    metrics,
+    copies: Sequence[int],
+    elapsed: float,
+    balance_copies: int = 0,
+):
     average = sum(metrics.compute_load) / len(metrics.compute_load)
     return [
         str(layer),
@@ -28,6 +36,7 @@ def _rows(layer: int, method: str, metrics, copies: Sequence[int], elapsed: floa
         str(metrics.max_egress),
         f"{max(metrics.compute_load) / average if average else 0:.2f}x",
         f"{min(copies)}-{max(copies)}",
+        str(balance_copies),
         f"{elapsed * 1000:.1f}",
     ]
 
@@ -57,6 +66,20 @@ def main() -> None:
         help="maximum rank load / average load; omit for original all-local Top-N",
     )
     parser.add_argument(
+        "--max-compute-extra-experts-per-rank",
+        type=int,
+        default=0,
+        help="additional replicas per rank used only to balance compute (default: 0)",
+    )
+    parser.add_argument(
+        "--communication-budget-ratio",
+        type=float,
+        help=(
+            "communication budget relative to the source-top placement; "
+            "defaults to 1.0 when compute replicas are enabled"
+        ),
+    )
+    parser.add_argument(
         "--output-plan",
         help="write replicas/routing/quota JSON for benchmark_a2a_plan.py",
     )
@@ -73,6 +96,13 @@ def main() -> None:
         or args.compute_imbalance_limit < 1
     ):
         parser.error("--compute-imbalance-limit must be at least 1")
+    if args.max_compute_extra_experts_per_rank < 0:
+        parser.error("--max-compute-extra-experts-per-rank must be non-negative")
+    if args.communication_budget_ratio is not None and (
+        not math.isfinite(args.communication_budget_ratio)
+        or args.communication_budget_ratio < 0
+    ):
+        parser.error("--communication-budget-ratio must be non-negative")
     raw, layers = _load(args.input)
     num_ranks = int(raw["num_ranks"])
     top_k = int(raw["top_k"])
@@ -80,6 +110,11 @@ def main() -> None:
         args.max_extra_experts_per_rank
         if args.max_extra_experts_per_rank is not None
         else 2 * top_k
+    )
+    budget_ratio = (
+        args.communication_budget_ratio
+        if args.communication_budget_ratio is not None
+        else (1.0 if args.max_compute_extra_experts_per_rank else None)
     )
     rows = [
         [
@@ -91,6 +126,7 @@ def main() -> None:
             "max-egress",
             "comp",
             "extra/rank",
+            "compute-copies",
             "eval-ms",
         ]
     ]
@@ -120,6 +156,14 @@ def main() -> None:
             max_extra_per_rank=max_extra,
             compute_imbalance_limit=args.compute_imbalance_limit,
         )
+        if args.max_compute_extra_experts_per_rank:
+            optimized = balance_replica_compute(
+                tokens,
+                optimized,
+                num_ranks=num_ranks,
+                max_extra_per_rank=args.max_compute_extra_experts_per_rank,
+                communication_budget_ratio=budget_ratio,
+            )
         if args.output_plan:
             plan[gate] = _plan_entry(optimized)
         copies = [0] * num_ranks
@@ -129,10 +173,15 @@ def main() -> None:
         rows.append(
             _rows(
                 layer,
-                f"remote-top{max_extra}",
+                (
+                    f"remote-top{max_extra}+compute"
+                    if args.max_compute_extra_experts_per_rank
+                    else f"remote-top{max_extra}"
+                ),
                 optimized.metrics,
                 copies,
                 time.perf_counter() - started,
+                optimized.balance_copies,
             )
         )
 
@@ -143,7 +192,9 @@ def main() -> None:
     )
     print(
         f"trace={args.input}  EP={num_ranks}  K={top_k}  "
-        f"remote replica cap/rank={max_extra}  compute limit={compute}"
+        f"remote replica cap/rank={max_extra}  compute limit={compute}  "
+        f"compute replica cap/rank={args.max_compute_extra_experts_per_rank}  "
+        f"communication budget={budget_ratio if budget_ratio is not None else 'none'}"
     )
     print(_table(rows))
     if args.output_plan:

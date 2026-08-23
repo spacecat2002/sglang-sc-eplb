@@ -110,6 +110,7 @@ class LoadConfig:
     weight_cache_mode: str = "off"  # "off", "daemon", "client"
     weight_cache_socket: Optional[str] = None  # Path to daemon socket (for client mode)
     fallback_load_format: Union[str, "LoadFormat"] = LoadFormat.AUTO
+    enable_moe_cpu_pinned_memory: bool = False
 
     def __post_init__(self):
         model_loader_extra_config = self.model_loader_extra_config or {}

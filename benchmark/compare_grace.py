@@ -260,6 +260,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             replication,
             num_ranks=args.num_ranks,
             max_extra_per_rank=args.max_comp_expert_per_rank,
+            communication_budget_ratio=(
+                args.communication_budget_ratio
+                if args.communication_budget_ratio is not None
+                else (1.0 if args.max_comp_expert_per_rank else None)
+            ),
         )
         plus_seconds = time.perf_counter() - started
         total_tokens = (
@@ -310,6 +315,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "input": args.input,
         "method": "baseline+grace+grace+",
         "objective": args.objective,
+        "communication_budget_ratio": args.communication_budget_ratio,
         "source_ep": source_ep,
         "num_ranks": args.num_ranks,
         "optimizer_bundles": args.optimizer_bundles,
@@ -387,6 +393,14 @@ def main() -> None:
     parser.add_argument("--replica-compute-limit", type=float, default=1.25)
     parser.add_argument("--max-comm-expert-per-rank", type=int, default=0)
     parser.add_argument("--max-comp-expert-per-rank", type=int, default=0)
+    parser.add_argument(
+        "--communication-budget-ratio",
+        type=float,
+        help=(
+            "maximum communication metrics as a multiple of the placement "
+            "before compute balancing (default: 1.0 when compute replicas are enabled)"
+        ),
+    )
     parser.add_argument("--save-grace")
     parser.add_argument("--save-grace-plus")
     parser.add_argument("--json", action="store_true")
@@ -405,6 +419,13 @@ def main() -> None:
         or args.replica_candidates < 1
         or args.max_comm_expert_per_rank < 0
         or args.max_comp_expert_per_rank < 0
+        or (
+            args.communication_budget_ratio is not None
+            and (
+                not np.isfinite(args.communication_budget_ratio)
+                or args.communication_budget_ratio < 0
+            )
+        )
         or args.replica_compute_limit < 1
         or (args.swap_compute_limit is not None and args.swap_compute_limit < 1)
     ):
