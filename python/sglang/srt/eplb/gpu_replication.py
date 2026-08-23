@@ -23,10 +23,24 @@ from .grace_plus_replication import (
 )
 
 
-def _record(timing: dict[str, float] | None, key: str, started: float) -> None:
+def _phase_start(timing: dict[str, float] | None):
+    if timing is None:
+        return time.perf_counter()
+    event = torch.cuda.Event(enable_timing=True)
+    event.record()
+    return event
+
+
+def _record(timing: dict[str, float] | None, key: str, started: object) -> None:
     if timing is not None:
-        torch.cuda.synchronize()
-        timing[key] = timing.get(key, 0.0) + (time.perf_counter() - started) * 1000.0
+        if isinstance(started, torch.cuda.Event):
+            finished = torch.cuda.Event(enable_timing=True)
+            finished.record()
+            finished.synchronize()
+            elapsed_ms = started.elapsed_time(finished)
+        else:
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+        timing[key] = timing.get(key, 0.0) + elapsed_ms
 
 
 def _cuda_arrays(
@@ -443,7 +457,7 @@ def evaluate_replicated_placement_cuda(
     _, primary_np, mask_np = _replica_arrays(arrays, placement, num_ranks)
     primary = torch.as_tensor(primary_np, device=device, dtype=torch.int64)
     replica_mask = torch.as_tensor(mask_np, device=device, dtype=torch.bool)
-    started = time.perf_counter()
+    started = _phase_start(timing)
     metrics = _route_cuda(source, topk, count, primary, replica_mask, num_ranks)
     _record(timing, "cuda_route_eval_ms", started)
     return metrics
@@ -493,7 +507,7 @@ def replicate_source_top_experts_cuda(
         raise ValueError("CUDA backend requires a CUDA device")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA backend requested but torch.cuda is unavailable")
-    started = time.perf_counter()
+    started = _phase_start(timing)
     source, topk, count = _cuda_arrays(tokens, device)
     num_experts = runtime.num_experts if runtime is not None else len(primary)
     if runtime is not None and runtime.num_ranks != num_ranks:
@@ -571,12 +585,12 @@ def replicate_source_top_experts_cuda(
     )
     if max_compute_extra_per_rank:
         if communication_budget_ratio is not None:
-            metrics_started = time.perf_counter()
+            metrics_started = _phase_start(timing)
             initial_metrics = _route_cuda(
                 source, topk, count, primary_tensor, replica_mask, num_ranks
             )
             _record(timing, "communication_replication_ms", metrics_started)
-            quota_started = time.perf_counter()
+            quota_started = _phase_start(timing)
             initial_quota, routing_tensor = _communication_quota_cuda(
                 demand,
                 replica_mask,
@@ -592,7 +606,7 @@ def replicate_source_top_experts_cuda(
                 else None,
             )
             _record(timing, "quota_solve_ms", quota_started)
-            allocation_started = time.perf_counter()
+            allocation_started = _phase_start(timing)
             budget_baseline = _quota_route_cuda(
                 source,
                 topk,
@@ -606,7 +620,7 @@ def replicate_source_top_experts_cuda(
             )
             _record(timing, "quota_allocation_ms", allocation_started)
         elif compute_imbalance_limit is not None:
-            quota_started = time.perf_counter()
+            quota_started = _phase_start(timing)
             _, routing_tensor = _quota_cuda(
                 demand,
                 replica_mask,
@@ -622,7 +636,7 @@ def replicate_source_top_experts_cuda(
                 loads_out=loads_out,
             )
             _record(timing, "quota_solve_ms", quota_started)
-        compute_started = time.perf_counter()
+        compute_started = _phase_start(timing)
         if runtime is None:
             replica_mask, balance_copies, addition_order = _C.select_compute_replicas(
                 demand,
@@ -648,7 +662,7 @@ def replicate_source_top_experts_cuda(
             addition_order = runtime.compute_addition_order
         _record(timing, "compute_replication_ms", compute_started)
         if communication_budget_ratio is not None:
-            quota_started = time.perf_counter()
+            quota_started = _phase_start(timing)
             _, routing_tensor = _quota_cuda(
                 demand,
                 replica_mask,
@@ -665,13 +679,13 @@ def replicate_source_top_experts_cuda(
             )
             _record(timing, "quota_solve_ms", quota_started)
     if not needs_quota:
-        metrics_started = time.perf_counter()
+        metrics_started = _phase_start(timing)
         metrics = _route_cuda(
             source, topk, count, primary_tensor, replica_mask, num_ranks
         )
         _record(timing, "quota_allocation_ms", metrics_started)
     elif communication_budget_ratio is None:
-        quota_started = time.perf_counter()
+        quota_started = _phase_start(timing)
         quota, routing_tensor = _quota_cuda(
             demand,
             replica_mask,
@@ -687,7 +701,7 @@ def replicate_source_top_experts_cuda(
             loads_out=loads_out,
         )
         _record(timing, "quota_solve_ms", quota_started)
-        allocation_started = time.perf_counter()
+        allocation_started = _phase_start(timing)
         metrics = _quota_route_cuda(
             source,
             topk,
@@ -702,12 +716,12 @@ def replicate_source_top_experts_cuda(
         _record(timing, "quota_allocation_ms", allocation_started)
     else:
         if budget_baseline is None:
-            metrics_started = time.perf_counter()
+            metrics_started = _phase_start(timing)
             budget_baseline = _route_cuda(
                 source, topk, count, primary_tensor, replica_mask, num_ranks
             )
             _record(timing, "communication_replication_ms", metrics_started)
-        quota_started = time.perf_counter()
+        quota_started = _phase_start(timing)
         quota, routing_tensor = _communication_quota_cuda(
             demand,
             replica_mask,
@@ -721,7 +735,7 @@ def replicate_source_top_experts_cuda(
             workspaces=runtime.candidate_workspaces if runtime is not None else None,
         )
         _record(timing, "quota_solve_ms", quota_started)
-        allocation_started = time.perf_counter()
+        allocation_started = _phase_start(timing)
         metrics = _quota_route_cuda(
             source,
             topk,

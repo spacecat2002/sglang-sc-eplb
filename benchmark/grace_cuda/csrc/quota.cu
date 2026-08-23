@@ -12,21 +12,24 @@ namespace {
 
 constexpr int kMaxRanks = 128;
 
-template <int MaxRanks = kMaxRanks>
+template <int MaxRanks = kMaxRanks, int FixedRanks = 0>
 __device__ void waterfill(const int64_t* loads, const bool* replicas,
                           int64_t expert, int extra_rank, int64_t total,
                           int64_t* allocation, int64_t ranks) {
+  const int count = FixedRanks ? FixedRanks : static_cast<int>(ranks);
   int rank_order[MaxRanks];
   bool selected[MaxRanks];
   int replica_count = 0;
-  for (int rank = 0; rank < ranks; ++rank) {
+#pragma unroll
+  for (int rank = 0; rank < count; ++rank) {
     allocation[rank] = 0;
     selected[rank] = false;
     replica_count += replicas[expert * ranks + rank] || rank == extra_rank;
   }
   for (int position = 0; position < replica_count; ++position) {
     int best = -1;
-    for (int rank = 0; rank < ranks; ++rank) {
+#pragma unroll
+    for (int rank = 0; rank < count; ++rank) {
       if ((!replicas[expert * ranks + rank] && rank != extra_rank) || selected[rank]) {
         continue;
       }
@@ -55,6 +58,21 @@ __device__ void waterfill(const int64_t* loads, const bool* replicas,
     allocation[rank] = level - loads[rank] + quotient +
                        static_cast<int64_t>(position < remainder);
   }
+}
+
+template <int MaxRanks>
+__device__ void waterfill_fast(const int64_t* loads, const bool* replicas,
+                               int64_t expert, int extra_rank, int64_t total,
+                               int64_t* allocation, int64_t ranks) {
+  if constexpr (MaxRanks == 4) {
+    if (ranks == 4) {
+      waterfill<4, 4>(loads, replicas, expert, extra_rank, total, allocation,
+                      ranks);
+      return;
+    }
+  }
+  waterfill<MaxRanks>(loads, replicas, expert, extra_rank, total, allocation,
+                      ranks);
 }
 
 __global__ void instance_quota_kernel(
@@ -157,7 +175,7 @@ __device__ bool better_candidate(const ComputeCandidate& candidate,
 }
 
 template <int MaxRanks>
-__global__ void select_compute_replicas_kernel(
+__global__ __launch_bounds__(128, 1) void select_compute_replicas_kernel(
     const int64_t* demand, const int64_t* expert_demand,
     const int64_t* expert_order, bool* replicas, int64_t* instance_quota,
     int64_t* loads, int64_t* added_by_rank,
@@ -202,8 +220,8 @@ __global__ void select_compute_replicas_kernel(
             replica_count += replicas[expert * ranks + rank];
           }
           if ((replica_count > 1) != flexible) continue;
-          waterfill<MaxRanks>(loads, replicas, expert, -1,
-                              expert_demand[expert], allocation, ranks);
+          waterfill_fast<MaxRanks>(loads, replicas, expert, -1,
+                                   expert_demand[expert], allocation, ranks);
           for (int rank = 0; rank < ranks; ++rank) {
             instance_quota[expert * ranks + rank] = allocation[rank];
             loads[rank] += allocation[rank];
@@ -232,8 +250,8 @@ __global__ void select_compute_replicas_kernel(
       for (int rank = 0; rank < ranks; ++rank) {
         base[rank] = loads[rank] - instance_quota[expert * ranks + rank];
       }
-      waterfill<MaxRanks>(base, replicas, expert, target, total, allocation,
-                          ranks);
+      waterfill_fast<MaxRanks>(base, replicas, expert, target, total, allocation,
+                               ranks);
       ComputeCandidate candidate = {0, 0, 0, demand[expert * ranks + target],
                                     expert, target};
       int64_t local = 0;
@@ -253,16 +271,13 @@ __global__ void select_compute_replicas_kernel(
     }
     candidates[threadIdx.x] = best;
     __syncthreads();
-    for (int stride = blockDim.x / 2; stride; stride /= 2) {
-      if (threadIdx.x < stride &&
-          better_candidate(candidates[threadIdx.x + stride],
-                           candidates[threadIdx.x])) {
-        candidates[threadIdx.x] = candidates[threadIdx.x + stride];
-      }
-      __syncthreads();
-    }
     if (threadIdx.x == 0) {
-      const ComputeCandidate winner = candidates[0];
+      ComputeCandidate winner = candidates[0];
+      for (int index = 1; index < kThreads; ++index) {
+        if (better_candidate(candidates[index], winner)) {
+          winner = candidates[index];
+        }
+      }
       done = winner.expert < 0;
       if (!done) {
         replicas[winner.expert * ranks + winner.target] = true;
