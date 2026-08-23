@@ -306,6 +306,8 @@ def _quota_topk(
     slots: int,
     ordinals=None,
 ):
+    """Apply the same source/expert prefix quota used by ``_route_quota``."""
+
     import torch
 
     result = torch.empty_like(logical_topk)

@@ -422,18 +422,6 @@ def replicate_source_top_experts(
         for source in range(num_ranks)
     )
     return ReplicaPlacement(
-        {
-            int(expert): tuple(int(rank) for rank in ranks)
-            for expert, ranks in replicas.items()
-        },
-        tuple(tuple(int(rank) for rank in row) for row in routing),
-        metrics,
-        extra_copies,
-        balance_copies,
-        serialized_quota,
-        source_demand,
-    )
-    return ReplicaPlacement(
         replicas,
         tuple(tuple(int(rank) for rank in row) for row in routing),
         _route_quota(arrays, quota, demand, replicas),
