@@ -10,6 +10,8 @@ import time
 from pathlib import Path
 from typing import Sequence
 
+import torch
+
 from compare_grace import _baseline_placement, _load, _table, _tokens
 from sglang.srt.eplb.expert_affinity_graph import as_routed_arrays
 from sglang.srt.eplb.grace_plus_replication import (
@@ -143,6 +145,7 @@ def main() -> None:
         ]
     ]
     plan = {}
+    cuda_runtimes = {}
     for layer, (gate, value, compact) in enumerate(layers):
         tokens, _ = _tokens(gate, value, compact, limit=0, seed=0)
         # Materialize the compact arrays once per layer.  Passing the same
@@ -151,6 +154,11 @@ def main() -> None:
         tokens = as_routed_arrays(tokens)
         experts = tuple(range(int(value["topk_experts"].max().item()) + 1))
         primary = _baseline_placement(experts, num_ranks)
+        gpu_tokens = (
+            torch.as_tensor(tokens.source_rank, device="cuda", dtype=torch.int64),
+            torch.as_tensor(tokens.topk_experts, device="cuda", dtype=torch.int64),
+            torch.as_tensor(tokens.count, device="cuda", dtype=torch.int64),
+        ) if args.cuda else None
 
         started = time.perf_counter()
         if args.cuda:
@@ -179,19 +187,23 @@ def main() -> None:
         phase_ms: dict[str, float] = {}
         started = time.perf_counter()
         if args.cuda:
-            from sglang.srt.eplb.gpu_replication import (
-                replicate_source_top_experts_cuda,
-            )
+            from sglang.srt.eplb.gpu_replication import GraceCudaRuntime
 
-            optimized = replicate_source_top_experts_cuda(
-                tokens,
+            runtime = cuda_runtimes.get(len(experts))
+            if runtime is None:
+                runtime = cuda_runtimes.setdefault(
+                    len(experts), GraceCudaRuntime(len(experts), num_ranks)
+                )
+            demand = runtime.build_demand(*gpu_tokens)
+            started = time.perf_counter()
+            optimized = runtime.plan(
+                *gpu_tokens,
                 primary,
-                num_ranks=num_ranks,
+                demand=demand,
                 max_extra_per_rank=max_extra,
                 max_compute_extra_per_rank=args.max_compute_extra_experts_per_rank,
                 compute_imbalance_limit=args.compute_imbalance_limit,
                 communication_budget_ratio=budget_ratio,
-                device="cuda",
                 timing=phase_ms,
                 materialize_quota=bool(args.output_plan),
             )

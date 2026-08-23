@@ -240,20 +240,29 @@ def _communication_quota_cuda(
         candidates.append((quota, quota_routing))
         rank_cost = traffic.sum(dim=0) + traffic.sum(dim=1)
 
-    best = None
-    for index, values in enumerate(torch.stack(summaries).cpu().tolist()):
-        remote, pair, ingress, egress, max_compute, square_compute = values
-        violation = max(
-            remote / budgets[0] if budgets[0] else float(remote),
-            pair / budgets[1] if budgets[1] else float(pair),
-            ingress / budgets[2] if budgets[2] else float(ingress),
-            egress / budgets[3] if budgets[3] else float(egress),
-        )
-        key = (violation, max_compute, square_compute, remote, pair)
-        if best is None or key < best[0]:
-            best = (key, index)
-    assert best is not None
-    return candidates[best[1]]
+    summary = torch.stack(summaries)
+    budget_tensor = torch.as_tensor(
+        budgets, device=demand.device, dtype=torch.float64
+    )
+    values = summary[:, :4].to(torch.float64)
+    violation = torch.where(budget_tensor > 0, values / budget_tensor, values)
+    key = torch.stack(
+        (
+            violation.max(dim=1).values,
+            summary[:, 4].to(torch.float64),
+            summary[:, 5].to(torch.float64),
+            summary[:, 0].to(torch.float64),
+            summary[:, 1].to(torch.float64),
+        ),
+        dim=1,
+    )
+    remaining = torch.arange(4, device=demand.device)
+    for column in range(key.shape[1]):
+        column_values = key[remaining, column]
+        remaining = remaining[column_values == column_values.min()]
+        if remaining.numel() == 1:
+            break
+    return candidates[int(remaining[0].item())]
 
 
 class GraceCudaRuntime:
@@ -308,12 +317,25 @@ class GraceCudaRuntime:
             int(max_extra_per_rank),
         )
 
+    def build_demand(
+        self, source: torch.Tensor, topk: torch.Tensor, count: torch.Tensor
+    ) -> torch.Tensor:
+        source = source.to(
+            device=self.device, dtype=torch.int64, copy=False
+        ).contiguous()
+        topk = topk.to(device=self.device, dtype=torch.int64, copy=False).contiguous()
+        count = count.to(device=self.device, dtype=torch.int64, copy=False).contiguous()
+        return _source_demand_cuda(
+            source, topk, count, self.num_experts, self.num_ranks
+        )
+
     def plan(
         self,
         source: torch.Tensor,
         topk: torch.Tensor,
         count: torch.Tensor,
         primary: Mapping[int, int] | torch.Tensor,
+        demand: torch.Tensor | None = None,
         **kwargs,
     ) -> ReplicaPlacement:
         """Run the full planner from GPU tensors; CPU copies happen only at return."""
@@ -323,6 +345,7 @@ class GraceCudaRuntime:
             num_ranks=self.num_ranks,
             device=self.device,
             runtime=self,
+            demand_tensor=demand,
             **kwargs,
         )
 
@@ -366,6 +389,7 @@ def replicate_source_top_experts_cuda(
     timing: dict[str, float] | None = None,
     materialize_quota: bool = True,
     runtime: GraceCudaRuntime | None = None,
+    demand_tensor: torch.Tensor | None = None,
 ) -> ReplicaPlacement:
     """Run source-aware Top-N replication with CUDA trace processing.
 
@@ -414,7 +438,7 @@ def replicate_source_top_experts_cuda(
             [primary[e] for e in range(num_experts)], dtype=np.int64
         )
         primary_tensor = torch.as_tensor(primary_np, device=device)
-    if runtime is None:
+    if demand_tensor is None:
         demand, replica_mask, routing_tensor = _C.fused_source_topn(
             source,
             topk,
@@ -425,9 +449,13 @@ def replicate_source_top_experts_cuda(
             max_extra_per_rank,
         )
     else:
-        demand, replica_mask, routing_tensor = runtime.source_topn(
-            source, topk, count, primary_tensor, max_extra_per_rank
-        )
+        demand = demand_tensor.to(
+            device=device, dtype=torch.int64, copy=False
+        ).contiguous()
+        if demand.shape != (num_experts, num_ranks):
+            raise ValueError("demand has the wrong shape")
+        replica_mask = _C.select_topn(demand, primary_tensor, max_extra_per_rank)
+        routing_tensor = _C.default_routing(replica_mask, primary_tensor)
     _record(timing, "communication_replication_ms", started)
 
     quota = None

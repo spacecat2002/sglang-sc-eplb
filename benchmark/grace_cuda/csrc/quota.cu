@@ -472,7 +472,28 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> select_compute_replicas(
   auto addition_order = torch::zeros_like(demand);
   auto added = torch::zeros({1}, demand.options());
   auto stream = c10::cuda::getCurrentCUDAStream(demand.get_device());
-  if (ranks <= 32) {
+  if (ranks <= 4) {
+    launch(select_compute_replicas_kernel<4>, dim3(1), dim3(128), stream.stream(),
+           demand.data_ptr<int64_t>(), expert_demand.data_ptr<int64_t>(),
+           expert_order.data_ptr<int64_t>(), next_replicas.data_ptr<bool>(),
+           instance.data_ptr<int64_t>(), loads.data_ptr<int64_t>(),
+           added_by_rank.data_ptr<int64_t>(), addition_order.data_ptr<int64_t>(),
+           added.data_ptr<int64_t>(), experts, ranks, max_extra_per_rank);
+  } else if (ranks <= 8) {
+    launch(select_compute_replicas_kernel<8>, dim3(1), dim3(128), stream.stream(),
+           demand.data_ptr<int64_t>(), expert_demand.data_ptr<int64_t>(),
+           expert_order.data_ptr<int64_t>(), next_replicas.data_ptr<bool>(),
+           instance.data_ptr<int64_t>(), loads.data_ptr<int64_t>(),
+           added_by_rank.data_ptr<int64_t>(), addition_order.data_ptr<int64_t>(),
+           added.data_ptr<int64_t>(), experts, ranks, max_extra_per_rank);
+  } else if (ranks <= 16) {
+    launch(select_compute_replicas_kernel<16>, dim3(1), dim3(128), stream.stream(),
+           demand.data_ptr<int64_t>(), expert_demand.data_ptr<int64_t>(),
+           expert_order.data_ptr<int64_t>(), next_replicas.data_ptr<bool>(),
+           instance.data_ptr<int64_t>(), loads.data_ptr<int64_t>(),
+           added_by_rank.data_ptr<int64_t>(), addition_order.data_ptr<int64_t>(),
+           added.data_ptr<int64_t>(), experts, ranks, max_extra_per_rank);
+  } else if (ranks <= 32) {
     launch(select_compute_replicas_kernel<32>, dim3(1), dim3(128), stream.stream(),
            demand.data_ptr<int64_t>(), expert_demand.data_ptr<int64_t>(),
            expert_order.data_ptr<int64_t>(), next_replicas.data_ptr<bool>(),

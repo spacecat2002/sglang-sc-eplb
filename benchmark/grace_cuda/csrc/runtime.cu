@@ -25,6 +25,22 @@ __global__ void default_routing_kernel(const bool* replicas,
 
 }  // namespace
 
+torch::Tensor default_routing(torch::Tensor replicas, torch::Tensor primary) {
+  TORCH_CHECK(replicas.is_cuda() && primary.is_cuda());
+  TORCH_CHECK(replicas.scalar_type() == torch::kBool &&
+              primary.scalar_type() == torch::kInt64 && replicas.dim() == 2 &&
+              primary.numel() == replicas.size(0));
+  const int64_t experts = replicas.size(0);
+  const int64_t ranks = replicas.size(1);
+  auto routing = torch::empty({ranks, experts}, primary.options());
+  auto stream = c10::cuda::getCurrentCUDAStream(replicas.get_device());
+  launch(default_routing_kernel, dim3((ranks * experts + 255) / 256), dim3(256),
+         stream.stream(), replicas.data_ptr<bool>(), primary.data_ptr<int64_t>(),
+         routing.data_ptr<int64_t>(), experts, ranks);
+  check_cuda(cudaGetLastError());
+  return routing;
+}
+
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> fused_source_topn(
     torch::Tensor source, torch::Tensor topk, torch::Tensor count,
     torch::Tensor primary, int64_t experts, int64_t ranks,
@@ -41,12 +57,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> fused_source_topn(
               max_extra_per_rank >= 0);
   auto demand = source_demand(source, topk, count, experts, ranks);
   auto replicas = select_topn(demand, primary, max_extra_per_rank);
-  auto routing = torch::empty({ranks, experts}, primary.options());
-  auto stream = c10::cuda::getCurrentCUDAStream(source.get_device());
-  launch(default_routing_kernel, dim3((ranks * experts + 255) / 256), dim3(256),
-         stream.stream(), replicas.data_ptr<bool>(), primary.data_ptr<int64_t>(),
-         routing.data_ptr<int64_t>(), experts, ranks);
-  check_cuda(cudaGetLastError());
+  auto routing = default_routing(replicas, primary);
   return {demand, replicas, routing};
 }
 

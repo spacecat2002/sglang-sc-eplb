@@ -9,6 +9,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> fused_source_topn(
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
     int64_t, int64_t);
 torch::Tensor select_topn(torch::Tensor, torch::Tensor, int64_t);
+torch::Tensor default_routing(torch::Tensor, torch::Tensor);
 std::tuple<torch::Tensor, torch::Tensor> traffic(
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
     int64_t);
@@ -26,6 +27,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("source_demand", &grace_cuda::source_demand);
   m.def("fused_source_topn", &grace_cuda::fused_source_topn);
   m.def("select_topn", &grace_cuda::select_topn);
+  m.def("default_routing", &grace_cuda::default_routing);
   m.def("traffic", &grace_cuda::traffic);
   m.def("solve_quota", &grace_cuda::solve_quota);
   m.def("quota_traffic", &grace_cuda::quota_traffic);
