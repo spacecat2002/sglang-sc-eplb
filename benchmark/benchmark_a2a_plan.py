@@ -10,6 +10,11 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 
+# deepep/csrc/kernels/legacy/intranode.cu uses constexpr int kNumThreads = 128
+# and asserts num_experts / num_ranks <= kNumThreads.
+_DEEPEP_MAX_LOCAL_EXPERTS = 128
+
+
 def _config_hidden_size(config: object) -> int:
     hidden_size = getattr(config, "hidden_size", None)
     if not isinstance(hidden_size, int) or hidden_size < 1:
@@ -270,6 +275,14 @@ def _load(args: argparse.Namespace):
         num_ranks,
         routes={"baseline": None, "plan": routing},
     )
+    if slots > _DEEPEP_MAX_LOCAL_EXPERTS:
+        raise ValueError(
+            "plan requires "
+            f"{slots} physical experts per rank, but the current DeepEP "
+            f"intranode kernel supports at most {_DEEPEP_MAX_LOCAL_EXPERTS}; "
+            "reduce replica copies or rebuild DeepEP with a larger kernel "
+            "thread configuration"
+        )
     return (
         layer,
         gate,

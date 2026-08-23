@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Sequence
 
 from compare_grace import _baseline_placement, _load, _table, _tokens
+from sglang.srt.eplb.expert_affinity_graph import as_routed_arrays
 from sglang.srt.eplb.grace_plus_replication import (
     balance_replica_compute,
     evaluate_replicated_placement,
@@ -25,7 +26,9 @@ def _rows(
     copies: Sequence[int],
     elapsed: float,
     balance_copies: int = 0,
+    phase_ms: dict[str, float] | None = None,
 ):
+    phase_ms = phase_ms or {}
     average = sum(metrics.compute_load) / len(metrics.compute_load)
     return [
         str(layer),
@@ -37,6 +40,10 @@ def _rows(
         f"{max(metrics.compute_load) / average if average else 0:.2f}x",
         f"{min(copies)}-{max(copies)}",
         str(balance_copies),
+        f"{phase_ms.get('communication_replication_ms', 0.0):.1f}",
+        f"{phase_ms.get('compute_replication_ms', 0.0):.1f}",
+        f"{phase_ms.get('quota_solve_ms', 0.0):.1f}",
+        f"{phase_ms.get('quota_allocation_ms', 0.0):.1f}",
         f"{elapsed * 1000:.1f}",
     ]
 
@@ -123,27 +130,37 @@ def main() -> None:
             "comp",
             "extra/rank",
             "compute-copies",
+            "comm-repl-ms",
+            "compute-repl-ms",
+            "quota-solve-ms",
+            "quota-alloc/eval-ms",
             "eval-ms",
         ]
     ]
     plan = {}
     for layer, (gate, value, compact) in enumerate(layers):
         tokens, _ = _tokens(gate, value, compact, limit=0, seed=0)
+        # Materialize the compact arrays once per layer.  Passing the same
+        # object through baseline, communication, and quota evaluation avoids
+        # rebuilding three identical NumPy views without changing routing.
+        tokens = as_routed_arrays(tokens)
         experts = tuple(range(int(value["topk_experts"].max().item()) + 1))
         primary = _baseline_placement(experts, num_ranks)
 
         started = time.perf_counter()
         baseline = evaluate_replicated_placement(tokens, primary, num_ranks=num_ranks)
+        baseline_elapsed = time.perf_counter() - started
         rows.append(
             _rows(
                 layer,
                 "baseline",
                 baseline,
                 [0] * num_ranks,
-                time.perf_counter() - started,
+                baseline_elapsed,
             )
         )
 
+        phase_ms: dict[str, float] = {}
         started = time.perf_counter()
         optimized = replicate_source_top_experts(
             tokens,
@@ -151,14 +168,48 @@ def main() -> None:
             num_ranks=num_ranks,
             max_extra_per_rank=max_extra,
             compute_imbalance_limit=args.compute_imbalance_limit,
+            timing=phase_ms,
+        )
+        replication_elapsed = time.perf_counter() - started
+        # The first call contains communication-oriented placement.  When
+        # compute balancing is requested, the remainder is the quota/compute
+        # stage; keep it separate from the communication candidate search.
+        quota_elapsed = sum(
+            phase_ms.get(key, 0.0)
+            for key in ("quota_solve_ms", "quota_allocation_ms")
+        )
+        phase_ms["compute_replication_ms"] = (
+            max(
+                0.0,
+                replication_elapsed * 1000.0
+                - phase_ms.get("communication_replication_ms", 0.0)
+                - quota_elapsed,
+            )
+            if args.compute_imbalance_limit is not None
+            else 0.0
         )
         if args.max_compute_extra_experts_per_rank:
+            compute_started = time.perf_counter()
+            before_quota = {
+                key: value
+                for key, value in phase_ms.items()
+                if key.startswith("quota_")
+            }
             optimized = balance_replica_compute(
                 tokens,
                 optimized,
                 num_ranks=num_ranks,
                 max_extra_per_rank=args.max_compute_extra_experts_per_rank,
                 communication_budget_ratio=budget_ratio,
+                timing=phase_ms,
+            )
+            quota_elapsed = sum(
+                phase_ms.get(key, 0.0) - before_quota.get(key, 0.0)
+                for key in ("quota_solve_ms", "quota_allocation_ms")
+            )
+            phase_ms["compute_replication_ms"] += max(
+                0.0,
+                (time.perf_counter() - compute_started) * 1000.0 - quota_elapsed,
             )
         if args.output_plan:
             plan[gate] = _plan_entry(optimized)
@@ -178,6 +229,7 @@ def main() -> None:
                 copies,
                 time.perf_counter() - started,
                 optimized.balance_copies,
+                phase_ms,
             )
         )
 
