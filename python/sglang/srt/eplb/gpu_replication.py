@@ -261,9 +261,8 @@ def _communication_quota_cuda(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     ranks = demand.shape[1]
     if budget_ratio == 1.0:
-        # The caller validates the exact traffic budget after route evaluation;
-        # one solve is enough because a failing candidate falls back to the
-        # default (baseline) routing instead of paying for four trial solves.
+        # Compute is the primary objective, so the first balanced solve is the
+        # only candidate needed; exact traffic is checked after route eval.
         workspace = workspaces[0] if workspaces is not None else None
         return _quota_cuda(
             demand,
@@ -355,6 +354,8 @@ def _communication_quota_cuda(
     excess = (values - budget_tensor).clamp_min(0)
     key = torch.stack(
         (
+            summary[:, 4].to(torch.float64),
+            summary[:, 5].to(torch.float64),
             (excess > 0).sum(dim=1),
             excess.sum(dim=1),
             excess.max(dim=1).values,
@@ -362,8 +363,6 @@ def _communication_quota_cuda(
             excess[:, 1],
             excess[:, 2],
             excess[:, 3],
-            summary[:, 4].to(torch.float64),
-            summary[:, 5].to(torch.float64),
             summary[:, 0].to(torch.float64),
             summary[:, 1].to(torch.float64),
         ),
@@ -802,8 +801,22 @@ def replicate_source_top_experts_cuda(
             safe_metrics = _route_cuda(
                 source, topk, count, primary_tensor, replica_mask, num_ranks
             )
-            if _within_communication_budget(
-                safe_metrics, budget_baseline, communication_budget_ratio
+            candidate_compute_key = (
+                max(metrics.compute_load, default=0),
+                sum(value * value for value in metrics.compute_load),
+            )
+            safe_compute_key = (
+                max(safe_metrics.compute_load, default=0),
+                sum(value * value for value in safe_metrics.compute_load),
+            )
+            # Communication is a soft tie-break after compute.  Do not undo a
+            # strictly better compute plan merely because its exact bundle
+            # traffic exceeds the budget.
+            if (
+                _within_communication_budget(
+                    safe_metrics, budget_baseline, communication_budget_ratio
+                )
+                and safe_compute_key <= candidate_compute_key
             ):
                 routing_tensor = torch.where(
                     replica_mask.t(),

@@ -961,12 +961,12 @@ def _communication_aware_quotas(
             )
         )
         key = (
+            max(summary.compute_load, default=0),
+            int(np.square(summary.compute_load).sum()),
             sum(value > 0 for value in excess),
             sum(excess),
             max(excess),
             *excess,
-            max(summary.compute_load, default=0),
-            int(np.square(summary.compute_load).sum()),
             summary.remote,
             summary.max_pair_traffic,
         )
@@ -1142,7 +1142,19 @@ def _balance_replica_compute_hybrid(
         fallback_metrics = _route_quota(
             arrays, fallback_quota, source_demand, replicas
         )
-        if _communication_within_budget(fallback_metrics, communication_budgets):
+        before_key = (
+            max(metrics.compute_load, default=0),
+            int(np.square(metrics.compute_load).sum()),
+        )
+        fallback_key = (
+            max(fallback_metrics.compute_load, default=0),
+            int(np.square(fallback_metrics.compute_load).sum()),
+        )
+        # Keep the compute-first candidate when the safe route would worsen it.
+        if (
+            _communication_within_budget(fallback_metrics, communication_budgets)
+            and fallback_key <= before_key
+        ):
             quota, routing, metrics = (
                 fallback_quota,
                 fallback_routing,
