@@ -13,6 +13,65 @@ def test_kernels() -> None:
     _C.source_demand_into(source, topk, count, 4, 2, demand_into)
     assert torch.equal(demand_into, demand)
 
+    affinity = torch.empty((4, 4), device="cuda", dtype=torch.int64)
+    affinity_degree = torch.empty(4, device="cuda", dtype=torch.int64)
+    affinity_score = torch.empty_like(affinity_degree)
+    affinity_groups = torch.empty_like(affinity_degree)
+    group_source = torch.empty((2, 2), device="cuda", dtype=torch.int64)
+    group_to_rank = torch.empty(2, device="cuda", dtype=torch.int64)
+    affinity_primary = torch.empty_like(affinity_degree)
+    affinity_demand = torch.empty((4, 2), device="cuda", dtype=torch.int64)
+    affinity_source = torch.tensor([0, 0, 1, 1], device="cuda", dtype=torch.int64)
+    affinity_topk = torch.tensor(
+        [[0, 2], [0, 2], [1, 3], [1, 3]], device="cuda", dtype=torch.int64
+    )
+    affinity_count = torch.tensor([5, 5, 7, 7], device="cuda", dtype=torch.int64)
+    _C.affinity_primary_into(
+        affinity_source,
+        affinity_topk,
+        affinity_count,
+        affinity_demand,
+        affinity,
+        affinity_degree,
+        affinity_score,
+        affinity_groups,
+        group_source,
+        group_to_rank,
+        affinity_primary,
+    )
+    assert affinity[0, 2].item() == 10
+    assert affinity[1, 3].item() == 14
+    assert affinity_groups[0].item() == affinity_groups[2].item()
+    assert affinity_groups[1].item() == affinity_groups[3].item()
+    assert torch.bincount(affinity_groups, minlength=2).cpu().tolist() == [2, 2]
+    assert sorted(group_to_rank.cpu().tolist()) == [0, 1]
+    assert affinity_primary.cpu().tolist() == [0, 1, 0, 1]
+    affinity_replicas = torch.nn.functional.one_hot(
+        affinity_primary, num_classes=2
+    ).bool()
+    sequential_primary = torch.tensor([0, 0, 1, 1], device="cuda")
+    sequential_replicas = torch.nn.functional.one_hot(
+        sequential_primary, num_classes=2
+    ).bool()
+    affinity_traffic, _ = _C.traffic(
+        affinity_source,
+        affinity_topk,
+        affinity_count,
+        affinity_primary,
+        affinity_replicas,
+        2,
+    )
+    sequential_traffic, _ = _C.traffic(
+        affinity_source,
+        affinity_topk,
+        affinity_count,
+        sequential_primary,
+        sequential_replicas,
+        2,
+    )
+    assert affinity_traffic.sum().item() == 0
+    assert affinity_traffic.sum().item() < sequential_traffic.sum().item()
+
     primary = torch.tensor([0, 0, 1, 1], device="cuda", dtype=torch.int64)
     replicas = _C.select_topn(demand, primary, 0)
     assert replicas.cpu().tolist() == [

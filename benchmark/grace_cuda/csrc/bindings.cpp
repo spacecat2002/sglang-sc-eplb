@@ -3,6 +3,10 @@
 #include <tuple>
 
 namespace grace_cuda {
+void affinity_primary_into(torch::Tensor, torch::Tensor, torch::Tensor,
+                           torch::Tensor, torch::Tensor, torch::Tensor,
+                           torch::Tensor, torch::Tensor, torch::Tensor,
+                           torch::Tensor, torch::Tensor);
 torch::Tensor source_demand(torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
                             int64_t);
 void source_demand_into(torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
@@ -40,6 +44,7 @@ void select_compute_replicas_into(
 }  // namespace grace_cuda
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("affinity_primary_into", &grace_cuda::affinity_primary_into);
   m.def("source_demand", &grace_cuda::source_demand);
   m.def("source_demand_into", &grace_cuda::source_demand_into);
   m.def("fused_source_topn", &grace_cuda::fused_source_topn);

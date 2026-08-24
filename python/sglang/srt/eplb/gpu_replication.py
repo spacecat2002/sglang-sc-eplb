@@ -390,7 +390,9 @@ class GraceCudaRuntime:
             raise ValueError("CUDA runtime requires a CUDA device")
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA runtime requested but torch.cuda is unavailable")
-        self.primary: torch.Tensor | None = None
+        self.primary = torch.empty(
+            (self.num_experts,), device=self.device, dtype=torch.int64
+        )
         self.demand = torch.empty(
             (self.num_experts, self.num_ranks),
             device=self.device,
@@ -433,6 +435,22 @@ class GraceCudaRuntime:
         self.compute_added_by_rank = torch.empty_like(self.compute_loads)
         self.compute_addition_order = torch.empty_like(self.compute_instance)
         self.compute_added = torch.empty((1,), device=self.device, dtype=torch.int64)
+        self.affinity = torch.empty(
+            (self.num_experts, self.num_experts),
+            device=self.device,
+            dtype=torch.int64,
+        )
+        self.affinity_degree = torch.empty_like(self.primary)
+        self.affinity_score = torch.empty_like(self.primary)
+        self.affinity_groups = torch.empty_like(self.primary)
+        self.affinity_group_source = torch.empty(
+            (self.num_ranks, self.num_ranks),
+            device=self.device,
+            dtype=torch.int64,
+        )
+        self.affinity_group_to_rank = torch.empty(
+            (self.num_ranks,), device=self.device, dtype=torch.int64
+        )
 
     def _primary_tensor(self, primary: Mapping[int, int] | torch.Tensor) -> torch.Tensor:
         if isinstance(primary, torch.Tensor):
@@ -488,6 +506,32 @@ class GraceCudaRuntime:
             source, topk, count, self.num_experts, self.num_ranks, self.demand
         )
         return self.demand
+
+    def affinity_primary(
+        self,
+        source: torch.Tensor,
+        topk: torch.Tensor,
+        count: torch.Tensor,
+        timing: dict[str, float] | None = None,
+    ) -> torch.Tensor:
+        """Build a capacity-strict affinity placement without leaving CUDA."""
+        started = _phase_start(timing)
+        source, topk, count = _cuda_arrays((source, topk, count), self.device)
+        _C.affinity_primary_into(
+            source,
+            topk,
+            count,
+            self.demand,
+            self.affinity,
+            self.affinity_degree,
+            self.affinity_score,
+            self.affinity_groups,
+            self.affinity_group_source,
+            self.affinity_group_to_rank,
+            self.primary,
+        )
+        _record(timing, "communication_replication_ms", started)
+        return self.primary
 
     def plan(
         self,

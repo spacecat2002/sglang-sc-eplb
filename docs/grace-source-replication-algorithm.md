@@ -372,7 +372,176 @@ plan。这个回退只牺牲通信 tie-break，不提高已经找到的计算 th
 
 ### 3.5 一次输出副本、quota 和 routing
 
-最终 export plan 同时确定：
+当前 fast path 不是“先确定全部计算副本，再调用另一个算法分配 quota”。副本和 quota
+由同一份 capacity/export plan 一起产生：只有某次 export 需要一个尚不存在的
+`(expert, target)` 边时，才创建计算副本；这次 export 的 `amount` 同时成为该副本
+承接的 quota。
+
+#### Quota 的含义
+
+定义：
+
+```text
+Q[s,e,r] = source rank s 对 expert e 的 occurrence 中，交给 rank r 执行的数量
+```
+
+它是三维整数张量：
+
+```text
+[source_rank, expert, execution_rank]
+```
+
+quota 的单位是 expert occurrence。一个 token 经过 Top-K router 选择 K 个 expert，就会
+贡献 K 个 occurrence。compact trace 的 `count=c` 表示相同 bundle 重复 `c` 次，所以
+其中每个 expert 都贡献 `c` 个 occurrence。
+
+#### 从最低通信方案初始化
+
+对每个 `(source=s, expert=e)`，初始执行位置是：
+
+```text
+R[s,e] = s           if expert e 已经在 source s 上有副本
+         primary[e]  otherwise
+```
+
+初始 quota 只有一个非零目标：
+
+```text
+Q[s,e,R[s,e]] = demand[e,s]
+```
+
+其他 `Q[s,e,r]` 都为零。这意味着只要 source 本地已有副本，所有该 source 的 demand
+都先留在本地；只有本地没有副本时才发往 primary。它是当前副本集合下按
+`(source, expert)` 观察的最低远程通信起点。
+
+初始执行负载直接由 quota 求和：
+
+```text
+load[r] = sum_s sum_e Q[s,e,r]
+```
+
+#### Quota 不是重新生成，而是通过 export 搬运
+
+若 execution rank `over` 超过候选 threshold `T`，solver 从它当前承接的 quota 中
+选择一个 `(source, expert)`，再选择一个有计算余量且能执行该 expert 的 `target`。
+搬运量为：
+
+```text
+amount = min(
+    load[over] - T,          # over 还需要卸载多少
+    Q[source,expert,over],   # 这份 quota 实际有多少可搬
+    T - load[target],        # target 在 T 下还能接收多少
+)
+```
+
+然后只做四个原地更新：
+
+```text
+Q[source,expert,over]   -= amount
+Q[source,expert,target] += amount
+load[over]              -= amount
+load[target]            += amount
+```
+
+如果 target 尚无 expert 副本，则同时创建该计算副本并占用 target 的一个计算副本
+槽位。因而最终副本集合与最终 quota 天然一致，不存在“复制了 expert 但后续 quota
+solver 完全不用它”的独立决策阶段。多跳增广修复创建的图连接边是例外：它先扩展
+replica graph，随后立即由 residual rebalance 沿增广路径搬运 quota。
+
+#### 为什么这样能维持计算均衡
+
+对于已经确定的 threshold `T`，每次 export 都受 `amount` 的第一项和第三项限制：
+
+```text
+load[over] - amount   >= 0
+load[target] + amount <= T
+```
+
+solver 只有在最终所有 rank 都满足下式时，才把该次构造判为可行：
+
+```text
+max_r load[r] <= T
+```
+
+外层先用 capacity-first pass 找到最低 oracle-feasible `T`，再在同一个 `T` 上重建
+communication-first quota。若通信优先的选择导致后续无路可走，则回退到已经验证可行
+的 capacity-first quota。因此通信优化只能改变“由哪些 target 承接负载”，不能把
+计算上限从 `T` 放宽到更大的值。
+
+#### Quota 如何减少通信
+
+通信优化不是在 quota 完成后才进行，而是发生在每一次 quota export 的 target 选择
+中。communication-first pass 使用：
+
+```text
+(
+    communication_delta,
+    projected_target_ingress,
+    -amount,
+    is_new_replica,
+)
+```
+
+其中：
+
+```text
+communication_delta
+    = (target != source) - (over != source)
+```
+
+所以 solver 按以下顺序分配 quota：
+
+1. 如果可能，优先把原本在远程 `over` 执行的 quota 搬回 `source`，同时降低计算过载
+   和远程通信；
+2. 如果只能放到远程 target，优先选择搬运后预计 ingress 更低的 rank，避免形成新的
+   入站热点；
+3. 通信代价相同时，一次搬运更多 quota，减少操作次数；
+4. 前面都相同时复用已有副本，节省有限的计算副本槽位。
+
+例如：
+
+```text
+source = 2
+Q[2,e,0] = 10
+load[0] - T = 6
+T - load[2] = 4
+```
+
+如果 rank 2 上可以放置 expert `e`，则 `0 -> 2` 的
+`communication_delta=-1`，第一次搬运：
+
+```text
+amount = min(6, 10, 4) = 4
+Q[2,e,0] = 6
+Q[2,e,2] = 4
+```
+
+这 4 个 occurrence 从远程执行变成本地执行，既减少 rank 0 的过载，又减少 4 单位
+source-expert 远程量。剩余 2 单位过载若必须在 rank 1 和 rank 3 中选择，而二者计算
+slack 相同，则选择 `projected_target_ingress` 更低的那个。
+
+#### 始终成立的 quota 不变量
+
+每次 export 和增广搬运都必须保持：
+
+```text
+1. demand conservation:
+   sum_r Q[s,e,r] = demand[e,s]
+
+2. replica legality:
+   Q[s,e,r] > 0 => rank r 上存在 expert e 的副本
+
+3. load definition:
+   load[r] = sum_s sum_e Q[s,e,r]
+
+4. capacity after a feasible plan:
+   load[r] <= T
+```
+
+前两项保证没有 occurrence 丢失、重复或被发往不存在的 expert；后两项保证 quota
+张量与计算均衡判定使用的是同一份负载，而不是两套近似统计。
+
+最终 export plan 同时输出：
 
 ```text
 replicas          哪些新计算副本被创建
@@ -392,24 +561,76 @@ Python 的 `_capacity_export_plan()` 实现相同的 source-specific oracle，�
 然后在整个 replica graph 上寻找多跳增广路径。这样可以处理“先从 rank B 搬到 C，
 才能从 A 搬到 B”的计算均衡，而不重新运行逐 expert waterfill。
 
-## 4. 步骤三：Quota 路由与精确评估
+## 4. 步骤三：把 Quota 映射到 Trace 并精确评估
 
-quota 通过 occurrence ordinal 转换为实际目标。对每个 `(source, expert)`，副本顺序
-是：
+步骤二只确定数量，例如：
 
 ```text
-source 本地副本
-primary
-其他通信副本
-按 addition_order 排列的计算副本
+Q[2,e,2] = 4
+Q[2,e,0] = 6
 ```
 
-沿这个顺序对 quota 做 prefix sum。一个 occurrence 的 ordinal 落在哪个 prefix 区间，
-它就路由到哪个副本。
+步骤三还需要确定 source 2 的哪些具体 occurrence 去 rank 2，哪些去 rank 0。实现不
+展开 compact trace，而是为每个 `(source, expert)` 建立稳定的 occurrence ordinal。
+
+#### 固定副本顺序与 quota prefix
+
+CUDA fast path 对每个 `(source, expert)` 使用固定副本顺序：
+
+```text
+1. source 本地副本，如果存在
+2. primary，如果它不是 source
+3. 其他已有通信副本，按 rank id
+4. 本轮计算副本，按 addition_order
+```
+
+沿该顺序对 `Q[source,expert,:]` 做 prefix sum。例如顺序为 `(2,0,3)`，quota 为
+`(4,6,2)`，则边界为：
+
+```text
+[0,4)   -> rank 2
+[4,10)  -> rank 0
+[10,12) -> rank 3
+```
+
+同一 `(source, expert)` 的 occurrence 按 trace 中的稳定顺序编号。ordinal 落在哪个
+prefix 区间，就交给对应副本。这样实际执行数量严格等于 quota，不会因为简单使用
+`argmax(Q)` 而把全部 demand 都发往 quota 最大的一个 rank。
+
+`routing[source,expert] = argmax_r Q[source,expert,r]` 只是计划摘要和无 demand 情况的
+默认目标；真正的 quota route 使用的是上述 prefix，而不是这个单一 routing 值。
+
+#### Compact bundle 跨边界时如何处理
 
 compact bundle 的 `count` 可能跨越 quota 边界，所以不能只看 quota 最大的 rank。
 评估器会计算每个 `(source, expert)` 的稳定 ordinal；若一个 bundle 跨越多个 prefix
-区间，则按边界拆成 segments，再对每个 segment 的 Top-K 目标去重。
+区间，则按所有 Top-K expert 的最近边界拆成 segments。
+
+例如某 bundle 的 `count=8`，其中一个 expert 在 bundle 内第 3 个 occurrence 处跨 quota
+边界，另一个 expert 在第 5 个处跨边界，则拆成：
+
+```text
+[0,3), [3,5), [5,8)
+```
+
+每个 segment 内各 expert 的目标保持不变。计算负载对每个 Top-K occurrence 分别
+累计；通信量则对该 segment 的 Top-K 目标 rank 去重：同一 token 的多个 expert 若发
+往同一个远程 rank，只计算一次 token 传输。
+
+#### 近似通信优化与精确通信评估的区别
+
+步骤二使用 source-expert quota 维护 `communication_delta` 和近似 ingress，原因是它们
+可以在一次 export 后常数时间更新。步骤三才根据原始 Top-K bundle 去重规则计算精确
+traffic。因此：
+
+```text
+步骤二：在固定计算 threshold 下，尽量减少预计远程量和 ingress
+步骤三：不再改变 quota，只测量最终 plan 的精确通信结果
+```
+
+局部通信代理不能保证精确 `remote/max-pair/max-ingress/max-egress` 的数学全局最优，
+但它不会破坏 quota 的计算 capacity，并避免在每枚举一个 target 时重新扫描完整
+trace。
 
 最终指标为：
 

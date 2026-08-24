@@ -66,7 +66,7 @@ def main() -> None:
     parser.add_argument(
         "--max-extra-experts-per-rank",
         type=int,
-        help="remote expert replica limit per rank (default: 2 * trace Top-K)",
+        help="remote replica limit/rank (default: K with affinity, otherwise 2K)",
     )
     parser.add_argument(
         "--compute-imbalance-limit",
@@ -96,9 +96,16 @@ def main() -> None:
         action="store_true",
         help="run the source-demand, Top-N replication and traffic evaluation on CUDA",
     )
+    parser.add_argument(
+        "--affinity-placement",
+        action="store_true",
+        help="cluster co-routed experts and map groups to ranks on CUDA",
+    )
     args = parser.parse_args()
     if Path(args.input).suffix != ".pt":
         parser.error("--input must be a compact .pt routing trace")
+    if args.affinity_placement and not args.cuda:
+        parser.error("--affinity-placement requires --cuda")
     if (
         args.max_extra_experts_per_rank is not None
         and args.max_extra_experts_per_rank < 0
@@ -122,7 +129,7 @@ def main() -> None:
     max_extra = (
         args.max_extra_experts_per_rank
         if args.max_extra_experts_per_rank is not None
-        else 2 * top_k
+        else top_k if args.affinity_placement else 2 * top_k
     )
     budget_ratio = args.communication_budget_ratio
     rows = [
@@ -196,8 +203,14 @@ def main() -> None:
                 )
             # UltraEP's solver consumes an already aggregated expert-load view.
             # Build the equivalent source/expert histogram outside planner timing.
-            demand_tensor = runtime.build_demand(*gpu_tokens)
-        started = time.perf_counter()
+            if args.affinity_placement:
+                started = time.perf_counter()
+                primary = runtime.affinity_primary(*gpu_tokens, timing=phase_ms)
+                demand_tensor = runtime.demand
+            else:
+                demand_tensor = runtime.build_demand(*gpu_tokens)
+        if not args.affinity_placement:
+            started = time.perf_counter()
         if args.cuda:
             optimized = runtime.plan(
                 *gpu_tokens,
@@ -250,9 +263,9 @@ def main() -> None:
             _rows(
                 layer,
                 (
-                    f"remote-top{max_extra}+compute"
+                    f"{'affinity+' if args.affinity_placement else ''}remote-top{max_extra}+compute"
                     if args.max_compute_extra_experts_per_rank
-                    else f"remote-top{max_extra}"
+                    else f"{'affinity+' if args.affinity_placement else ''}remote-top{max_extra}"
                 ),
                 optimized.metrics,
                 copies,
