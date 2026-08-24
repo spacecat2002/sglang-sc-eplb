@@ -214,6 +214,26 @@ def main() -> None:
                 started = time.perf_counter()
                 primary = runtime.affinity_primary(*gpu_tokens, timing=phase_ms)
                 demand_tensor = runtime.demand
+                from sglang.srt.eplb.gpu_replication import _route_cuda
+
+                primary_metrics = _route_cuda(
+                    *gpu_tokens,
+                    primary,
+                    torch.nn.functional.one_hot(
+                        primary, num_classes=num_ranks
+                    ).bool(),
+                    num_ranks,
+                )
+                rows.append(
+                    _rows(
+                        layer,
+                        "affinity-primary",
+                        primary_metrics,
+                        [0] * num_ranks,
+                        time.perf_counter() - started,
+                        phase_ms=phase_ms,
+                    )
+                )
             else:
                 demand_tensor = runtime.build_demand(*gpu_tokens)
         if not args.affinity_placement:
