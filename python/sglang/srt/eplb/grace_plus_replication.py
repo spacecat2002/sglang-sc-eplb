@@ -425,6 +425,7 @@ def replicate_source_top_experts(
     _record_timing(timing, "quota_allocation_ms", allocation_started)
     average = demand.sum() / num_ranks
     capacity = int(np.ceil(average * compute_imbalance_limit))
+    _rebalance_quota_compute(quota, replicas, compute, capacity)
     changed = True
     while changed:
         changed = False
@@ -636,6 +637,69 @@ def _source_quotas(
                 capacity[target] -= moved
                 amount -= moved
     return quota
+
+
+def _rebalance_quota_compute(
+    quota: np.ndarray,
+    replicas: Mapping[int, Sequence[int]],
+    loads: np.ndarray,
+    capacity: int,
+) -> None:
+    """Augment quota from overloaded ranks to feasible underloaded ranks."""
+
+    num_sources, num_experts, num_ranks = quota.shape
+    while True:
+        path = None
+        for over in np.flatnonzero(loads > capacity):
+            previous = np.full(num_ranks, -2, dtype=np.intp)
+            edge_source = np.full(num_ranks, -1, dtype=np.intp)
+            edge_expert = np.full(num_ranks, -1, dtype=np.intp)
+            previous[over] = -1
+            queue = deque([int(over)])
+            under = -1
+            while queue and under < 0:
+                source_rank = queue.popleft()
+                for source in range(num_sources):
+                    for expert in range(num_experts):
+                        if not quota[source, expert, source_rank]:
+                            continue
+                        for target in replicas[expert]:
+                            if previous[target] != -2:
+                                continue
+                            previous[target] = source_rank
+                            edge_source[target] = source
+                            edge_expert[target] = expert
+                            if loads[target] < capacity:
+                                under = target
+                                break
+                            queue.append(target)
+                        if under >= 0:
+                            break
+                    if under >= 0:
+                        break
+            if under >= 0:
+                path = (int(over), int(under), previous, edge_source, edge_expert)
+                break
+        if path is None:
+            return
+        over, under, previous, edge_source, edge_expert = path
+        moved = min(int(loads[over] - capacity), int(capacity - loads[under]))
+        rank = under
+        while previous[rank] >= 0:
+            source = int(edge_source[rank])
+            expert = int(edge_expert[rank])
+            moved = min(moved, int(quota[source, expert, previous[rank]]))
+            rank = int(previous[rank])
+        rank = under
+        while previous[rank] >= 0:
+            source = int(edge_source[rank])
+            expert = int(edge_expert[rank])
+            parent = int(previous[rank])
+            quota[source, expert, parent] -= moved
+            quota[source, expert, rank] += moved
+            rank = parent
+        loads[over] -= moved
+        loads[under] += moved
 
 
 def _joint_quotas(
@@ -914,8 +978,12 @@ def _fast_communication_quota(
     instance_quota, _ = _greedy_instance_quotas(
         source_demand.sum(axis=1), replicas, num_ranks
     )
+    capacity = (int(source_demand.sum()) + num_ranks - 1) // num_ranks
     if rank_cost is None:
-        return _source_quotas(source_demand, instance_quota, routing), routing
+        quota = _source_quotas(source_demand, instance_quota, routing)
+        loads = quota.sum(axis=(0, 1), dtype=np.int64)
+        _rebalance_quota_compute(quota, replicas, loads, capacity)
+        return quota, routing
     preferred = np.empty_like(routing)
     for source in range(num_ranks):
         for expert in range(num_experts):
@@ -928,10 +996,10 @@ def _fast_communication_quota(
                     rank,
                 ),
             )
-    return (
-        _source_quotas(source_demand, instance_quota, preferred),
-        preferred,
-    )
+    quota = _source_quotas(source_demand, instance_quota, preferred)
+    loads = quota.sum(axis=(0, 1), dtype=np.int64)
+    _rebalance_quota_compute(quota, replicas, loads, capacity)
+    return quota, preferred
 
 
 def _communication_aware_quotas(

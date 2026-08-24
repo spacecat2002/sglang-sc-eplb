@@ -235,6 +235,40 @@ def test_kernels() -> None:
     limit_compute = limit_quota.sum(dim=(0, 1))
     assert limit_compute.cpu().tolist() == [48, 47, 48]
 
+    # Greedy per-expert waterfill yields [11, 9, 10], but the replica graph
+    # admits the exact [10, 10, 10] capacity through cross-expert rebalance.
+    augment_demand = torch.tensor(
+        [[4, 0, 0], [12, 0, 0], [14, 0, 0]],
+        device="cuda",
+        dtype=torch.int64,
+    )
+    augment_replicas = torch.tensor(
+        [[False, False, True], [True, False, True], [False, True, True]],
+        device="cuda",
+    )
+    augment_primary = torch.tensor([2, 0, 1], device="cuda", dtype=torch.int64)
+    augment_routing = torch.tensor(
+        [[2, 0, 1], [2, 0, 1], [2, 2, 2]],
+        device="cuda",
+        dtype=torch.int64,
+    )
+    augment_order = torch.tensor([0, 2, 1], device="cuda", dtype=torch.int64)
+    augment_source_order = torch.tensor(
+        [[2, 1, 0], [0, 1, 2], [0, 1, 2]],
+        device="cuda",
+        dtype=torch.int64,
+    )
+    augment_quota, _ = _C.solve_quota(
+        augment_demand,
+        augment_replicas,
+        augment_primary,
+        augment_routing,
+        augment_order,
+        augment_source_order,
+        1.0,
+    )
+    assert augment_quota.sum(dim=(0, 1)).cpu().tolist() == [10, 10, 10]
+
 
 if __name__ == "__main__":
     test_kernels()

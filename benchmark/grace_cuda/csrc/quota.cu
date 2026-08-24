@@ -448,6 +448,79 @@ __global__ void fused_quota_kernel(
   }
   __syncthreads();
 
+  // Rebalance the global compute load before source-local localization.  The
+  // initial per-expert waterfill is greedy and can miss a feasible global
+  // capacity (for example, [11, 9, 10] when [10, 10, 10] is possible).
+  if (tid == 0 && imbalance_limit >= 1.0) {
+    int64_t total = 0;
+    for (int64_t index = 0; index < experts * ranks; ++index) {
+      total += demand[index];
+    }
+    const int64_t capacity = static_cast<int64_t>(ceil(
+        static_cast<double>(total) / ranks * imbalance_limit));
+    while (true) {
+      int over = -1;
+      for (int rank = 0; rank < ranks; ++rank) {
+        if (loads[rank] > capacity) {
+          over = rank;
+          break;
+        }
+      }
+      if (over < 0) break;
+
+      int previous[MaxRanks];
+      int edge_source[MaxRanks];
+      int64_t edge_expert[MaxRanks];
+      int queue[MaxRanks];
+      for (int rank = 0; rank < ranks; ++rank) previous[rank] = -2;
+      previous[over] = -1;
+      int head = 0;
+      int tail = 1;
+      int under = -1;
+      queue[0] = over;
+      while (head < tail && under < 0) {
+        const int from = queue[head++];
+        for (int source = 0; source < ranks && under < 0; ++source) {
+          for (int64_t expert = 0; expert < experts && under < 0; ++expert) {
+            if (!quota[(source * experts + expert) * ranks + from]) continue;
+            for (int target = 0; target < ranks; ++target) {
+              if (previous[target] != -2 ||
+                  !replicas[expert * ranks + target]) {
+                continue;
+              }
+              previous[target] = from;
+              edge_source[target] = source;
+              edge_expert[target] = expert;
+              if (loads[target] < capacity) {
+                under = target;
+                break;
+              }
+              queue[tail++] = target;
+            }
+          }
+        }
+      }
+      if (under < 0) break;
+
+      int64_t moved = min(loads[over] - capacity, capacity - loads[under]);
+      for (int rank = under; previous[rank] >= 0; rank = previous[rank]) {
+        moved = min(
+            moved,
+            quota[(edge_source[rank] * experts + edge_expert[rank]) * ranks +
+                  previous[rank]]);
+      }
+      for (int rank = under; previous[rank] >= 0; rank = previous[rank]) {
+        const int64_t offset =
+            (edge_source[rank] * experts + edge_expert[rank]) * ranks;
+        quota[offset + previous[rank]] -= moved;
+        quota[offset + rank] += moved;
+      }
+      loads[over] -= moved;
+      loads[under] += moved;
+    }
+  }
+  __syncthreads();
+
   if (tid == 0 && imbalance_limit >= 1.0) {
     int64_t total = 0;
     for (int64_t index = 0; index < experts * ranks; ++index) total += demand[index];

@@ -18,6 +18,7 @@ from sglang.srt.eplb.grace_plus_replication import (
     _greedy_instance_quotas,
     _joint_quotas,
     _quota_prefix,
+    _rebalance_quota_compute,
     _route_quota,
     balance_replica_compute,
     evaluate_replicated_placement,
@@ -449,6 +450,40 @@ def test_greedy_quota_places_fixed_load_before_replicated_experts():
     )
 
     assert loads.tolist() == [23, 22]
+
+
+def test_compute_rebalance_moves_quota_between_experts_to_meet_capacity():
+    replicas = {0: (2,), 1: (0, 2), 2: (1, 2)}
+    quota = np.zeros((3, 3, 3), dtype=np.int64)
+    quota[0, 0, 2] = 4
+    quota[0, 1, 0] = 9
+    quota[0, 1, 2] = 3
+    quota[0, 2, 1] = 9
+    quota[0, 2, 2] = 5
+    loads = quota.sum(axis=(0, 1), dtype=np.int64)
+
+    _rebalance_quota_compute(quota, replicas, loads, capacity=10)
+
+    assert loads.tolist() == [10, 10, 10]
+    assert np.array_equal(
+        quota.sum(axis=2),
+        np.array([[4, 12, 14], [0, 0, 0], [0, 0, 0]]),
+    )
+
+
+def test_compute_rebalance_uses_an_augmenting_path():
+    quota = np.zeros((3, 2, 3), dtype=np.int64)
+    quota[0, 0, 0] = 12
+    quota[0, 1, 1] = 10
+    loads = quota.sum(axis=(0, 1), dtype=np.int64)
+
+    _rebalance_quota_compute(quota, {0: (0, 1), 1: (1, 2)}, loads, capacity=8)
+
+    assert loads.tolist() == [8, 8, 6]
+    assert np.array_equal(
+        quota.sum(axis=2),
+        np.array([[12, 10], [0, 0], [0, 0]]),
+    )
 
 
 def test_joint_quota_chooses_local_among_compute_optimal_solutions():
