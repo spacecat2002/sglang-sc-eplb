@@ -92,6 +92,8 @@ def test_kernels() -> None:
         next_groups,
         group_sizes,
         overflow,
+        torch.empty((4, 2), device="cuda", dtype=torch.int64),
+        torch.empty((4, 4), device="cuda", dtype=torch.int64),
     )
     assert torch.bincount(strict_groups, minlength=2).cpu().tolist() == [2, 2]
     strict_group_source = torch.empty((2, 2), device="cuda", dtype=torch.int64)
@@ -125,6 +127,30 @@ def test_kernels() -> None:
         2,
     )
     assert strict_traffic.sum().item() == 0
+
+    swap_embedding = torch.tensor(
+        [[1.0, 0.0], [0.9, 0.1], [0.1, 0.9], [0.0, 1.0]],
+        device="cuda",
+        dtype=torch.float64,
+    )
+    swap_affinity = torch.zeros((4, 4), device="cuda", dtype=torch.int64)
+    swap_affinity[0, 2] = swap_affinity[2, 0] = 10
+    swap_affinity[1, 3] = swap_affinity[3, 1] = 10
+    swap_groups = torch.empty(4, device="cuda", dtype=torch.int64)
+    _C.spectral_groups_into(
+        swap_embedding,
+        swap_affinity,
+        torch.empty((2, 2), device="cuda", dtype=torch.float64),
+        torch.empty(4, device="cuda", dtype=torch.float64),
+        swap_groups,
+        torch.empty(4, device="cuda", dtype=torch.int64),
+        torch.empty(2, device="cuda", dtype=torch.int64),
+        torch.empty(4, device="cuda", dtype=torch.int64),
+        torch.empty((4, 2), device="cuda", dtype=torch.int64),
+        torch.empty((4, 4), device="cuda", dtype=torch.int64),
+    )
+    assert swap_groups[0].item() == swap_groups[2].item()
+    assert swap_groups[1].item() == swap_groups[3].item()
 
     move_primary = torch.tensor([0, 0, 1, 1], device="cuda", dtype=torch.int64)
     move_source = torch.tensor([1, 0, 0, 0], device="cuda", dtype=torch.int64)

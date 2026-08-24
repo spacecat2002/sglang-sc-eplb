@@ -418,6 +418,67 @@ __global__ void spectral_exact_groups_kernel(
   }
 }
 
+__global__ void group_affinity_kernel(const int64_t* affinity,
+                                      const int64_t* labels,
+                                      int64_t* group_affinity,
+                                      int64_t experts, int ranks) {
+  const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= experts * ranks) return;
+  const int64_t expert = index / ranks;
+  const int group = index % ranks;
+  int64_t total = 0;
+  for (int64_t other = 0; other < experts; ++other)
+    if (labels[other] == group)
+      total += affinity[expert * experts + other];
+  group_affinity[index] = total;
+}
+
+__global__ void affinity_swap_candidates_kernel(
+    const int64_t* affinity, const int64_t* labels,
+    const int64_t* group_affinity, int64_t* gains, int64_t experts,
+    int ranks) {
+  const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= experts * experts) return;
+  const int64_t left_expert = index / experts;
+  const int64_t right_expert = index % experts;
+  const int left = labels[left_expert];
+  const int right = labels[right_expert];
+  if (left >= right) {
+    gains[index] = LLONG_MIN;
+    return;
+  }
+  const int64_t pair = affinity[left_expert * experts + right_expert];
+  gains[index] = group_affinity[left_expert * ranks + right] - pair +
+                 group_affinity[right_expert * ranks + left] - pair -
+                 group_affinity[left_expert * ranks + left] -
+                 group_affinity[right_expert * ranks + right];
+}
+
+__global__ void apply_best_affinity_swap_kernel(const int64_t* gains,
+                                                int64_t* labels,
+                                                int64_t experts) {
+  if (blockIdx.x || threadIdx.x) return;
+  int64_t best_gain = 0;
+  int64_t best_left = -1;
+  int64_t best_right = -1;
+  for (int64_t left = 0; left < experts; ++left)
+    for (int64_t right = 0; right < experts; ++right) {
+      const int64_t gain = gains[left * experts + right];
+      if (gain > best_gain ||
+          (gain == best_gain && gain > 0 &&
+           (left > best_left || (left == best_left && right > best_right)))) {
+        best_gain = gain;
+        best_left = left;
+        best_right = right;
+      }
+    }
+  if (best_left >= 0) {
+    const int64_t group = labels[best_left];
+    labels[best_left] = labels[best_right];
+    labels[best_right] = group;
+  }
+}
+
 __device__ void hungarian(const int64_t* cost, int64_t* work,
                           int64_t* assignment, int size) {
   int64_t* u = work;
@@ -871,7 +932,8 @@ void spectral_groups_into(torch::Tensor embedding, torch::Tensor affinity,
                           torch::Tensor centers, torch::Tensor distances,
                           torch::Tensor groups,
                           torch::Tensor next_groups, torch::Tensor sizes,
-                          torch::Tensor overflow) {
+                          torch::Tensor overflow, torch::Tensor group_affinity,
+                          torch::Tensor swap_gains) {
   const int64_t experts = embedding.size(0);
   const int64_t ranks = embedding.size(1);
   TORCH_CHECK(embedding.is_cuda() && embedding.scalar_type() == torch::kFloat64 &&
@@ -886,6 +948,12 @@ void spectral_groups_into(torch::Tensor embedding, torch::Tensor affinity,
   TORCH_CHECK(groups.is_cuda() && groups.scalar_type() == torch::kInt64 &&
               groups.numel() == experts && next_groups.numel() == experts &&
               sizes.numel() == ranks && overflow.numel() == experts);
+  TORCH_CHECK(group_affinity.is_cuda() &&
+              group_affinity.scalar_type() == torch::kInt64 &&
+              group_affinity.numel() == experts * ranks &&
+              swap_gains.is_cuda() &&
+              swap_gains.scalar_type() == torch::kInt64 &&
+              swap_gains.numel() == experts * experts);
   auto stream = c10::cuda::getCurrentCUDAStream(embedding.get_device());
   launch(spectral_exact_groups_kernel, dim3(1), dim3(256), stream.stream(),
          embedding.data_ptr<double>(), affinity.data_ptr<int64_t>(),
@@ -893,6 +961,19 @@ void spectral_groups_into(torch::Tensor embedding, torch::Tensor affinity,
          groups.data_ptr<int64_t>(),
          next_groups.data_ptr<int64_t>(), sizes.data_ptr<int64_t>(),
          overflow.data_ptr<int64_t>(), experts, ranks);
+  for (int round = 0; round < 8; ++round) {
+    launch(group_affinity_kernel, dim3((experts * ranks + 255) / 256),
+           dim3(256), stream.stream(), affinity.data_ptr<int64_t>(),
+           groups.data_ptr<int64_t>(), group_affinity.data_ptr<int64_t>(),
+           experts, ranks);
+    launch(affinity_swap_candidates_kernel,
+           dim3((experts * experts + 255) / 256), dim3(256), stream.stream(),
+           affinity.data_ptr<int64_t>(), groups.data_ptr<int64_t>(),
+           group_affinity.data_ptr<int64_t>(), swap_gains.data_ptr<int64_t>(),
+           experts, ranks);
+    launch(apply_best_affinity_swap_kernel, dim3(1), dim3(1), stream.stream(),
+           swap_gains.data_ptr<int64_t>(), groups.data_ptr<int64_t>(), experts);
+  }
   check_cuda(cudaGetLastError());
 }
 

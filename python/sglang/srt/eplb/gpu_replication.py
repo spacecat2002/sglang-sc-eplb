@@ -470,6 +470,12 @@ class GraceCudaRuntime:
         self.affinity_next_groups = torch.empty_like(self.primary)
         self.affinity_group_sizes = torch.empty_like(self.affinity_group_to_rank)
         self.affinity_overflow = torch.empty_like(self.primary)
+        self.affinity_group_affinity = torch.empty(
+            (self.num_experts, self.num_ranks),
+            device=self.device,
+            dtype=torch.int64,
+        )
+        self.affinity_swap_gains = torch.empty_like(self.affinity)
         self.affinity_allowed = torch.empty(
             (self.num_ranks, self.num_ranks), device=self.device, dtype=torch.bool
         )
@@ -477,25 +483,6 @@ class GraceCudaRuntime:
         self.affinity_cost = torch.empty_like(self.affinity_group_source)
         self.affinity_hungarian_work = torch.empty(
             (6 * (self.num_ranks + 1),), device=self.device, dtype=torch.int64
-        )
-        self.affinity_occurrence_counts = torch.empty_like(self.primary)
-        self.affinity_occurrence_offsets = torch.empty(
-            (self.num_experts + 1,), device=self.device, dtype=torch.int64
-        )
-        self.affinity_occurrence_cursors = torch.empty_like(self.primary)
-        self.affinity_occurrence_tokens = torch.empty(
-            (0,), device=self.device, dtype=torch.int64
-        )
-        self.affinity_slots = torch.empty_like(self.affinity_group_to_rank)
-        self.affinity_loads = torch.empty_like(self.affinity_group_to_rank)
-        self.affinity_traffic = torch.empty_like(self.affinity_group_source)
-        self.affinity_move_candidates = torch.empty(
-            (self.num_experts, self.num_ranks, 5),
-            device=self.device,
-            dtype=torch.int64,
-        )
-        self.affinity_selected_move = torch.empty(
-            (2,), device=self.device, dtype=torch.int64
         )
 
     def _primary_tensor(self, primary: Mapping[int, int] | torch.Tensor) -> torch.Tensor:
@@ -558,18 +545,11 @@ class GraceCudaRuntime:
         source: torch.Tensor,
         topk: torch.Tensor,
         count: torch.Tensor,
-        compute_imbalance_limit: float = 1.0,
-        capacity_ratio: float = 0.15,
-        refine_rounds: int = 4,
         timing: dict[str, float] | None = None,
     ) -> torch.Tensor:
         """Build a capacity-strict affinity placement without leaving CUDA."""
         if self.num_experts % self.num_ranks:
             raise ValueError("strict spectral placement requires experts divisible by ranks")
-        if compute_imbalance_limit < 1 or not 0 <= capacity_ratio < 1:
-            raise ValueError("invalid compute or capacity limit")
-        if refine_rounds < 0:
-            raise ValueError("refine_rounds must be non-negative")
         started = _phase_start(timing)
         source, topk, count = _cuda_arrays((source, topk, count), self.device)
         phase_started = _phase_start(timing)
@@ -613,6 +593,8 @@ class GraceCudaRuntime:
             self.affinity_next_groups,
             self.affinity_group_sizes,
             self.affinity_overflow,
+            self.affinity_group_affinity,
+            self.affinity_swap_gains,
         )
         _record(timing, "affinity_grouping_ms", phase_started)
         phase_started = _phase_start(timing)
@@ -632,35 +614,6 @@ class GraceCudaRuntime:
             self.affinity_hungarian_work,
             self.affinity_group_to_rank,
             self.primary,
-        )
-        ideal = self.num_experts / self.num_ranks
-        delta = round(ideal * capacity_ratio)
-        minimum = max(1, math.floor(ideal - delta))
-        maximum = max(minimum, math.ceil(ideal + delta))
-        entries = topk.numel()
-        if self.affinity_occurrence_tokens.numel() != entries:
-            self.affinity_occurrence_tokens = torch.empty(
-                (entries,), device=self.device, dtype=torch.int64
-            )
-        _C.refine_congestion_into(
-            source,
-            topk,
-            count,
-            self.demand,
-            self.primary,
-            minimum,
-            maximum,
-            compute_imbalance_limit,
-            refine_rounds,
-            self.affinity_occurrence_counts,
-            self.affinity_occurrence_offsets,
-            self.affinity_occurrence_cursors,
-            self.affinity_occurrence_tokens,
-            self.affinity_slots,
-            self.affinity_loads,
-            self.affinity_traffic,
-            self.affinity_move_candidates,
-            self.affinity_selected_move,
         )
         _record(timing, "affinity_hungarian_ms", phase_started)
         _record(timing, "communication_replication_ms", started)

@@ -11,7 +11,8 @@ void affinity_histogram_into(torch::Tensor, torch::Tensor, torch::Tensor,
                              torch::Tensor, torch::Tensor, torch::Tensor);
 void spectral_groups_into(torch::Tensor, torch::Tensor, torch::Tensor,
                           torch::Tensor, torch::Tensor, torch::Tensor,
-                          torch::Tensor, torch::Tensor);
+                          torch::Tensor, torch::Tensor, torch::Tensor,
+                          torch::Tensor);
 void group_source_into(torch::Tensor, torch::Tensor, torch::Tensor,
                        torch::Tensor, torch::Tensor);
 void congestion_hungarian_into(torch::Tensor, torch::Tensor, torch::Tensor,

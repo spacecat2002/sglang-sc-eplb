@@ -212,11 +212,7 @@ def main() -> None:
             # Build the equivalent source/expert histogram outside planner timing.
             if args.affinity_placement:
                 started = time.perf_counter()
-                primary = runtime.affinity_primary(
-                    *gpu_tokens,
-                    compute_imbalance_limit=args.compute_imbalance_limit or 1.0,
-                    timing=phase_ms,
-                )
+                primary = runtime.affinity_primary(*gpu_tokens, timing=phase_ms)
                 demand_tensor = runtime.demand
             else:
                 demand_tensor = runtime.build_demand(*gpu_tokens)
