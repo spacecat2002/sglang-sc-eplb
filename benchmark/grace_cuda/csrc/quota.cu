@@ -180,7 +180,7 @@ __device__ bool better_candidate(const ComputeCandidate& candidate,
 template <int MaxRanks>
 __global__ __launch_bounds__(128, 1) void select_compute_replicas_kernel(
     const int64_t* demand, const int64_t* expert_demand,
-    const int64_t* expert_order, bool* replicas, int64_t* instance_quota,
+    const int64_t* demand_order, bool* replicas, int64_t* instance_quota,
     int64_t* loads, int64_t* added_by_rank,
     int64_t* addition_order, int64_t* added_out, int64_t experts, int64_t ranks,
     int64_t max_extra_per_rank) {
@@ -211,16 +211,23 @@ __global__ __launch_bounds__(128, 1) void select_compute_replicas_kernel(
   while (added < ranks * max_extra_per_rank) {
     if (threadIdx.x == 0) {
       for (int rank = 0; rank < ranks; ++rank) loads[rank] = 0;
-      // ``expert_order`` is already stable-partitioned as (fixed, flexible)
-      // by the caller.  Re-scanning it for both partitions doubled this hot
-      // loop without changing the result.
-      for (int64_t position = 0; position < experts; ++position) {
-        const int64_t expert = expert_order[position];
-        waterfill_fast<MaxRanks>(loads, replicas, expert, -1,
-                                 expert_demand[expert], allocation, ranks);
-        for (int rank = 0; rank < ranks; ++rank) {
-          instance_quota[expert * ranks + rank] = allocation[rank];
-          loads[rank] += allocation[rank];
+      // The Python reference rebuilds the stable (fixed, flexible) order
+      // after every added replica.  Keep that contract here; using the order
+      // from the first iteration changes the waterfill result.
+      for (int flexible = 0; flexible < 2; ++flexible) {
+        for (int64_t position = 0; position < experts; ++position) {
+          const int64_t expert = demand_order[position];
+          int replica_count = 0;
+          for (int rank = 0; rank < ranks; ++rank) {
+            replica_count += replicas[expert * ranks + rank];
+          }
+          if ((replica_count > 1) != flexible) continue;
+          waterfill_fast<MaxRanks>(loads, replicas, expert, -1,
+                                   expert_demand[expert], allocation, ranks);
+          for (int rank = 0; rank < ranks; ++rank) {
+            instance_quota[expert * ranks + rank] = allocation[rank];
+            loads[rank] += allocation[rank];
+          }
         }
       }
       current_max = 0;
@@ -766,21 +773,21 @@ std::tuple<torch::Tensor, torch::Tensor> solve_quota(
 
 void select_compute_replicas_into(
     torch::Tensor demand, torch::Tensor replicas, torch::Tensor expert_demand,
-    torch::Tensor expert_order, int64_t max_extra_per_rank,
+    torch::Tensor demand_order, int64_t max_extra_per_rank,
     torch::Tensor instance, torch::Tensor loads, torch::Tensor added_by_rank,
     torch::Tensor addition_order, torch::Tensor added) {
   TORCH_CHECK(demand.is_cuda() && replicas.is_cuda() &&
-              expert_demand.is_cuda() && expert_order.is_cuda());
+              expert_demand.is_cuda() && demand_order.is_cuda());
   TORCH_CHECK(demand.scalar_type() == torch::kInt64 &&
               replicas.scalar_type() == torch::kBool &&
               expert_demand.scalar_type() == torch::kInt64 &&
-              expert_order.scalar_type() == torch::kInt64 &&
+              demand_order.scalar_type() == torch::kInt64 &&
               demand.sizes() == replicas.sizes());
   const int64_t experts = demand.size(0);
   const int64_t ranks = demand.size(1);
   TORCH_CHECK(ranks > 0 && ranks <= kMaxRanks, "compute replicas support 1-128 ranks");
   TORCH_CHECK(expert_demand.numel() == experts &&
-              expert_order.numel() == experts && max_extra_per_rank >= 0);
+              demand_order.numel() == experts && max_extra_per_rank >= 0);
   TORCH_CHECK(instance.is_cuda() && instance.scalar_type() == torch::kInt64 &&
               instance.sizes() == demand.sizes());
   TORCH_CHECK(loads.is_cuda() && loads.scalar_type() == torch::kInt64 &&
@@ -794,42 +801,42 @@ void select_compute_replicas_into(
   if (ranks <= 4) {
     launch(select_compute_replicas_kernel<4>, dim3(1), dim3(128), stream.stream(),
            demand.data_ptr<int64_t>(), expert_demand.data_ptr<int64_t>(),
-           expert_order.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
+           demand_order.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
            instance.data_ptr<int64_t>(), loads.data_ptr<int64_t>(),
            added_by_rank.data_ptr<int64_t>(), addition_order.data_ptr<int64_t>(),
            added.data_ptr<int64_t>(), experts, ranks, max_extra_per_rank);
   } else if (ranks <= 8) {
     launch(select_compute_replicas_kernel<8>, dim3(1), dim3(128), stream.stream(),
            demand.data_ptr<int64_t>(), expert_demand.data_ptr<int64_t>(),
-           expert_order.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
+           demand_order.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
            instance.data_ptr<int64_t>(), loads.data_ptr<int64_t>(),
            added_by_rank.data_ptr<int64_t>(), addition_order.data_ptr<int64_t>(),
            added.data_ptr<int64_t>(), experts, ranks, max_extra_per_rank);
   } else if (ranks <= 16) {
     launch(select_compute_replicas_kernel<16>, dim3(1), dim3(128), stream.stream(),
            demand.data_ptr<int64_t>(), expert_demand.data_ptr<int64_t>(),
-           expert_order.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
+           demand_order.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
            instance.data_ptr<int64_t>(), loads.data_ptr<int64_t>(),
            added_by_rank.data_ptr<int64_t>(), addition_order.data_ptr<int64_t>(),
            added.data_ptr<int64_t>(), experts, ranks, max_extra_per_rank);
   } else if (ranks <= 32) {
     launch(select_compute_replicas_kernel<32>, dim3(1), dim3(128), stream.stream(),
            demand.data_ptr<int64_t>(), expert_demand.data_ptr<int64_t>(),
-           expert_order.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
+           demand_order.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
            instance.data_ptr<int64_t>(), loads.data_ptr<int64_t>(),
            added_by_rank.data_ptr<int64_t>(), addition_order.data_ptr<int64_t>(),
            added.data_ptr<int64_t>(), experts, ranks, max_extra_per_rank);
   } else if (ranks <= 64) {
     launch(select_compute_replicas_kernel<64>, dim3(1), dim3(128), stream.stream(),
            demand.data_ptr<int64_t>(), expert_demand.data_ptr<int64_t>(),
-           expert_order.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
+           demand_order.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
            instance.data_ptr<int64_t>(), loads.data_ptr<int64_t>(),
            added_by_rank.data_ptr<int64_t>(), addition_order.data_ptr<int64_t>(),
            added.data_ptr<int64_t>(), experts, ranks, max_extra_per_rank);
   } else {
     launch(select_compute_replicas_kernel<128>, dim3(1), dim3(128), stream.stream(),
            demand.data_ptr<int64_t>(), expert_demand.data_ptr<int64_t>(),
-           expert_order.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
+           demand_order.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
            instance.data_ptr<int64_t>(), loads.data_ptr<int64_t>(),
            added_by_rank.data_ptr<int64_t>(), addition_order.data_ptr<int64_t>(),
            added.data_ptr<int64_t>(), experts, ranks, max_extra_per_rank);
@@ -839,14 +846,14 @@ void select_compute_replicas_into(
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> select_compute_replicas(
     torch::Tensor demand, torch::Tensor replicas, torch::Tensor expert_demand,
-    torch::Tensor expert_order, int64_t max_extra_per_rank) {
+    torch::Tensor demand_order, int64_t max_extra_per_rank) {
   auto next_replicas = replicas.clone();
   auto instance = torch::zeros_like(demand);
   auto loads = torch::zeros({demand.size(1)}, demand.options());
   auto added_by_rank = torch::zeros_like(loads);
   auto addition_order = torch::zeros_like(demand);
   auto added = torch::zeros({1}, demand.options());
-  select_compute_replicas_into(demand, next_replicas, expert_demand, expert_order,
+  select_compute_replicas_into(demand, next_replicas, expert_demand, demand_order,
                                max_extra_per_rank, instance, loads, added_by_rank,
                                addition_order, added);
   return {next_replicas, added, addition_order};

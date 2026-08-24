@@ -691,7 +691,7 @@ def replicate_source_top_experts_cuda(
                 demand,
                 replica_mask,
                 expert_demand,
-                expert_order,
+                demand_order,
                 max_compute_extra_per_rank,
             )
         else:
@@ -699,7 +699,7 @@ def replicate_source_top_experts_cuda(
                 demand,
                 replica_mask,
                 expert_demand,
-                expert_order,
+                demand_order,
                 max_compute_extra_per_rank,
                 runtime.compute_instance,
                 runtime.compute_loads,
@@ -714,6 +714,12 @@ def replicate_source_top_experts_cuda(
             routing_tensor = _C.default_routing(replica_mask, primary_tensor)
         else:
             _C.default_routing_into(replica_mask, primary_tensor, routing_tensor)
+        # Compute replicas change which experts are flexible.  Quota must use
+        # the post-replication order, not the order used to select copies.
+        flexible = replica_mask.sum(dim=1) > 1
+        expert_order = demand_order[
+            torch.argsort(flexible[demand_order].to(torch.int8), stable=True)
+        ]
     if not needs_quota:
         metrics_started = _phase_start(timing)
         metrics = _route_cuda(

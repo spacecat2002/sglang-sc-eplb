@@ -437,7 +437,12 @@ def replicate_source_top_experts(
             for expert in local_experts:
                 if room <= 0:
                     break
-                for target in replicas[expert]:
+                # Match CUDA localization: primary first, then remaining
+                # replica ranks in ascending rank order.
+                targets = (replicas[expert][0],) + tuple(
+                    sorted(rank for rank in replicas[expert][1:])
+                )
+                for target in targets:
                     if target == source or room <= 0:
                         continue
                     moved = min(room, int(quota[source, expert, target]))

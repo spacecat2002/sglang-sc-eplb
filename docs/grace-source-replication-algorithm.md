@@ -14,13 +14,14 @@ MoE 层中，每个 token 会被送到 Top-K experts。一个 rank 产生的 tok
 1. 热门的远端 expert 可以被复制到产生请求的 rank，减少通信；
 2. expert 的计算负载在 rank 之间尽量均衡；
 3. 一个 expert 的多个副本能够按 source rank 和需求量进行确定性分流；
-4. 在指定通信预算时，不因为计算均衡而产生不可接受的 ingress、egress 或 pair traffic；
+4. 在指定通信预算时，在不损失计算均衡的前提下控制 ingress、egress 或 pair traffic；
 5. 对 compact trace 中的聚合 token 保持精确语义，而不是只用平均概率估计。
 
 这里的核心选择顺序是：先决定副本集合（通信副本和计算副本），再决定每个
 source-expert 需求分给哪些副本，最后根据 quota 模拟真实 token occurrence 的目标
-rank。候选搜索中使用的临时 instance quota 只用于判断计算导出是否改善，不是最终
-quota；最终 quota 只在副本集合固定后求解一次。
+rank。所有候选都使用同一个计算优先目标：先最小化最大 rank load，再最小化 load
+平方和；只有这两个计算指标相同，才比较通信预算超额和通信总量。临时 instance
+quota 只用于比较候选，不是最终 quota；最终 quota 只在副本集合固定后求解一次。
 
 ## 2. 输入表示
 
@@ -341,26 +342,27 @@ moved = min(remaining_source_demand, target_capacity)
 当设置 `compute_imbalance_limit=L` 时，允许的 rank capacity 为：
 
 ```text
-capacity = max(
-    当前最大 compute load,
-    ceil(total_demand / R * L)
-)
+capacity = ceil(total_demand / R * L)
 ```
 
-这意味着算法不会强迫已有 placement 的最大负载下降，但不允许为了重新本地化而超过当前峰值或显式上限。
+该 capacity 是 quota localization 的硬上限。若单副本 expert 的固定负载本身就超过
+capacity，或者副本集合无法提供足够的可行目标，算法只能返回最接近的可行结果，
+并由最终 `compute_imbalance` 指标暴露不可行性；它不会伪造满足约束的结果。
 
 然后重复执行以下过程，直到没有任何移动：
 
 1. 按 source rank 顺序处理；
 2. `room = capacity - compute[source]`；
 3. 找出在 source 有副本的 expert，按 `(-source_demand[e, source], e)` 排序；
-4. 对每个 expert，按 primary 优先、其他 rank 升序检查其余 replicas；
+4. 对每个 expert，按 primary 优先、其他 replica rank 升序检查其余 replicas；
 5. 把 `quota[source, expert, target]` 移到 `quota[source, expert, source]`，最多移动 `room`；
 6. 同步更新 source 和 target 的 compute load。
 
 移动只会把已有 quota 从远端副本拉回 source 本地，不会改变副本集合，也不会创造新的通信目标。
 
-完成后，`routing[source, expert]` 取该 quota 行中 quota 最大的 rank；相同最大值保留较小 rank，和 `argmax` 的确定性语义一致。
+完成后，`routing[source, expert]` 取该 quota 行中 quota 最大的 rank；相同最大值保留较小 rank，和 `argmax` 的确定性语义一致。这个顺序只用于
+localization tie-break；真正的 prefix routing 仍按“primary、静态副本、按 addition
+order 排列的计算副本”执行。
 
 ### 9.1 精确的联合 quota 求解
 
@@ -420,7 +422,8 @@ GRACE 的确定性和较低开销；同时用 source-demand 的远程上界评�
 5. 临时把 expert 加到 target，重新 waterfill 该 expert；
 6. 计算候选的新 load key 和 source-demand 远程上界。
 
-只有候选严格改善 `(max_load, sum(load ** 2))` 才保留。
+只有候选严格改善计算 key 才保留。实现还记录理想整数容量以上的 overload，作为
+候选比较中的中间 tie-break，避免整数容量边界导致后续无法继续下降。
 
 ### 10.3 Tie-break
 
@@ -473,15 +476,15 @@ budget = ceil(baseline_metric * communication_budget_ratio)
 1. 用 `_fast_communication_quota()` 根据 instance quota 生成 source quota；
 2. 计算 quota 的廉价通信摘要；
 3. 计算每项指标相对 budget 的 violation；
-4. 用以下字典序选择当前最佳方案。先减少违反预算的项，再比较计算负载：
+4. 用以下字典序选择当前最佳方案。计算负载是第一目标，通信预算超额是第二目标：
 
 ```text
+max(compute_load)
+sum(compute_load ** 2)
 违反项数量
 违反项总量
 最大单项违反
 remote、pair、ingress、egress 各项违反
-max(compute_load)
-sum(compute_load ** 2)
 remote
 max_pair
 ```
@@ -501,7 +504,10 @@ rank_cost[r] = ingress[r] + egress[r]
 在 `balance_replica_compute(..., communication_budget_ratio=...)` 中，副本搜索和
 quota 搜索使用同一组 lexicographic 目标：计算负载改善优先，通信预算超额作为
 次级代价；随后用精确 `_route_quota()` 重新评估 bundle 边界。如果 quota 估计因
-bundle crossing 超出预算，则回退到 source-local routing（副本集合不变）。
+bundle crossing 超出预算，会计算不带 quota 的 safe routing 作为候选。只有 safe
+routing 的计算 key 不差于当前方案且满足通信预算时才回退；否则保留计算更均衡的
+方案，并让最终指标明确显示通信预算被放宽。这是“计算第一”的明确语义，而不是
+隐式覆盖结果。
 
 ## 12. 精确 quota 路由评估
 
@@ -585,15 +591,20 @@ source_demand
 
 CUDA wrapper 的 Python 侧流程与上述阶段一致：
 
-1. 规范化输入；
-2. 构造 source demand；
-3. 选择 source Top-N replicas；
-4. 生成 quota/routing；
-5. 可选执行 compute replica selection；
-6. 可选执行 communication-budget quota search；
-7. 返回相同 `ReplicaPlacement` 语义。
+1. 规范化输入，并把 source、Top-K、count 保持在 CUDA；
+2. 用 fused source-demand/Top-N kernel 构造 demand、replica mask 和默认 routing；
+3. 若启用计算副本，selector 接收纯 `demand_order`，按当前副本状态动态生成
+   fixed/flexible 顺序；
+4. 副本集合确定后，重建 post-replication `expert_order`，再执行 fused quota solve；
+5. 若启用通信预算，最多进行四轮 preferred-rank 反馈，但候选排序仍以计算为第一目标；
+6. 对最终 quota 计算 bundle ordinals，并用 crossing-aware evaluator 统计 exact traffic
+   和 compute；
+7. 只有在 safe routing 既满足通信预算又不损失计算均衡时才回退；
+8. runtime 模式复用预分配的 demand/quota/routing workspace，返回前才 materialize
+   Python placement 和可选 quota tuple。
 
-本文不依赖其底层 kernel 的线程组织和 buffer 复用方式。
+CUDA 阶段计时使用 CUDA events，单次 plan 结束时统一同步一次，避免每个阶段单独
+`synchronize()` 把测量本身变成额外的 host/device barrier。
 
 ## 14. 正确性不变量
 
