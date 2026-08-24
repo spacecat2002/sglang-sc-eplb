@@ -323,6 +323,7 @@ def replicate_source_top_experts(
     *,
     num_ranks: int,
     max_extra_per_rank: int,
+    max_compute_extra_per_rank: int = 0,
     compute_imbalance_limit: float | None = None,
     communication_budget_ratio: float | None = None,
     timing: dict[str, float] | None = None,
@@ -331,15 +332,20 @@ def replicate_source_top_experts(
 
     if max_extra_per_rank < 0:
         raise ValueError("max_extra_per_rank must be non-negative")
+    if max_compute_extra_per_rank < 0:
+        raise ValueError("max_compute_extra_per_rank must be non-negative")
     if compute_imbalance_limit is not None and (
         compute_imbalance_limit < 1 or not np.isfinite(compute_imbalance_limit)
     ):
         raise ValueError("invalid compute imbalance limit")
     if communication_budget_ratio is not None and (
-        communication_budget_ratio < 0
+        compute_imbalance_limit is None
+        or communication_budget_ratio < 0
         or not np.isfinite(communication_budget_ratio)
     ):
-        raise ValueError("invalid communication budget ratio")
+        raise ValueError(
+            "communication budget requires a compute imbalance limit and a finite ratio"
+        )
     replication_started = time.perf_counter()
     arrays = as_routed_arrays(tokens)
     demand = _source_demand(arrays, len(primary), num_ranks)
@@ -357,7 +363,7 @@ def replicate_source_top_experts(
 
     replicas, primary_rank, replica_mask = _replica_arrays(arrays, replicas, num_ranks)
     routing = _default_routing(primary_rank, replica_mask, num_ranks)
-    if compute_imbalance_limit is None:
+    if compute_imbalance_limit is None and not max_compute_extra_per_rank:
         _record_timing(timing, "communication_replication_ms", replication_started)
         evaluation_started = time.perf_counter()
         metrics = _route(arrays, primary_rank, replica_mask, num_ranks=num_ranks)
@@ -370,6 +376,30 @@ def replicate_source_top_experts(
             source_demand=demand,
         )
     _record_timing(timing, "communication_replication_ms", replication_started)
+    if max_compute_extra_per_rank:
+        baseline_metrics = _route(
+            arrays, primary_rank, replica_mask, num_ranks=num_ranks
+        )
+        placement = ReplicaPlacement(
+            replicas,
+            tuple(tuple(int(rank) for rank in row) for row in routing),
+            baseline_metrics,
+            extra_copies,
+            source_demand=demand,
+        )
+        communication_budgets = (
+            _communication_budget(baseline_metrics, communication_budget_ratio)
+            if communication_budget_ratio is not None
+            else None
+        )
+        return _balance_replica_compute_hybrid(
+            arrays,
+            placement,
+            num_ranks=num_ranks,
+            max_extra_per_rank=max_compute_extra_per_rank,
+            communication_budgets=communication_budgets,
+            timing=timing,
+        )
     quota_started = time.perf_counter()
     instance_quota, compute = _greedy_instance_quotas(
         demand.sum(axis=1), replicas, num_ranks
@@ -1164,9 +1194,11 @@ def _balance_replica_compute_hybrid(
     replicas, primary, replica_mask = _replica_arrays(
         arrays, placement.replicas_by_expert, num_ranks
     )
+    initial_replicas = replicas.copy()
     source_demand = placement.source_demand
     if source_demand is None:
         source_demand = _source_demand(arrays, len(primary), num_ranks)
+    compute_started = time.perf_counter()
     replicas, balance_copies, quota = _capacity_export_plan(
         source_demand,
         replicas,
@@ -1174,14 +1206,55 @@ def _balance_replica_compute_hybrid(
         max_extra_per_rank=max_extra_per_rank,
         communication_budgets=communication_budgets,
     )
+    capacity = (int(quota.sum()) + num_ranks - 1) // num_ranks
+    loads = quota.sum(axis=(0, 1), dtype=np.int64)
+    slots = np.zeros(num_ranks, dtype=np.int64)
+    for expert, ranks in replicas.items():
+        for rank in ranks:
+            slots[rank] += rank not in initial_replicas[expert]
+    while np.any(loads > capacity):
+        _rebalance_quota_compute(quota, replicas, loads, capacity)
+        if not np.any(loads > capacity):
+            break
+        best = None
+        for over in np.flatnonzero(loads > capacity):
+            for source in range(num_ranks):
+                for expert in range(quota.shape[1]):
+                    available = int(quota[source, expert, over])
+                    if not available:
+                        continue
+                    for target in range(num_ranks):
+                        if (
+                            target == over
+                            or target in replicas[expert]
+                            or slots[target] >= max_extra_per_rank
+                        ):
+                            continue
+                        delta = int(target != source) - int(over != source)
+                        key = (
+                            int(loads[target]),
+                            -available,
+                            delta,
+                            expert,
+                            source,
+                            target,
+                        )
+                        if best is None or key < best[0]:
+                            best = (key, expert, target)
+            if best is not None:
+                break
+        if best is None:
+            break
+        _, expert, target = best
+        replicas[expert] += (target,)
+        slots[target] += 1
+        balance_copies += 1
+    _record_timing(timing, "compute_replication_ms", compute_started)
     replicas, primary, replica_mask = _replica_arrays(arrays, replicas, num_ranks)
     routing = _default_routing(primary, replica_mask, num_ranks)
     quota_started = time.perf_counter()
-    capacity = int(quota.sum() + num_ranks - 1) // num_ranks
-    loads = quota.sum(axis=(0, 1), dtype=np.int64)
-    _rebalance_quota_compute(quota, replicas, loads, capacity)
-    _record_timing(timing, "quota_solve_ms", quota_started)
     routing = np.where(quota.sum(axis=2) > 0, quota.argmax(axis=2), routing)
+    _record_timing(timing, "quota_solve_ms", quota_started)
     allocation_started = time.perf_counter()
     metrics = _route_quota(arrays, quota, source_demand, replicas)
     _record_timing(timing, "quota_allocation_ms", allocation_started)

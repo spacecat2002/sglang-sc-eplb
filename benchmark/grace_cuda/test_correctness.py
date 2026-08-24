@@ -312,6 +312,36 @@ def test_kernels() -> None:
     assert local_selected[0].cpu().tolist() == [True, True, False, True]
     assert local_added.item() == 1
 
+    # Direct exports get stuck at [8, 8, 4]. Graph augmentation adds the two
+    # edges needed for the multi-hop [7, 7, 6] plan.
+    chain_demand = torch.diag(
+        torch.tensor([10, 8, 2], device="cuda", dtype=torch.int64)
+    )
+    chain_replicas = torch.eye(3, device="cuda", dtype=torch.bool)
+    chain_primary = torch.arange(3, device="cuda", dtype=torch.int64)
+    chain_instance = torch.empty_like(chain_demand)
+    chain_loads = torch.empty(3, device="cuda", dtype=torch.int64)
+    chain_slots = torch.empty_like(chain_loads)
+    chain_order = torch.empty_like(chain_demand)
+    chain_quota = torch.empty((3, 3, 3), device="cuda", dtype=torch.int64)
+    chain_routing = torch.empty_like(chain_demand)
+    chain_added = torch.empty(1, device="cuda", dtype=torch.int64)
+    _C.select_compute_replicas_into(
+        chain_demand,
+        chain_replicas,
+        chain_primary,
+        1,
+        chain_instance,
+        chain_loads,
+        chain_slots,
+        chain_order,
+        chain_quota,
+        chain_routing,
+        chain_added,
+    )
+    assert chain_added.item() == 2
+    assert chain_quota.sum(dim=(0, 1)).cpu().tolist() == [7, 7, 6]
+
     # The first overloaded rank is fixed above capacity. The solver must still
     # rebalance a later overloaded rank that has a feasible export path.
     blocked_demand = torch.tensor(

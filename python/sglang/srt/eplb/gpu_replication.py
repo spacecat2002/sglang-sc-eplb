@@ -554,10 +554,9 @@ def replicate_source_top_experts_cuda(
 ) -> ReplicaPlacement:
     """Run source-aware Top-N replication with CUDA trace processing.
 
-    The replica choice matches the source-demand Top-N policy. If compute
-    balancing is requested, the GPU-produced replica set is passed to the
-    existing exact quota path; this preserves the plan while keeping all
-    trace histogram and communication scoring on CUDA.
+    The replica choice matches the source-demand Top-N policy. With a resident
+    runtime, compute replicas and their export quota are produced together by
+    the CUDA capacity solver and consumed directly by quota routing.
     """
 
     if max_extra_per_rank < 0:

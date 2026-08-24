@@ -15,7 +15,6 @@ import torch
 from compare_grace import _baseline_placement, _load, _table, _tokens
 from sglang.srt.eplb.expert_affinity_graph import as_routed_arrays
 from sglang.srt.eplb.grace_plus_replication import (
-    balance_replica_compute,
     evaluate_replicated_placement,
     replicate_source_top_experts,
 )
@@ -185,7 +184,8 @@ def main() -> None:
         )
 
         phase_ms: dict[str, float] = {}
-        started = time.perf_counter()
+        runtime = None
+        demand_tensor = None
         if args.cuda:
             from sglang.srt.eplb.gpu_replication import GraceCudaRuntime
 
@@ -194,9 +194,15 @@ def main() -> None:
                 runtime = cuda_runtimes.setdefault(
                     len(experts), GraceCudaRuntime(len(experts), num_ranks)
                 )
+            # UltraEP's solver consumes an already aggregated expert-load view.
+            # Build the equivalent source/expert histogram outside planner timing.
+            demand_tensor = runtime.build_demand(*gpu_tokens)
+        started = time.perf_counter()
+        if args.cuda:
             optimized = runtime.plan(
                 *gpu_tokens,
                 primary,
+                demand=demand_tensor,
                 max_extra_per_rank=max_extra,
                 max_compute_extra_per_rank=args.max_compute_extra_experts_per_rank,
                 compute_imbalance_limit=args.compute_imbalance_limit,
@@ -210,7 +216,9 @@ def main() -> None:
                 primary,
                 num_ranks=num_ranks,
                 max_extra_per_rank=max_extra,
+                max_compute_extra_per_rank=args.max_compute_extra_experts_per_rank,
                 compute_imbalance_limit=args.compute_imbalance_limit,
+                communication_budget_ratio=budget_ratio,
                 timing=phase_ms,
             )
         replication_elapsed = time.perf_counter() - started
@@ -231,29 +239,6 @@ def main() -> None:
                 if args.compute_imbalance_limit is not None
                 or args.max_compute_extra_experts_per_rank
                 else 0.0
-            )
-        if args.max_compute_extra_experts_per_rank and not args.cuda:
-            compute_started = time.perf_counter()
-            before_quota = {
-                key: value
-                for key, value in phase_ms.items()
-                if key.startswith("quota_")
-            }
-            optimized = balance_replica_compute(
-                tokens,
-                optimized,
-                num_ranks=num_ranks,
-                max_extra_per_rank=args.max_compute_extra_experts_per_rank,
-                communication_budget_ratio=budget_ratio,
-                timing=phase_ms,
-            )
-            quota_elapsed = sum(
-                phase_ms.get(key, 0.0) - before_quota.get(key, 0.0)
-                for key in ("quota_solve_ms", "quota_allocation_ms")
-            )
-            phase_ms["compute_replication_ms"] += max(
-                0.0,
-                (time.perf_counter() - compute_started) * 1000.0 - quota_elapsed,
             )
         if args.output_plan:
             plan[gate] = _plan_entry(optimized)

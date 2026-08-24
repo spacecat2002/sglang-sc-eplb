@@ -197,6 +197,31 @@ def test_source_top_experts_quota_limits_local_compute():
     assert result.metrics.remote == 55
 
 
+def test_source_top_experts_runs_compute_solver_in_one_call():
+    tokens = [
+        RoutedToken(0, (0,), 100),
+        RoutedToken(1, (1,), 10),
+        RoutedToken(0, (2,), 40),
+    ]
+    primary = {0: 0, 1: 1, 2: 1}
+    communication = replicate_source_top_experts(
+        tokens, primary, num_ranks=2, max_extra_per_rank=0
+    )
+    separate = balance_replica_compute(
+        tokens, communication, num_ranks=2, max_extra_per_rank=1
+    )
+    fused = replicate_source_top_experts(
+        tokens,
+        primary,
+        num_ranks=2,
+        max_extra_per_rank=0,
+        max_compute_extra_per_rank=1,
+        compute_imbalance_limit=1.0,
+    )
+
+    assert fused == separate
+
+
 def test_compute_balancing_adds_replica_and_reroutes_static_demand():
     tokens = [
         RoutedToken(0, (0,), 20),
