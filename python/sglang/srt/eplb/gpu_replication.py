@@ -687,6 +687,7 @@ def replicate_source_top_experts_cuda(
     materialize_quota: bool = True,
     runtime: GraceCudaRuntime | None = None,
     demand_tensor: torch.Tensor | None = None,
+    compute_solver: str = "legacy",
 ) -> ReplicaPlacement:
     """Run bundle-aware communication replication with CUDA trace processing.
 
@@ -699,6 +700,8 @@ def replicate_source_top_experts_cuda(
         raise ValueError("max_extra_per_rank must be non-negative")
     if max_compute_extra_per_rank < 0:
         raise ValueError("max_compute_extra_per_rank must be non-negative")
+    if compute_solver not in {"legacy", "capacity-v2"}:
+        raise ValueError("compute_solver must be 'legacy' or 'capacity-v2'")
     if compute_imbalance_limit is not None and (
         compute_imbalance_limit < 1 or not math.isfinite(compute_imbalance_limit)
     ):
@@ -822,7 +825,10 @@ def replicate_source_top_experts_cuda(
     direct_export_quota = (
         runtime is not None
         and max_compute_extra_per_rank > 0
-        and communication_budget_ratio in (None, 1.0)
+        and (
+            compute_solver == "capacity-v2"
+            or communication_budget_ratio in (None, 1.0)
+        )
     )
     if needs_quota and not direct_export_quota:
         expert_demand = demand.sum(dim=1)
@@ -843,7 +849,26 @@ def replicate_source_top_experts_cuda(
             )
             _record(timing, "communication_replication_ms", metrics_started)
         compute_started = _phase_start(timing)
-        if runtime is None:
+        if compute_solver == "capacity-v2":
+            if runtime is None:
+                raise ValueError("capacity-v2 requires a resident CUDA runtime")
+            _C.select_compute_replicas_v2_into(
+                demand,
+                replica_mask,
+                primary_tensor,
+                max_compute_extra_per_rank,
+                quota_compute_limit,
+                runtime.compute_instance,
+                runtime.compute_loads,
+                runtime.compute_added_by_rank,
+                runtime.compute_addition_order,
+                runtime.quota,
+                runtime.routing,
+                runtime.compute_added,
+            )
+            balance_copies = runtime.compute_added
+            addition_order = runtime.compute_addition_order
+        elif runtime is None:
             replica_mask, balance_copies, addition_order = _C.select_compute_replicas(
                 demand,
                 replica_mask,

@@ -11,6 +11,7 @@ setup(
             sources=[
                 str(root / "csrc" / "bindings.cpp"),
                 str(root / "csrc" / "affinity.cu"),
+                str(root / "csrc" / "compute_v2.cu"),
                 str(root / "csrc" / "demand.cu"),
                 str(root / "csrc" / "placement.cu"),
                 str(root / "csrc" / "quota.cu"),

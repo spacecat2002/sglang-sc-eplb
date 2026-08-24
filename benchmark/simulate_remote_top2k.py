@@ -84,6 +84,12 @@ def main() -> None:
         help="additional replicas per rank used only to balance compute (default: 0)",
     )
     parser.add_argument(
+        "--compute-solver",
+        choices=("legacy", "capacity-v2"),
+        default="legacy",
+        help="CUDA compute solver (default: legacy)",
+    )
+    parser.add_argument(
         "--communication-budget-ratio",
         type=float,
         help=(
@@ -110,6 +116,8 @@ def main() -> None:
         parser.error("--input must be a compact .pt routing trace")
     if args.affinity_placement and not args.cuda:
         parser.error("--affinity-placement requires --cuda")
+    if args.compute_solver != "legacy" and not args.cuda:
+        parser.error("--compute-solver capacity-v2 requires --cuda")
     if (
         args.max_extra_experts_per_rank is not None
         and args.max_extra_experts_per_rank < 0
@@ -247,6 +255,7 @@ def main() -> None:
                 max_compute_extra_per_rank=args.max_compute_extra_experts_per_rank,
                 compute_imbalance_limit=args.compute_imbalance_limit,
                 communication_budget_ratio=budget_ratio,
+                compute_solver=args.compute_solver,
                 timing=phase_ms,
                 materialize_quota=bool(args.output_plan),
             )
@@ -290,7 +299,7 @@ def main() -> None:
             _rows(
                 layer,
                 (
-                    f"{'affinity+' if args.affinity_placement else ''}remote-top{max_extra}+compute"
+                    f"{'affinity+' if args.affinity_placement else ''}remote-top{max_extra}+compute-{args.compute_solver}"
                     if args.max_compute_extra_experts_per_rank
                     else f"{'affinity+' if args.affinity_placement else ''}remote-top{max_extra}"
                 ),

@@ -372,6 +372,33 @@ def test_kernels() -> None:
     assert into_quota.sum(dim=(0, 1)).cpu().tolist() == [10, 10]
     assert torch.equal(into_quota.sum(dim=2), unbalanced.t())
 
+    v2_replicas = initial.clone()
+    v2_instance = torch.empty_like(unbalanced)
+    v2_loads = torch.empty((2,), device="cuda", dtype=torch.int64)
+    v2_slots = torch.empty_like(v2_loads)
+    v2_order = torch.empty_like(unbalanced)
+    v2_quota = torch.empty((2, 2, 2), device="cuda", dtype=torch.int64)
+    v2_routing = torch.zeros((2, 2), device="cuda", dtype=torch.int64)
+    v2_added = torch.empty((1,), device="cuda", dtype=torch.int64)
+    _C.select_compute_replicas_v2_into(
+        unbalanced,
+        v2_replicas,
+        torch.tensor([0, 0], device="cuda"),
+        1,
+        1.0,
+        v2_instance,
+        v2_loads,
+        v2_slots,
+        v2_order,
+        v2_quota,
+        v2_routing,
+        v2_added,
+    )
+    assert v2_replicas.cpu().tolist() == [[True, True], [True, False]]
+    assert v2_added.item() == 1
+    assert v2_quota.sum(dim=(0, 1)).cpu().tolist() == [10, 10]
+    assert torch.equal(v2_quota.sum(dim=2), unbalanced.t())
+
     # A requested 1.0x limit must actually localize quota from an overloaded
     # rank when the replica set can serve the other rank.
     limit_demand = torch.tensor(
