@@ -424,7 +424,7 @@ def replicate_source_top_experts(
     quota = _source_quotas(demand, instance_quota, routing)
     _record_timing(timing, "quota_allocation_ms", allocation_started)
     average = demand.sum() / num_ranks
-    capacity = max(int(compute.max()), int(np.ceil(average * compute_imbalance_limit)))
+    capacity = int(np.ceil(average * compute_imbalance_limit))
     changed = True
     while changed:
         changed = False
@@ -435,8 +435,10 @@ def replicate_source_top_experts(
                 key=lambda expert: (-demand[expert, source], expert),
             )
             for expert in local_experts:
+                if room <= 0:
+                    break
                 for target in replicas[expert]:
-                    if target == source or not room:
+                    if target == source or room <= 0:
                         continue
                     moved = min(room, int(quota[source, expert, target]))
                     quota[source, expert, target] -= moved
@@ -1014,8 +1016,6 @@ def _capacity_export_replicas(
                 if target in replicas[expert] or (
                     added_by_rank[target] >= max_extra_per_rank
                 ):
-                    continue
-                if compute[target] >= current_key[0]:
                     continue
                 allocation = _waterfill(
                     base, replicas[expert] + (target,), int(total)

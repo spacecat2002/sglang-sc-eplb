@@ -173,6 +173,50 @@ def test_kernels() -> None:
     assert torch.equal(into_order, addition_order)
     assert into_added.item() == added.item()
 
+    # A requested 1.0x limit must actually localize quota from an overloaded
+    # rank when the replica set can serve the other rank.
+    limit_demand = torch.tensor(
+        [[6, 13, 0], [16, 7, 14], [15, 17, 7], [11, 7, 7], [14, 9, 0]],
+        device="cuda",
+        dtype=torch.int64,
+    )
+    limit_replicas = torch.tensor(
+        [
+            [False, False, True],
+            [True, False, False],
+            [True, True, True],
+            [False, True, True],
+            [False, True, True],
+        ],
+        device="cuda",
+        dtype=torch.bool,
+    )
+    limit_primary = torch.tensor([2, 0, 0, 1, 1], device="cuda", dtype=torch.int64)
+    limit_routing = torch.tensor(
+        [[2, 0, 0, 1, 1], [2, 0, 1, 1, 1], [2, 0, 2, 2, 2]],
+        device="cuda",
+        dtype=torch.int64,
+    )
+    limit_expert_order = torch.tensor(
+        [1, 0, 2, 3, 4], device="cuda", dtype=torch.int64
+    )
+    limit_source_order = torch.tensor(
+        [[1, 2, 4, 3, 0], [2, 0, 4, 1, 3], [1, 2, 3, 0, 4]],
+        device="cuda",
+        dtype=torch.int64,
+    )
+    limit_quota, _ = _C.solve_quota(
+        limit_demand,
+        limit_replicas,
+        limit_primary,
+        limit_routing,
+        limit_expert_order,
+        limit_source_order,
+        1.0,
+    )
+    limit_compute = limit_quota.sum(dim=(0, 1))
+    assert limit_compute.cpu().tolist() == [48, 47, 48]
+
 
 if __name__ == "__main__":
     test_kernels()

@@ -255,8 +255,7 @@ __global__ __launch_bounds__(128, 1) void select_compute_replicas_kernel(
       const int target = index % ranks;
       const int64_t total = expert_demand[expert];
       if (!total || replicas[expert * ranks + target] ||
-          added_by_rank[target] >= max_extra_per_rank ||
-          loads[target] >= current_max) {
+          added_by_rank[target] >= max_extra_per_rank) {
         continue;
       }
       for (int rank = 0; rank < ranks; ++rank) {
@@ -317,22 +316,19 @@ __global__ void localize_quota_kernel(
     double imbalance_limit, int64_t experts, int64_t ranks) {
   if (blockIdx.x || threadIdx.x || imbalance_limit < 1.0) return;
   int64_t total = 0;
-  int64_t capacity = 0;
-  for (int rank = 0; rank < ranks; ++rank) capacity = max(capacity, loads[rank]);
   for (int64_t index = 0; index < experts * ranks; ++index) total += demand[index];
-  capacity = max(
-      capacity,
-      static_cast<int64_t>(ceil(static_cast<double>(total) / ranks * imbalance_limit)));
+  const int64_t capacity = static_cast<int64_t>(ceil(
+      static_cast<double>(total) / ranks * imbalance_limit));
 
   bool changed = true;
   while (changed) {
     changed = false;
     for (int source = 0; source < ranks; ++source) {
       int64_t room = capacity - loads[source];
-      for (int64_t index = 0; index < experts && room; ++index) {
+      for (int64_t index = 0; index < experts && room > 0; ++index) {
         const int64_t expert = source_order[source * experts + index];
         if (!replicas[expert * ranks + source]) continue;
-        for (int pass = 0; pass < ranks && room; ++pass) {
+        for (int pass = 0; pass < ranks && room > 0; ++pass) {
           const int primary_rank = primary[expert];
           const int secondary = pass - 1;
           const int target =
@@ -439,21 +435,19 @@ __global__ void fused_quota_kernel(
   __syncthreads();
 
   if (tid == 0 && imbalance_limit >= 1.0) {
-    int64_t capacity = 0;
-    for (int rank = 0; rank < ranks; ++rank) capacity = max(capacity, loads[rank]);
     int64_t total = 0;
     for (int64_t index = 0; index < experts * ranks; ++index) total += demand[index];
-    capacity = max(capacity, static_cast<int64_t>(ceil(
-        static_cast<double>(total) / ranks * imbalance_limit)));
+    const int64_t capacity = static_cast<int64_t>(ceil(
+        static_cast<double>(total) / ranks * imbalance_limit));
     bool changed = true;
     while (changed) {
       changed = false;
       for (int source = 0; source < ranks; ++source) {
         int64_t room = capacity - loads[source];
-        for (int64_t index = 0; index < experts && room; ++index) {
+        for (int64_t index = 0; index < experts && room > 0; ++index) {
           const int64_t expert = source_order[source * experts + index];
           if (!replicas[expert * ranks + source]) continue;
-          for (int pass = 0; pass < ranks && room; ++pass) {
+          for (int pass = 0; pass < ranks && room > 0; ++pass) {
             const int primary_rank = primary[expert];
             const int secondary = pass - 1;
             const int target = pass == 0
