@@ -8,9 +8,14 @@ Build from the repository root:
     cd benchmark/grace_cuda
     python setup.py build_ext --inplace
 
-The extension has separate CUDA translation units for demand histogram,
-source-aware Top-N placement, capacity/export planning, quota routing, and
-traffic evaluation. Compute replicas are selected by probing the ideal rank
+With `--affinity-placement`, the initial placement uses the same normalized
+spectral embedding, deterministic k-means, exact-size repair, and lexicographic
+Hungarian rank assignment as the Python implementation. A fixed-size swap pass
+balances group demand before rank assignment; affinity breaks compute ties.
+
+The extension also has CUDA stages for demand histogram, source-aware Top-N
+placement, capacity/export planning, quota routing, and traffic evaluation.
+Compute replicas are selected by probing the ideal rank
 capacity first, then binary-searching only when that threshold is infeasible.
 The final export pass prefers source-local targets at the same feasible
 capacity. If direct exports stop above ideal capacity, the solver adds only

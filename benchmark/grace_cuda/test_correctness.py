@@ -72,6 +72,72 @@ def test_kernels() -> None:
     assert affinity_traffic.sum().item() == 0
     assert affinity_traffic.sum().item() < sequential_traffic.sum().item()
 
+    degree = affinity.sum(dim=1).to(torch.float64)
+    scale = degree.sqrt().reciprocal()
+    scale.masked_fill_(degree == 0, 0)
+    normalized = affinity.to(torch.float64) * scale[:, None] * scale[None, :]
+    _, eigenvectors = torch.linalg.eigh(normalized)
+    embedding = torch.nn.functional.normalize(eigenvectors[:, -2:], dim=1)
+    centers = torch.empty((2, 2), device="cuda", dtype=torch.float64)
+    strict_groups = torch.empty(4, device="cuda", dtype=torch.int64)
+    next_groups = torch.empty_like(strict_groups)
+    group_sizes = torch.empty(2, device="cuda", dtype=torch.int64)
+    overflow = torch.empty_like(strict_groups)
+    _C.spectral_groups_into(
+        embedding.contiguous(),
+        affinity,
+        centers,
+        strict_groups,
+        next_groups,
+        group_sizes,
+        overflow,
+    )
+    assert torch.bincount(strict_groups, minlength=2).cpu().tolist() == [2, 2]
+    strict_group_source = torch.empty((2, 2), device="cuda", dtype=torch.int64)
+    _C.group_source_into(
+        affinity_source,
+        affinity_topk,
+        affinity_count,
+        strict_groups,
+        strict_group_source,
+    )
+    strict_primary = torch.empty_like(strict_groups)
+    _C.congestion_hungarian_into(
+        strict_group_source,
+        strict_groups,
+        torch.empty((2, 2), device="cuda", dtype=torch.bool),
+        torch.empty((2, 2), device="cuda", dtype=torch.int64),
+        torch.empty((2, 2), device="cuda", dtype=torch.int64),
+        torch.empty(18, device="cuda", dtype=torch.int64),
+        torch.empty(2, device="cuda", dtype=torch.int64),
+        strict_primary,
+    )
+    strict_replicas = torch.nn.functional.one_hot(
+        strict_primary, num_classes=2
+    ).bool()
+    strict_traffic, _ = _C.traffic(
+        affinity_source,
+        affinity_topk,
+        affinity_count,
+        strict_primary,
+        strict_replicas,
+        2,
+    )
+    assert strict_traffic.sum().item() == 0
+
+    compute_groups = torch.tensor([0, 0, 1, 1], device="cuda", dtype=torch.int64)
+    compute_demand = torch.tensor(
+        [[100, 0], [90, 0], [10, 0], [0, 0]],
+        device="cuda",
+        dtype=torch.int64,
+    )
+    compute_group_loads = torch.empty(2, device="cuda", dtype=torch.int64)
+    _C.balance_group_compute_into(
+        compute_demand, affinity, compute_groups, compute_group_loads
+    )
+    assert torch.bincount(compute_groups, minlength=2).cpu().tolist() == [2, 2]
+    assert compute_group_loads.cpu().tolist() == [100, 100]
+
     primary = torch.tensor([0, 0, 1, 1], device="cuda", dtype=torch.int64)
     replicas = _C.select_topn(demand, primary, 0)
     assert replicas.cpu().tolist() == [

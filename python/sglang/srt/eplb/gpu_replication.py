@@ -451,6 +451,33 @@ class GraceCudaRuntime:
         self.affinity_group_to_rank = torch.empty(
             (self.num_ranks,), device=self.device, dtype=torch.int64
         )
+        self.affinity_float = torch.empty_like(self.affinity, dtype=torch.float64)
+        self.affinity_scale = torch.empty_like(self.primary, dtype=torch.float64)
+        self.affinity_eigenvalues = torch.empty_like(
+            self.primary, dtype=torch.float64
+        )
+        self.affinity_eigenvectors = torch.empty_like(self.affinity_float)
+        self.affinity_embedding = torch.empty(
+            (self.num_experts, self.num_ranks),
+            device=self.device,
+            dtype=torch.float64,
+        )
+        self.affinity_centers = torch.empty(
+            (self.num_ranks, self.num_ranks),
+            device=self.device,
+            dtype=torch.float64,
+        )
+        self.affinity_next_groups = torch.empty_like(self.primary)
+        self.affinity_group_sizes = torch.empty_like(self.affinity_group_to_rank)
+        self.affinity_overflow = torch.empty_like(self.primary)
+        self.affinity_allowed = torch.empty(
+            (self.num_ranks, self.num_ranks), device=self.device, dtype=torch.bool
+        )
+        self.affinity_values = torch.empty_like(self.affinity_group_source)
+        self.affinity_cost = torch.empty_like(self.affinity_group_source)
+        self.affinity_hungarian_work = torch.empty(
+            (6 * (self.num_ranks + 1),), device=self.device, dtype=torch.int64
+        )
 
     def _primary_tensor(self, primary: Mapping[int, int] | torch.Tensor) -> torch.Tensor:
         if isinstance(primary, torch.Tensor):
@@ -515,18 +542,66 @@ class GraceCudaRuntime:
         timing: dict[str, float] | None = None,
     ) -> torch.Tensor:
         """Build a capacity-strict affinity placement without leaving CUDA."""
+        if self.num_experts % self.num_ranks:
+            raise ValueError("strict spectral placement requires experts divisible by ranks")
         started = _phase_start(timing)
         source, topk, count = _cuda_arrays((source, topk, count), self.device)
-        _C.affinity_primary_into(
+        _C.affinity_histogram_into(
             source,
             topk,
             count,
             self.demand,
             self.affinity,
             self.affinity_degree,
-            self.affinity_score,
+        )
+        self.affinity_float.copy_(self.affinity)
+        self.affinity_scale.copy_(self.affinity_degree)
+        self.affinity_scale.sqrt_().reciprocal_()
+        self.affinity_scale.masked_fill_(self.affinity_degree == 0, 0)
+        self.affinity_float.mul_(self.affinity_scale[:, None])
+        self.affinity_float.mul_(self.affinity_scale[None, :])
+        torch.linalg.eigh(
+            self.affinity_float,
+            out=(self.affinity_eigenvalues, self.affinity_eigenvectors),
+        )
+        self.affinity_embedding.copy_(
+            self.affinity_eigenvectors[:, -self.num_ranks :]
+        )
+        torch.nn.functional.normalize(
+            self.affinity_embedding,
+            dim=1,
+            eps=1e-12,
+            out=self.affinity_embedding,
+        )
+        _C.spectral_groups_into(
+            self.affinity_embedding,
+            self.affinity,
+            self.affinity_centers,
+            self.affinity_groups,
+            self.affinity_next_groups,
+            self.affinity_group_sizes,
+            self.affinity_overflow,
+        )
+        _C.balance_group_compute_into(
+            self.demand,
+            self.affinity,
+            self.affinity_groups,
+            self.affinity_group_sizes,
+        )
+        _C.group_source_into(
+            source,
+            topk,
+            count,
             self.affinity_groups,
             self.affinity_group_source,
+        )
+        _C.congestion_hungarian_into(
+            self.affinity_group_source,
+            self.affinity_groups,
+            self.affinity_allowed,
+            self.affinity_values,
+            self.affinity_cost,
+            self.affinity_hungarian_work,
             self.affinity_group_to_rank,
             self.primary,
         )

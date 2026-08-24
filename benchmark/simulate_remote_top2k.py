@@ -189,7 +189,6 @@ def main() -> None:
                 baseline_elapsed,
             )
         )
-
         phase_ms: dict[str, float] = {}
         runtime = None
         demand_tensor = None
@@ -274,6 +273,17 @@ def main() -> None:
                 phase_ms,
             )
         )
+        if (
+            args.compute_imbalance_limit is not None
+            and optimized.metrics.compute_imbalance
+            > args.compute_imbalance_limit + 1e-12
+        ):
+            print(
+                f"warning: layer {layer} compute limit is infeasible with "
+                f"{args.max_compute_extra_experts_per_rank} extra copies/rank: "
+                f"{optimized.metrics.compute_imbalance:.4f}x > "
+                f"{args.compute_imbalance_limit:.4f}x"
+            )
 
     compute = (
         f"{args.compute_imbalance_limit:.2f}x"
