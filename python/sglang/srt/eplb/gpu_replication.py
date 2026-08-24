@@ -428,6 +428,7 @@ class GraceCudaRuntime:
         self.replicas = torch.empty(
             (self.num_experts, self.num_ranks), device=self.device, dtype=torch.bool
         )
+        self.replica_gains = torch.empty_like(self.replicas, dtype=torch.int64)
         self.compute_instance = torch.empty_like(self.replicas, dtype=torch.int64)
         self.compute_loads = torch.empty(
             (self.num_ranks,), device=self.device, dtype=torch.int64
@@ -521,6 +522,7 @@ class GraceCudaRuntime:
             self.num_ranks,
             int(max_extra_per_rank),
             self.demand,
+            self.replica_gains,
             self.replicas,
             self.routing,
         )
@@ -682,11 +684,11 @@ def replicate_source_top_experts_cuda(
     runtime: GraceCudaRuntime | None = None,
     demand_tensor: torch.Tensor | None = None,
 ) -> ReplicaPlacement:
-    """Run source-aware Top-N replication with CUDA trace processing.
+    """Run bundle-aware communication replication with CUDA trace processing.
 
-    The replica choice matches the source-demand Top-N policy. With a resident
-    runtime, compute replicas and their export quota are produced together by
-    the CUDA capacity solver and consumed directly by quota routing.
+    Replica gain counts only traffic whose remote destination disappears. With
+    a resident runtime, compute replicas and their export quota are produced
+    together by the CUDA capacity solver and consumed directly by quota routing.
     """
 
     if max_extra_per_rank < 0:
@@ -753,6 +755,7 @@ def replicate_source_top_experts_cuda(
                 num_ranks,
                 max_extra_per_rank,
                 runtime.demand,
+                runtime.replica_gains,
                 runtime.replicas,
                 runtime.routing,
             )
@@ -765,13 +768,29 @@ def replicate_source_top_experts_cuda(
         if demand.shape != (num_experts, num_ranks):
             raise ValueError("demand has the wrong shape")
         if runtime is None:
-            replica_mask = _C.select_topn(demand, primary_tensor, max_extra_per_rank)
-            routing_tensor = _C.default_routing(replica_mask, primary_tensor)
-        else:
-            _C.select_topn_routing_into(
-                demand,
+            gains = torch.empty_like(demand)
+            replica_mask = torch.empty_like(demand, dtype=torch.bool)
+            routing_tensor = torch.empty(
+                (num_ranks, num_experts), device=device, dtype=torch.int64
+            )
+            _C.select_bundle_topn_routing_into(
+                source,
+                topk,
+                count,
                 primary_tensor,
                 max_extra_per_rank,
+                gains,
+                replica_mask,
+                routing_tensor,
+            )
+        else:
+            _C.select_bundle_topn_routing_into(
+                source,
+                topk,
+                count,
+                primary_tensor,
+                max_extra_per_rank,
+                runtime.replica_gains,
                 runtime.replicas,
                 runtime.routing,
             )

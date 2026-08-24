@@ -5,6 +5,39 @@
 
 namespace grace_cuda {
 
+__global__ void bundle_gain_kernel(
+    const int64_t* source, const int64_t* topk, const int64_t* count,
+    const int64_t* primary, int64_t* gains, int64_t tokens, int64_t k,
+    int64_t ranks) {
+  const int64_t token = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (token >= tokens) return;
+  const int64_t src = source[token];
+  const int64_t weight = count[token];
+  unsigned long long seen_low = 0;
+  unsigned long long seen_high = 0;
+  unsigned long long duplicate_low = 0;
+  unsigned long long duplicate_high = 0;
+  for (int64_t column = 0; column < k; ++column) {
+    const int64_t expert = topk[token * k + column];
+    const int64_t destination = primary[expert];
+    const auto bit = 1ULL << (destination & 63);
+    auto& seen = destination < 64 ? seen_low : seen_high;
+    auto& duplicate = destination < 64 ? duplicate_low : duplicate_high;
+    if (seen & bit) duplicate |= bit;
+    seen |= bit;
+  }
+  for (int64_t column = 0; column < k; ++column) {
+    const int64_t expert = topk[token * k + column];
+    const int64_t destination = primary[expert];
+    const auto bit = 1ULL << (destination & 63);
+    const auto duplicate = destination < 64 ? duplicate_low : duplicate_high;
+    if (destination != src && !(duplicate & bit)) {
+      atomicAdd(reinterpret_cast<unsigned long long*>(gains + expert * ranks + src),
+                static_cast<unsigned long long>(weight));
+    }
+  }
+}
+
 __global__ void topn_kernel(const int64_t* demand, const int64_t* primary,
                             bool* replicas, int64_t experts, int64_t ranks,
                             int64_t max_extra) {
@@ -141,6 +174,33 @@ void select_topn_routing_into(torch::Tensor demand, torch::Tensor primary,
          replicas.data_ptr<bool>(), routing.data_ptr<int64_t>(), experts, ranks,
          max_extra);
   check_cuda(cudaGetLastError());
+}
+
+void select_bundle_topn_routing_into(
+    torch::Tensor source, torch::Tensor topk, torch::Tensor count,
+    torch::Tensor primary, int64_t max_extra, torch::Tensor gains,
+    torch::Tensor replicas, torch::Tensor routing) {
+  TORCH_CHECK(source.is_cuda() && topk.is_cuda() && count.is_cuda() &&
+              primary.is_cuda());
+  TORCH_CHECK(source.scalar_type() == torch::kInt64 &&
+              topk.scalar_type() == torch::kInt64 &&
+              count.scalar_type() == torch::kInt64 &&
+              primary.scalar_type() == torch::kInt64);
+  TORCH_CHECK(source.dim() == 1 && topk.dim() == 2 && count.dim() == 1 &&
+              source.size(0) == topk.size(0) && source.size(0) == count.size(0));
+  TORCH_CHECK(gains.is_cuda() && gains.scalar_type() == torch::kInt64 &&
+              gains.dim() == 2 && gains.size(0) == primary.numel());
+  const int64_t ranks = gains.size(1);
+  TORCH_CHECK(ranks > 0 && ranks <= 128,
+              "bundle-aware replication supports at most 128 ranks");
+  gains.zero_();
+  auto stream = c10::cuda::getCurrentCUDAStream(source.get_device());
+  launch(bundle_gain_kernel, dim3((source.size(0) + 255) / 256), dim3(256),
+         stream.stream(), source.data_ptr<int64_t>(), topk.data_ptr<int64_t>(),
+         count.data_ptr<int64_t>(), primary.data_ptr<int64_t>(),
+         gains.data_ptr<int64_t>(), source.size(0), topk.size(1), ranks);
+  check_cuda(cudaGetLastError());
+  select_topn_routing_into(gains, primary, max_extra, replicas, routing);
 }
 
 torch::Tensor select_topn(torch::Tensor demand, torch::Tensor primary,

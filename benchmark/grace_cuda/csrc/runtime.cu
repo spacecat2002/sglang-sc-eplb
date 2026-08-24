@@ -14,6 +14,9 @@ void source_demand_into(torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
 torch::Tensor select_topn(torch::Tensor, torch::Tensor, int64_t);
 void select_topn_routing_into(torch::Tensor, torch::Tensor, int64_t,
                               torch::Tensor, torch::Tensor);
+void select_bundle_topn_routing_into(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
+    torch::Tensor, torch::Tensor, torch::Tensor);
 
 namespace {
 
@@ -32,13 +35,13 @@ __global__ void default_routing_kernel(const bool* replicas,
 void fused_source_topn_into(
     torch::Tensor source, torch::Tensor topk, torch::Tensor count,
     torch::Tensor primary, int64_t experts, int64_t ranks,
-    int64_t max_extra_per_rank, torch::Tensor demand, torch::Tensor replicas,
-    torch::Tensor routing) {
+    int64_t max_extra_per_rank, torch::Tensor demand, torch::Tensor gains,
+    torch::Tensor replicas, torch::Tensor routing) {
   TORCH_CHECK(source.is_cuda() && topk.is_cuda() && count.is_cuda() &&
               primary.is_cuda());
   source_demand_into(source, topk, count, experts, ranks, demand);
-  select_topn_routing_into(demand, primary, max_extra_per_rank, replicas,
-                           routing);
+  select_bundle_topn_routing_into(source, topk, count, primary,
+                                  max_extra_per_rank, gains, replicas, routing);
 }
 
 void default_routing_into(torch::Tensor replicas, torch::Tensor primary,
@@ -82,8 +85,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> fused_source_topn(
   TORCH_CHECK(primary.numel() == experts && ranks > 0 && ranks <= 128 &&
               max_extra_per_rank >= 0);
   auto demand = source_demand(source, topk, count, experts, ranks);
-  auto replicas = select_topn(demand, primary, max_extra_per_rank);
-  auto routing = default_routing(replicas, primary);
+  auto gains = torch::empty_like(demand);
+  auto replicas = torch::empty({experts, ranks}, demand.options().dtype(torch::kBool));
+  auto routing = torch::empty({ranks, experts}, primary.options());
+  select_bundle_topn_routing_into(source, topk, count, primary,
+                                  max_extra_per_rank, gains, replicas, routing);
   return {demand, replicas, routing};
 }
 

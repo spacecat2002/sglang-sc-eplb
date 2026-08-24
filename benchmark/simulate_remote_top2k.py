@@ -70,7 +70,7 @@ def main() -> None:
     parser.add_argument(
         "--max-extra-experts-per-rank",
         type=int,
-        help="remote replica limit/rank (default: K with affinity, otherwise 2K)",
+        help="remote replica limit/rank (default: 2K)",
     )
     parser.add_argument(
         "--compute-imbalance-limit",
@@ -133,7 +133,7 @@ def main() -> None:
     max_extra = (
         args.max_extra_experts_per_rank
         if args.max_extra_experts_per_rank is not None
-        else top_k if args.affinity_placement else 2 * top_k
+        else 2 * top_k
     )
     budget_ratio = args.communication_budget_ratio
     rows = [

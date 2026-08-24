@@ -219,12 +219,24 @@ def test_kernels() -> None:
         2,
         0,
         fused_all_demand,
+        torch.empty_like(demand),
         fused_all_replicas,
         fused_all_routing,
     )
     assert torch.equal(fused_all_demand, demand)
     assert torch.equal(fused_all_replicas, replicas)
     assert torch.equal(fused_all_routing, fused_routing)
+
+    # Replicating either expert would only split one shared remote bundle;
+    # bundle-aware selection correctly spends no replica on it.
+    shared_source = torch.tensor([0], device="cuda", dtype=torch.int64)
+    shared_topk = torch.tensor([[0, 1]], device="cuda", dtype=torch.int64)
+    shared_count = torch.tensor([10], device="cuda", dtype=torch.int64)
+    shared_primary = torch.tensor([1, 1], device="cuda", dtype=torch.int64)
+    _, shared_replicas, _ = _C.fused_source_topn(
+        shared_source, shared_topk, shared_count, shared_primary, 2, 2, 1
+    )
+    assert shared_replicas.cpu().tolist() == [[False, True], [False, True]]
 
     traffic, compute = _C.traffic(source, topk, count, primary, replicas, 2)
     assert traffic.cpu().tolist() == [[0, 5], [3, 0]]

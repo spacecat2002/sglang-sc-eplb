@@ -34,9 +34,13 @@ torch::Tensor select_topn(torch::Tensor, torch::Tensor, int64_t);
 void select_topn_into(torch::Tensor, torch::Tensor, int64_t, torch::Tensor);
 void select_topn_routing_into(torch::Tensor, torch::Tensor, int64_t,
                               torch::Tensor, torch::Tensor);
+void select_bundle_topn_routing_into(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
+    torch::Tensor, torch::Tensor, torch::Tensor);
 void fused_source_topn_into(torch::Tensor, torch::Tensor, torch::Tensor,
                             torch::Tensor, int64_t, int64_t, int64_t,
-                            torch::Tensor, torch::Tensor, torch::Tensor);
+                            torch::Tensor, torch::Tensor, torch::Tensor,
+                            torch::Tensor);
 torch::Tensor default_routing(torch::Tensor, torch::Tensor);
 void default_routing_into(torch::Tensor, torch::Tensor, torch::Tensor);
 std::tuple<torch::Tensor, torch::Tensor> traffic(
@@ -72,6 +76,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("select_topn", &grace_cuda::select_topn);
   m.def("select_topn_into", &grace_cuda::select_topn_into);
   m.def("select_topn_routing_into", &grace_cuda::select_topn_routing_into);
+  m.def("select_bundle_topn_routing_into",
+        &grace_cuda::select_bundle_topn_routing_into);
   m.def("fused_source_topn_into", &grace_cuda::fused_source_topn_into);
   m.def("default_routing", &grace_cuda::default_routing);
   m.def("default_routing_into", &grace_cuda::default_routing_into);
