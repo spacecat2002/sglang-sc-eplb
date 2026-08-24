@@ -44,6 +44,7 @@ __global__ void current_bundle_gain_kernel(
 }
 
 struct CapacityCandidate {
+  int source;
   int over;
   int target;
   int64_t expert;
@@ -65,6 +66,7 @@ __device__ bool better_capacity_candidate(
   if (candidate.gain != current.gain) return candidate.gain > current.gain;
   if (candidate.is_new != current.is_new) return candidate.is_new < current.is_new;
   if (candidate.amount != current.amount) return candidate.amount > current.amount;
+  if (candidate.source != current.source) return candidate.source < current.source;
   if (candidate.expert != current.expert) return candidate.expert < current.expert;
   if (candidate.target != current.target) return candidate.target < current.target;
   return candidate.over < current.over;
@@ -90,26 +92,32 @@ __global__ void capacity_v2_kernel(
   }
   for (int64_t index = tid; index < matrix_size * ranks; index += blockDim.x)
     quota[index] = 0;
-  for (int rank = tid; rank < ranks; rank += blockDim.x)
+  for (int rank = tid; rank < ranks; rank += blockDim.x) {
     added_by_rank[rank] = 0;
+    loads[rank] = 0;
+  }
   __syncthreads();
 
   for (int64_t index = tid; index < matrix_size; index += blockDim.x) {
-    const int64_t expert = index / ranks;
-    const int source = index % ranks;
-    const int target = replicas[index] ? source : primary[expert];
+    const int source = index / experts;
+    const int64_t expert = index % experts;
+    const int target = replicas[expert * ranks + source]
+                           ? source
+                           : primary[expert];
+    const int64_t value = demand[expert * ranks + source];
+    quota[index * ranks + target] = value;
+    routing[index] = target;
     atomicAdd(reinterpret_cast<unsigned long long*>(
                   instance + expert * ranks + target),
-              static_cast<unsigned long long>(demand[index]));
+              static_cast<unsigned long long>(value));
+    atomicAdd(reinterpret_cast<unsigned long long*>(loads + target),
+              static_cast<unsigned long long>(value));
   }
   __syncthreads();
 
   if (tid == 0) {
     int64_t total = 0;
     for (int rank = 0; rank < ranks; ++rank) {
-      loads[rank] = 0;
-      for (int64_t expert = 0; expert < experts; ++expert)
-        loads[rank] += instance[expert * ranks + rank];
       total += loads[rank];
     }
     const double limit = imbalance_limit >= 1.0 ? imbalance_limit : 1.0;
@@ -120,26 +128,36 @@ __global__ void capacity_v2_kernel(
   __syncthreads();
 
   while (true) {
-    CapacityCandidate best = {-1, -1, -1, 0, LLONG_MAX, -1, true};
+    CapacityCandidate best = {-1, -1, -1, -1, 0, LLONG_MAX, -1, true};
     const int64_t candidate_count = experts * ranks * ranks;
     for (int64_t index = tid; index < candidate_count; index += blockDim.x) {
       const int target = index % ranks;
       const int64_t pair = index / ranks;
       const int64_t expert = pair % experts;
-      const int over = pair / experts;
+      const int source = pair / experts;
+      const int64_t route_index = source * experts + expert;
+      const int over = routing[route_index];
       if (target == over || loads[over] <= capacity || loads[target] >= capacity)
         continue;
-      const int64_t available = instance[expert * ranks + over];
+      const int64_t offset = route_index * ranks;
+      const int64_t available = quota[offset + over];
       if (!available) continue;
       const bool present = replicas[expert * ranks + target] ||
                            addition_order[expert * ranks + target];
       if (!present && added_by_rank[target] >= max_extra_per_rank) continue;
       const int64_t amount = min(
           min(loads[over] - capacity, capacity - loads[target]), available);
-      const int64_t local = min(amount, demand[expert * ranks + target]);
+      int64_t penalty = amount;
+      int64_t gain = 0;
+      if (target == source) {
+        gain = min(amount, bundle_gain[expert * ranks + source]);
+        penalty = -gain;
+      } else if (over != source) {
+        // Remote-to-remote moves can split an existing Top-K destination.
+        penalty = amount;
+      }
       CapacityCandidate candidate = {
-          over, target, expert, amount, amount - local,
-          min(local, bundle_gain[expert * ranks + target]), !present};
+          source, over, target, expert, amount, penalty, gain, !present};
       if (better_capacity_candidate(candidate, best, loads)) best = candidate;
     }
     candidates[tid] = best;
@@ -155,10 +173,18 @@ __global__ void capacity_v2_kernel(
           addition_order[best.expert * ranks + best.target] = ++added;
           ++added_by_rank[best.target];
         }
+        const int64_t offset =
+            (best.source * experts + best.expert) * ranks;
+        quota[offset + best.over] -= best.amount;
+        quota[offset + best.target] += best.amount;
         instance[best.expert * ranks + best.over] -= best.amount;
         instance[best.expert * ranks + best.target] += best.amount;
         loads[best.over] -= best.amount;
         loads[best.target] += best.amount;
+        int next = 0;
+        for (int rank = 1; rank < ranks; ++rank)
+          if (quota[offset + rank] > quota[offset + next]) next = rank;
+        routing[best.source * experts + best.expert] = next;
       } else {
         *added_out = added;
       }
@@ -169,48 +195,6 @@ __global__ void capacity_v2_kernel(
 
   for (int64_t index = tid; index < matrix_size; index += blockDim.x)
     replicas[index] = replicas[index] || addition_order[index];
-  __syncthreads();
-
-  // Fixed instance capacities are allocated source-local first, then to the
-  // communication solver's preferred destination, then to the largest remainder.
-  for (int64_t expert = tid; expert < experts; expert += blockDim.x) {
-    for (int source = 0; source < ranks; ++source) {
-      const int64_t offset = (source * experts + expert) * ranks;
-      const int64_t local = min(demand[expert * ranks + source],
-                                instance[expert * ranks + source]);
-      quota[offset + source] = local;
-      instance[expert * ranks + source] -= local;
-    }
-    for (int source = 0; source < ranks; ++source) {
-      const int64_t offset = (source * experts + expert) * ranks;
-      if (!demand[expert * ranks + source]) continue;
-      int64_t remaining = demand[expert * ranks + source] - quota[offset + source];
-      const int preferred = routing[source * experts + expert];
-      if (remaining && preferred != source) {
-        const int64_t moved = min(remaining, instance[expert * ranks + preferred]);
-        quota[offset + preferred] += moved;
-        instance[expert * ranks + preferred] -= moved;
-        remaining -= moved;
-      }
-      while (remaining) {
-        int target = -1;
-        for (int rank = 0; rank < ranks; ++rank)
-          if (instance[expert * ranks + rank] &&
-              (target < 0 || instance[expert * ranks + rank] >
-                                 instance[expert * ranks + target]))
-            target = rank;
-        if (target < 0) break;
-        const int64_t moved = min(remaining, instance[expert * ranks + target]);
-        quota[offset + target] += moved;
-        instance[expert * ranks + target] -= moved;
-        remaining -= moved;
-      }
-      int target = 0;
-      for (int rank = 1; rank < ranks; ++rank)
-        if (quota[offset + rank] > quota[offset + target]) target = rank;
-      routing[source * experts + expert] = target;
-    }
-  }
 }
 
 }  // namespace
