@@ -141,6 +141,24 @@ def test_kernels() -> None:
     assert traffic.cpu().tolist() == [[0, 4], [0, 0]]
     assert compute.cpu().tolist() == [3, 4]
 
+    crossing_source = torch.tensor([0], device="cuda", dtype=torch.int64)
+    crossing_topk = torch.tensor([[0]], device="cuda", dtype=torch.int64)
+    crossing_count = torch.tensor([5], device="cuda", dtype=torch.int64)
+    crossing_ordinals = torch.zeros_like(crossing_topk)
+    traffic, compute = _C.quota_traffic(
+        crossing_source,
+        crossing_topk,
+        crossing_count,
+        bundle_quota,
+        bundle_replicas,
+        bundle_primary,
+        torch.zeros((1, 2), device="cuda", dtype=torch.int64),
+        crossing_ordinals,
+        2,
+    )
+    assert traffic.cpu().tolist() == [[0, 2], [0, 0]]
+    assert compute.cpu().tolist() == [3, 2]
+
     unbalanced = torch.tensor([[10, 0], [10, 0]], device="cuda", dtype=torch.int64)
     initial = torch.tensor([[True, False], [True, False]], device="cuda")
     expert_demand = unbalanced.sum(dim=1)

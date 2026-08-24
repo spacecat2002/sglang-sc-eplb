@@ -999,13 +999,18 @@ def _capacity_export_replicas(
     if max_extra_per_rank == 0:
         return replicas, 0
     expert_demand = source_demand.sum(axis=1)
+    ideal_capacity = (int(expert_demand.sum()) + num_ranks - 1) // num_ranks
     added_by_rank = np.zeros(num_ranks, dtype=np.int64)
     added = 0
     while added < num_ranks * max_extra_per_rank:
         instance_quota, compute = _greedy_instance_quotas(
             expert_demand, replicas, num_ranks
         )
-        current_key = (int(compute.max(initial=0)), int(np.square(compute).sum()))
+        current_key = (
+            int(compute.max(initial=0)),
+            int(np.maximum(compute - ideal_capacity, 0).sum()),
+            int(np.square(compute).sum()),
+        )
         current_remote = _source_remote_bound(source_demand, instance_quota)
         best = None
         for expert, total in enumerate(expert_demand):
@@ -1023,11 +1028,17 @@ def _capacity_export_replicas(
                 next_compute = base + allocation
                 compute_key = (
                     int(next_compute.max(initial=0)),
+                    int(np.maximum(next_compute - ideal_capacity, 0).sum()),
                     int(np.square(next_compute).sum()),
                 )
                 # Capacity/export: only export from a currently overloaded
-                # plan, and retain the old strict improvement semantics.
-                if compute_key >= current_key:
+                # plan.  The overload term lets a copy that reaches the
+                # integer capacity unlock a later max-load improvement.
+                if compute_key[0] > current_key[0] or (
+                    compute_key[0] == current_key[0]
+                    and compute_key[1] >= current_key[1]
+                    and compute_key[2] >= current_key[2]
+                ):
                     continue
                 current_expert_remote = int(
                     total

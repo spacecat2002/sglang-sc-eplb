@@ -142,11 +142,13 @@ __global__ void source_quota_kernel(
 }
 
 __device__ bool better_candidate(
-    int64_t next_max, int64_t next_square, int64_t remote,
+    int64_t next_max, int64_t next_overload, int64_t next_square,
+    int64_t remote,
     int64_t local_demand, int64_t expert, int target, int64_t best_max,
-    int64_t best_square, int64_t best_remote, int64_t best_local_demand,
-    int64_t best_expert, int best_target) {
+    int64_t best_overload, int64_t best_square, int64_t best_remote,
+    int64_t best_local_demand, int64_t best_expert, int best_target) {
   if (next_max != best_max) return next_max < best_max;
+  if (next_overload != best_overload) return next_overload < best_overload;
   if (next_square != best_square) return next_square < best_square;
   if (remote != best_remote) return remote < best_remote;
   if (local_demand != best_local_demand) return local_demand > best_local_demand;
@@ -156,6 +158,7 @@ __device__ bool better_candidate(
 
 struct ComputeCandidate {
   int64_t next_max;
+  int64_t next_overload;
   int64_t next_square;
   int64_t remote;
   int64_t local_demand;
@@ -168,10 +171,10 @@ __device__ bool better_candidate(const ComputeCandidate& candidate,
   if (candidate.expert < 0) return false;
   if (best.expert < 0) return true;
   return better_candidate(
-      candidate.next_max, candidate.next_square, candidate.remote,
-      candidate.local_demand, candidate.expert, candidate.target,
-      best.next_max, best.next_square, best.remote, best.local_demand,
-      best.expert, best.target);
+      candidate.next_max, candidate.next_overload, candidate.next_square,
+      candidate.remote, candidate.local_demand, candidate.expert,
+      candidate.target, best.next_max, best.next_overload, best.next_square,
+      best.remote, best.local_demand, best.expert, best.target);
 }
 
 template <int MaxRanks>
@@ -185,6 +188,8 @@ __global__ __launch_bounds__(128, 1) void select_compute_replicas_kernel(
   constexpr int kThreads = 128;
   __shared__ ComputeCandidate candidates[kThreads];
   __shared__ int64_t current_max;
+  __shared__ int64_t ideal_capacity;
+  __shared__ int64_t current_overload;
   __shared__ int64_t current_square;
   __shared__ int64_t current_remote;
   __shared__ int64_t added;
@@ -206,33 +211,31 @@ __global__ __launch_bounds__(128, 1) void select_compute_replicas_kernel(
   while (added < ranks * max_extra_per_rank) {
     if (threadIdx.x == 0) {
       for (int rank = 0; rank < ranks; ++rank) loads[rank] = 0;
-      for (int64_t expert = 0; expert < experts; ++expert) {
+      // ``expert_order`` is already stable-partitioned as (fixed, flexible)
+      // by the caller.  Re-scanning it for both partitions doubled this hot
+      // loop without changing the result.
+      for (int64_t position = 0; position < experts; ++position) {
+        const int64_t expert = expert_order[position];
+        waterfill_fast<MaxRanks>(loads, replicas, expert, -1,
+                                 expert_demand[expert], allocation, ranks);
         for (int rank = 0; rank < ranks; ++rank) {
-          instance_quota[expert * ranks + rank] = 0;
-        }
-      }
-      // The Python key is (is_flexible, -demand, expert). Demand order is
-      // fixed, so only the two flexibility passes change after each addition.
-      for (int flexible = 0; flexible < 2; ++flexible) {
-        for (int64_t position = 0; position < experts; ++position) {
-          const int64_t expert = expert_order[position];
-          int replica_count = 0;
-          for (int rank = 0; rank < ranks; ++rank) {
-            replica_count += replicas[expert * ranks + rank];
-          }
-          if ((replica_count > 1) != flexible) continue;
-          waterfill_fast<MaxRanks>(loads, replicas, expert, -1,
-                                   expert_demand[expert], allocation, ranks);
-          for (int rank = 0; rank < ranks; ++rank) {
-            instance_quota[expert * ranks + rank] = allocation[rank];
-            loads[rank] += allocation[rank];
-          }
+          instance_quota[expert * ranks + rank] = allocation[rank];
+          loads[rank] += allocation[rank];
         }
       }
       current_max = 0;
       current_square = 0;
+      int64_t total = 0;
+      for (int64_t expert = 0; expert < experts; ++expert) {
+        total += expert_demand[expert];
+      }
+      ideal_capacity = (total + ranks - 1) / ranks;
+      current_overload = 0;
       for (int rank = 0; rank < ranks; ++rank) {
         current_max = max(current_max, loads[rank]);
+        current_overload += loads[rank] > ideal_capacity
+                                ? loads[rank] - ideal_capacity
+                                : 0;
         current_square += loads[rank] * loads[rank];
       }
       current_remote = 0;
@@ -248,7 +251,7 @@ __global__ __launch_bounds__(128, 1) void select_compute_replicas_kernel(
     }
     __syncthreads();
 
-    ComputeCandidate best = {0, 0, 0, 0, -1, -1};
+    ComputeCandidate best = {0, 0, 0, 0, 0, -1, -1};
     for (int64_t index = threadIdx.x; index < experts * ranks;
          index += blockDim.x) {
       const int64_t expert = index / ranks;
@@ -263,18 +266,22 @@ __global__ __launch_bounds__(128, 1) void select_compute_replicas_kernel(
       }
       waterfill_fast<MaxRanks>(base, replicas, expert, target, total, allocation,
                                ranks);
-      ComputeCandidate candidate = {0, 0, 0, demand[expert * ranks + target],
+      ComputeCandidate candidate = {0, 0, 0, 0, demand[expert * ranks + target],
                                     expert, target};
       int64_t local = 0;
       for (int rank = 0; rank < ranks; ++rank) {
         const int64_t next = base[rank] + allocation[rank];
         candidate.next_max = max(candidate.next_max, next);
+        candidate.next_overload += next > ideal_capacity
+                                      ? next - ideal_capacity
+                                      : 0;
         candidate.next_square += next * next;
         local += min(demand[expert * ranks + rank], allocation[rank]);
       }
       if (candidate.next_max > current_max ||
-           (candidate.next_max == current_max &&
-            candidate.next_square >= current_square)) {
+          (candidate.next_max == current_max &&
+           candidate.next_overload >= current_overload &&
+           candidate.next_square >= current_square)) {
         continue;
       }
       int64_t current_local = 0;
@@ -439,29 +446,37 @@ __global__ void fused_quota_kernel(
     for (int64_t index = 0; index < experts * ranks; ++index) total += demand[index];
     const int64_t capacity = static_cast<int64_t>(ceil(
         static_cast<double>(total) / ranks * imbalance_limit));
-    bool changed = true;
-    while (changed) {
-      changed = false;
-      for (int source = 0; source < ranks; ++source) {
-        int64_t room = capacity - loads[source];
-        for (int64_t index = 0; index < experts && room > 0; ++index) {
-          const int64_t expert = source_order[source * experts + index];
-          if (!replicas[expert * ranks + source]) continue;
-          for (int pass = 0; pass < ranks && room > 0; ++pass) {
-            const int primary_rank = primary[expert];
-            const int secondary = pass - 1;
-            const int target = pass == 0
-                                   ? primary_rank
-                                   : secondary + (secondary >= primary_rank);
-            if (target == source || !replicas[expert * ranks + target]) continue;
-            const int64_t offset = (source * experts + expert) * ranks;
-            const int64_t moved = min(room, quota[offset + target]);
-            quota[offset + target] -= moved;
-            quota[offset + source] += moved;
-            loads[target] -= moved;
-            loads[source] += moved;
-            room -= moved;
-            changed |= moved != 0;
+    bool needs_localize = false;
+    for (int rank = 0; rank < ranks; ++rank) {
+      needs_localize |= loads[rank] > capacity;
+    }
+    if (needs_localize) {
+      bool changed = true;
+      while (changed) {
+        changed = false;
+        for (int source = 0; source < ranks; ++source) {
+          int64_t room = capacity - loads[source];
+          for (int64_t index = 0; index < experts && room > 0; ++index) {
+            const int64_t expert = source_order[source * experts + index];
+            if (!replicas[expert * ranks + source]) continue;
+            for (int pass = 0; pass < ranks && room > 0; ++pass) {
+              const int primary_rank = primary[expert];
+              const int secondary = pass - 1;
+              const int target =
+                  pass == 0 ? primary_rank
+                            : secondary + (secondary >= primary_rank);
+              if (target == source || !replicas[expert * ranks + target]) {
+                continue;
+              }
+              const int64_t offset = (source * experts + expert) * ranks;
+              const int64_t moved = min(room, quota[offset + target]);
+              quota[offset + target] -= moved;
+              quota[offset + source] += moved;
+              loads[target] -= moved;
+              loads[source] += moved;
+              room -= moved;
+              changed |= moved != 0;
+            }
           }
         }
       }
@@ -559,6 +574,49 @@ __device__ int quota_destination(const int64_t* quota, const bool* replicas,
   return primary_rank;
 }
 
+__device__ int64_t quota_next_boundary(
+    const int64_t* quota, const bool* replicas, const int64_t* primary,
+    const int64_t* addition_order, int64_t ordinal, int64_t source,
+    int64_t expert, int64_t experts, int64_t ranks) {
+  const int64_t offset = (source * experts + expert) * ranks;
+  int64_t prefix = 0;
+  if (replicas[expert * ranks + source]) {
+    prefix += quota[offset + source];
+    if (prefix > ordinal) return prefix;
+  }
+  const int primary_rank = primary[expert];
+  if (primary_rank != source) {
+    prefix += quota[offset + primary_rank];
+    if (prefix > ordinal) return prefix;
+  }
+  for (int rank = 0; rank < ranks; ++rank) {
+    if (rank == source || rank == primary_rank ||
+        !replicas[expert * ranks + rank] ||
+        addition_order[expert * ranks + rank]) {
+      continue;
+    }
+    prefix += quota[offset + rank];
+    if (prefix > ordinal) return prefix;
+  }
+  int64_t last_order = 0;
+  while (true) {
+    int target = -1;
+    int64_t next_order = std::numeric_limits<int64_t>::max();
+    for (int rank = 0; rank < ranks; ++rank) {
+      const int64_t order = addition_order[expert * ranks + rank];
+      if (rank != source && order > last_order && order < next_order) {
+        target = rank;
+        next_order = order;
+      }
+    }
+    if (target < 0) break;
+    prefix += quota[offset + target];
+    if (prefix > ordinal) return prefix;
+    last_order = next_order;
+  }
+  return std::numeric_limits<int64_t>::max();
+}
+
 __global__ void quota_traffic_kernel(
     const int64_t* source, const int64_t* topk, const int64_t* count,
     const int64_t* quota, const bool* replicas, const int64_t* primary,
@@ -569,23 +627,40 @@ __global__ void quota_traffic_kernel(
   if (token >= tokens) return;
   const int64_t src = source[token];
   const int64_t weight = count[token];
-  unsigned long long seen_low = 0;
-  unsigned long long seen_high = 0;
-  for (int64_t col = 0; col < k; ++col) {
-    const int64_t index = token * k + col;
-    const int64_t expert = topk[index];
-    const int destination = quota_destination(
-        quota, replicas, primary, addition_order, ordinals[index], src, expert,
-        experts, ranks);
-    atomicAdd(reinterpret_cast<unsigned long long*>(compute + destination),
-              static_cast<unsigned long long>(weight));
-    const auto bit = 1ULL << (destination & 63);
-    auto& seen = destination < 64 ? seen_low : seen_high;
-    if (destination != src && !(seen & bit)) {
-      seen |= bit;
-      atomicAdd(reinterpret_cast<unsigned long long*>(traffic + src * ranks + destination),
-                static_cast<unsigned long long>(weight));
+  int64_t position = 0;
+  while (position < weight) {
+    int64_t next = weight;
+    for (int64_t col = 0; col < k; ++col) {
+      const int64_t index = token * k + col;
+      const int64_t boundary = quota_next_boundary(
+          quota, replicas, primary, addition_order, ordinals[index] + position,
+          src, topk[index], experts, ranks);
+      if (boundary > ordinals[index] + position &&
+          boundary - ordinals[index] < next) {
+        next = boundary - ordinals[index];
+      }
     }
+    if (next <= position) next = position + 1;
+    const int64_t segment = next - position;
+    unsigned long long seen_low = 0;
+    unsigned long long seen_high = 0;
+    for (int64_t col = 0; col < k; ++col) {
+      const int64_t index = token * k + col;
+      const int destination = quota_destination(
+          quota, replicas, primary, addition_order, ordinals[index] + position,
+          src, topk[index], experts, ranks);
+      atomicAdd(reinterpret_cast<unsigned long long*>(compute + destination),
+                static_cast<unsigned long long>(segment));
+      const auto bit = 1ULL << (destination & 63);
+      auto& seen = destination < 64 ? seen_low : seen_high;
+      if (destination != src && !(seen & bit)) {
+        seen |= bit;
+        atomicAdd(reinterpret_cast<unsigned long long*>(
+                      traffic + src * ranks + destination),
+                  static_cast<unsigned long long>(segment));
+      }
+    }
+    position = next;
   }
 }
 

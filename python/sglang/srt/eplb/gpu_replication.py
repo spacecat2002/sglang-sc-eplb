@@ -23,6 +23,9 @@ from .grace_plus_replication import (
 )
 
 
+_PENDING_CUDA_TIMING = "_pending_cuda_timing"
+
+
 def _phase_start(timing: dict[str, float] | None):
     if timing is None:
         return time.perf_counter()
@@ -36,11 +39,24 @@ def _record(timing: dict[str, float] | None, key: str, started: object) -> None:
         if isinstance(started, torch.cuda.Event):
             finished = torch.cuda.Event(enable_timing=True)
             finished.record()
-            finished.synchronize()
-            elapsed_ms = started.elapsed_time(finished)
+            timing.setdefault(_PENDING_CUDA_TIMING, []).append(
+                (key, started, finished)
+            )
+            return
         else:
             elapsed_ms = (time.perf_counter() - started) * 1000.0
         timing[key] = timing.get(key, 0.0) + elapsed_ms
+
+
+def _flush_cuda_timing(timing: dict[str, float] | None) -> None:
+    if not timing:
+        return
+    pending = timing.pop(_PENDING_CUDA_TIMING, ())
+    if not pending:
+        return
+    pending[-1][2].synchronize()
+    for key, started, finished in pending:
+        timing[key] = timing.get(key, 0.0) + started.elapsed_time(finished)
 
 
 def _cuda_arrays(
@@ -244,6 +260,26 @@ def _communication_quota_cuda(
     workspaces: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     ranks = demand.shape[1]
+    if budget_ratio == 1.0:
+        # The caller validates the exact traffic budget after route evaluation;
+        # one solve is enough because a failing candidate falls back to the
+        # default (baseline) routing instead of paying for four trial solves.
+        workspace = workspaces[0] if workspaces is not None else None
+        return _quota_cuda(
+            demand,
+            replica_mask,
+            primary,
+            routing,
+            compute_imbalance_limit,
+            expert_demand=expert_demand,
+            demand_order=demand_order,
+            source_order=source_order,
+            expert_order=expert_order,
+            quota_out=workspace[0] if workspace else None,
+            routing_out=workspace[1] if workspace else None,
+            instance_out=workspace[2] if workspace else None,
+            loads_out=workspace[3] if workspace else None,
+        )
     rank_ids = torch.arange(ranks, device=demand.device, dtype=torch.int64)
     source_ids = rank_ids[:, None]
     if demand_order is None:
@@ -498,6 +534,7 @@ def evaluate_replicated_placement_cuda(
     started = _phase_start(timing)
     metrics = _route_cuda(source, topk, count, primary, replica_mask, num_ranks)
     _record(timing, "cuda_route_eval_ms", started)
+    _flush_cuda_timing(timing)
     return metrics
 
 
@@ -552,7 +589,11 @@ def replicate_source_top_experts_cuda(
         raise ValueError("runtime rank count does not match num_ranks")
     if runtime is not None:
         primary_tensor = runtime._primary_tensor(primary)
-        primary_np = None
+        primary_np = (
+            np.asarray([primary[e] for e in range(num_experts)], dtype=np.int64)
+            if not isinstance(primary, torch.Tensor) and not materialize_quota
+            else None
+        )
     elif isinstance(primary, torch.Tensor):
         primary_tensor = primary.to(
             device=device, dtype=torch.int64, copy=False
@@ -631,6 +672,12 @@ def replicate_source_top_experts_cuda(
         expert_demand = demand.sum(dim=1)
         demand_order = torch.argsort(expert_demand, descending=True, stable=True)
         source_order = torch.argsort(demand.t(), dim=1, descending=True, stable=True)
+        flexible = replica_mask.sum(dim=1) > 1
+        expert_order = demand_order[
+            torch.argsort(flexible[demand_order].to(torch.int8), stable=True)
+        ]
+    else:
+        expert_demand = demand_order = source_order = expert_order = None
     bundle_ordinals = None
     if max_compute_extra_per_rank:
         if communication_budget_ratio is not None:
@@ -645,7 +692,7 @@ def replicate_source_top_experts_cuda(
                 demand,
                 replica_mask,
                 expert_demand,
-                demand_order,
+                expert_order,
                 max_compute_extra_per_rank,
             )
         else:
@@ -653,7 +700,7 @@ def replicate_source_top_experts_cuda(
                 demand,
                 replica_mask,
                 expert_demand,
-                demand_order,
+                expert_order,
                 max_compute_extra_per_rank,
                 runtime.compute_instance,
                 runtime.compute_loads,
@@ -685,6 +732,7 @@ def replicate_source_top_experts_cuda(
             expert_demand,
             demand_order,
             source_order,
+            expert_order=expert_order,
             quota_out=quota_out,
             routing_out=routing_out,
             instance_out=instance_out,
@@ -724,6 +772,7 @@ def replicate_source_top_experts_cuda(
             expert_demand,
             demand_order,
             source_order,
+            expert_order=expert_order,
             workspaces=runtime.candidate_workspaces if runtime is not None else None,
         )
         _record(timing, "quota_solve_ms", quota_started)
@@ -775,7 +824,7 @@ def replicate_source_top_experts_cuda(
                 metrics = safe_metrics
 
     replica_mask_np = replica_mask.cpu().numpy()
-    demand_np = demand.cpu().numpy()
+    demand_np = demand.cpu().numpy() if materialize_quota else None
     routing_np = routing_tensor.cpu().numpy()
     if primary_np is None:
         primary_np = primary_tensor.cpu().numpy()
@@ -825,4 +874,5 @@ def replicate_source_top_experts_cuda(
         quota_by_source=serialized_quota,
         source_demand=demand_np,
     )
+    _flush_cuda_timing(timing)
     return placement_result
