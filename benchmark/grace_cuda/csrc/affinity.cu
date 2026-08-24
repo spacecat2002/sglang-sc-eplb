@@ -418,64 +418,72 @@ __global__ void spectral_exact_groups_kernel(
   }
 }
 
-__global__ void group_affinity_kernel(const int64_t* affinity,
-                                      const int64_t* labels,
-                                      int64_t* group_affinity,
-                                      int64_t experts, int ranks) {
-  const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (index >= experts * ranks) return;
-  const int64_t expert = index / ranks;
-  const int group = index % ranks;
-  int64_t total = 0;
-  for (int64_t other = 0; other < experts; ++other)
-    if (labels[other] == group)
-      total += affinity[expert * experts + other];
-  group_affinity[index] = total;
-}
+__global__ void affinity_swaps_kernel(
+    const int64_t* affinity, int64_t* labels, int64_t* group_affinity,
+    int64_t* gains, int64_t experts, int ranks) {
+  if (blockIdx.x) return;
+  __shared__ int64_t best_gains[256];
+  __shared__ int64_t best_indices[256];
+  __shared__ int64_t selected;
+  for (int round = 0; round < 8; ++round) {
+    for (int64_t index = threadIdx.x; index < experts * ranks;
+         index += blockDim.x) {
+      const int64_t expert = index / ranks;
+      const int group = index % ranks;
+      int64_t total = 0;
+      for (int64_t other = 0; other < experts; ++other)
+        if (labels[other] == group)
+          total += affinity[expert * experts + other];
+      group_affinity[index] = total;
+    }
+    __syncthreads();
 
-__global__ void affinity_swap_candidates_kernel(
-    const int64_t* affinity, const int64_t* labels,
-    const int64_t* group_affinity, int64_t* gains, int64_t experts,
-    int ranks) {
-  const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (index >= experts * experts) return;
-  const int64_t left_expert = index / experts;
-  const int64_t right_expert = index % experts;
-  const int left = labels[left_expert];
-  const int right = labels[right_expert];
-  if (left >= right) {
-    gains[index] = LLONG_MIN;
-    return;
-  }
-  const int64_t pair = affinity[left_expert * experts + right_expert];
-  gains[index] = group_affinity[left_expert * ranks + right] - pair +
-                 group_affinity[right_expert * ranks + left] - pair -
-                 group_affinity[left_expert * ranks + left] -
-                 group_affinity[right_expert * ranks + right];
-}
-
-__global__ void apply_best_affinity_swap_kernel(const int64_t* gains,
-                                                int64_t* labels,
-                                                int64_t experts) {
-  if (blockIdx.x || threadIdx.x) return;
-  int64_t best_gain = 0;
-  int64_t best_left = -1;
-  int64_t best_right = -1;
-  for (int64_t left = 0; left < experts; ++left)
-    for (int64_t right = 0; right < experts; ++right) {
-      const int64_t gain = gains[left * experts + right];
+    int64_t best_gain = 0;
+    int64_t best_index = -1;
+    for (int64_t index = threadIdx.x; index < experts * experts;
+         index += blockDim.x) {
+      const int64_t left_expert = index / experts;
+      const int64_t right_expert = index % experts;
+      const int left = labels[left_expert];
+      const int right = labels[right_expert];
+      int64_t gain = LLONG_MIN;
+      if (left < right) {
+        const int64_t pair = affinity[index];
+        gain = group_affinity[left_expert * ranks + right] - pair +
+               group_affinity[right_expert * ranks + left] - pair -
+               group_affinity[left_expert * ranks + left] -
+               group_affinity[right_expert * ranks + right];
+      }
+      gains[index] = gain;
       if (gain > best_gain ||
-          (gain == best_gain && gain > 0 &&
-           (left > best_left || (left == best_left && right > best_right)))) {
+          (gain == best_gain && gain > 0 && index > best_index)) {
         best_gain = gain;
-        best_left = left;
-        best_right = right;
+        best_index = index;
       }
     }
-  if (best_left >= 0) {
-    const int64_t group = labels[best_left];
-    labels[best_left] = labels[best_right];
-    labels[best_right] = group;
+    best_gains[threadIdx.x] = best_gain;
+    best_indices[threadIdx.x] = best_index;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      for (int lane = 1; lane < blockDim.x; ++lane) {
+        if (best_gains[lane] > best_gain ||
+            (best_gains[lane] == best_gain && best_gains[lane] > 0 &&
+             best_indices[lane] > best_index)) {
+          best_gain = best_gains[lane];
+          best_index = best_indices[lane];
+        }
+      }
+      selected = best_index;
+      if (selected >= 0) {
+        const int64_t left = selected / experts;
+        const int64_t right = selected % experts;
+        const int64_t group = labels[left];
+        labels[left] = labels[right];
+        labels[right] = group;
+      }
+    }
+    __syncthreads();
+    if (selected < 0) break;
   }
 }
 
@@ -961,19 +969,10 @@ void spectral_groups_into(torch::Tensor embedding, torch::Tensor affinity,
          groups.data_ptr<int64_t>(),
          next_groups.data_ptr<int64_t>(), sizes.data_ptr<int64_t>(),
          overflow.data_ptr<int64_t>(), experts, ranks);
-  for (int round = 0; round < 8; ++round) {
-    launch(group_affinity_kernel, dim3((experts * ranks + 255) / 256),
-           dim3(256), stream.stream(), affinity.data_ptr<int64_t>(),
-           groups.data_ptr<int64_t>(), group_affinity.data_ptr<int64_t>(),
-           experts, ranks);
-    launch(affinity_swap_candidates_kernel,
-           dim3((experts * experts + 255) / 256), dim3(256), stream.stream(),
-           affinity.data_ptr<int64_t>(), groups.data_ptr<int64_t>(),
-           group_affinity.data_ptr<int64_t>(), swap_gains.data_ptr<int64_t>(),
-           experts, ranks);
-    launch(apply_best_affinity_swap_kernel, dim3(1), dim3(1), stream.stream(),
-           swap_gains.data_ptr<int64_t>(), groups.data_ptr<int64_t>(), experts);
-  }
+  launch(affinity_swaps_kernel, dim3(1), dim3(256), stream.stream(),
+         affinity.data_ptr<int64_t>(), groups.data_ptr<int64_t>(),
+         group_affinity.data_ptr<int64_t>(), swap_gains.data_ptr<int64_t>(),
+         experts, ranks);
   check_cuda(cudaGetLastError());
 }
 

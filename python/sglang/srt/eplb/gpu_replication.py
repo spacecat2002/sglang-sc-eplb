@@ -134,6 +134,10 @@ def _within_communication_budget(
     )
 
 
+def _within_compute_limit(metrics: ReplicaMetrics, limit: float | None) -> bool:
+    return limit is None or metrics.compute_imbalance <= limit + 1e-12
+
+
 def _quota_cuda(
     demand: torch.Tensor,
     replica_mask: torch.Tensor,
@@ -832,7 +836,7 @@ def replicate_source_top_experts_cuda(
         expert_demand = demand_order = source_order = expert_order = None
     bundle_ordinals = None
     if max_compute_extra_per_rank:
-        if communication_budget_ratio is not None:
+        if communication_budget_ratio is not None and not direct_export_quota:
             metrics_started = _phase_start(timing)
             budget_baseline = _route_cuda(
                 source, topk, count, primary_tensor, replica_mask, num_ranks
@@ -965,7 +969,9 @@ def replicate_source_top_experts_cuda(
         )
         _record(timing, "quota_allocation_ms", allocation_started)
 
-    if communication_budget_ratio is not None:
+    if communication_budget_ratio is not None and not _within_compute_limit(
+        metrics, compute_imbalance_limit
+    ):
         if budget_baseline is None:
             budget_baseline = _route_cuda(
                 source, topk, count, primary_tensor, replica_mask, num_ranks

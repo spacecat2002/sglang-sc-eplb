@@ -414,11 +414,12 @@ __global__ void select_compute_replicas_kernel(
   }
   __syncthreads();
   int64_t ignored = 0;
-  if (!build_export_plan<MaxRanks>(
+  const bool ideal_solved = build_export_plan<MaxRanks>(
           demand, primary, replicas, instance, loads, added_by_rank,
           addition_order, plan_quota, experts, ranks, max_extra_per_rank,
           bounds[0], false, &ignored, candidates, state, &shared_added,
-          rank_order, ingress)) {
+          rank_order, ingress);
+  if (!ideal_solved) {
     if (threadIdx.x == 0) ++bounds[0];
     __syncthreads();
     while (bounds[0] < bounds[1]) {
@@ -434,17 +435,19 @@ __global__ void select_compute_replicas_kernel(
       }
       __syncthreads();
     }
-  }
-  if (!build_export_plan<MaxRanks>(
-          demand, primary, replicas, instance, loads, added_by_rank,
-          addition_order, plan_quota, experts, ranks, max_extra_per_rank,
-          bounds[0], true, added_out, candidates, state, &shared_added,
-          rank_order, ingress)) {
-    build_export_plan<MaxRanks>(
+    if (!build_export_plan<MaxRanks>(
         demand, primary, replicas, instance, loads, added_by_rank,
         addition_order, plan_quota, experts, ranks, max_extra_per_rank,
-        bounds[0], false, added_out, candidates, state, &shared_added,
-        rank_order, ingress);
+        bounds[0], true, added_out, candidates, state, &shared_added,
+        rank_order, ingress)) {
+      build_export_plan<MaxRanks>(
+          demand, primary, replicas, instance, loads, added_by_rank,
+          addition_order, plan_quota, experts, ranks, max_extra_per_rank,
+          bounds[0], false, added_out, candidates, state, &shared_added,
+          rank_order, ingress);
+    }
+  } else if (threadIdx.x == 0) {
+    *added_out = ignored;
   }
   for (int64_t index = threadIdx.x; index < experts * ranks;
        index += blockDim.x) {
