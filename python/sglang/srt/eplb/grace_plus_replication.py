@@ -1308,19 +1308,7 @@ def _balance_replica_compute_hybrid(
         fallback_metrics = _route_quota(
             arrays, fallback_quota, source_demand, replicas
         )
-        before_key = (
-            max(metrics.compute_load, default=0),
-            int(np.square(metrics.compute_load).sum()),
-        )
-        fallback_key = (
-            max(fallback_metrics.compute_load, default=0),
-            int(np.square(fallback_metrics.compute_load).sum()),
-        )
-        # Keep the compute-first candidate when the safe route would worsen it.
-        if (
-            _communication_within_budget(fallback_metrics, communication_budgets)
-            and fallback_key <= before_key
-        ):
+        if _communication_within_budget(fallback_metrics, communication_budgets):
             quota, routing, metrics = (
                 fallback_quota,
                 fallback_routing,

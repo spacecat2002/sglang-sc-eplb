@@ -957,22 +957,8 @@ def replicate_source_top_experts_cuda(
             safe_metrics = _route_cuda(
                 source, topk, count, primary_tensor, replica_mask, num_ranks
             )
-            candidate_compute_key = (
-                max(metrics.compute_load, default=0),
-                sum(value * value for value in metrics.compute_load),
-            )
-            safe_compute_key = (
-                max(safe_metrics.compute_load, default=0),
-                sum(value * value for value in safe_metrics.compute_load),
-            )
-            # Communication is a soft tie-break after compute.  Do not undo a
-            # strictly better compute plan merely because its exact bundle
-            # traffic exceeds the budget.
-            if (
-                _within_communication_budget(
-                    safe_metrics, budget_baseline, communication_budget_ratio
-                )
-                and safe_compute_key <= candidate_compute_key
+            if _within_communication_budget(
+                safe_metrics, budget_baseline, communication_budget_ratio
             ):
                 routing_tensor = torch.where(
                     replica_mask.t(),
