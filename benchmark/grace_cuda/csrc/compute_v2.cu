@@ -77,6 +77,7 @@ struct CapacityCandidate {
   int target;
   int64_t expert;
   int64_t amount;
+  int64_t potential;
   int64_t penalty;
   int64_t gain;
   bool is_new;
@@ -89,10 +90,17 @@ __device__ bool better_capacity_candidate(
   if (candidate.expert < 0) return false;
   if (loads[candidate.over] != loads[current.over])
     return loads[candidate.over] > loads[current.over];
+  if (candidate.is_new != current.is_new)
+    return candidate.is_new < current.is_new;
+  if (candidate.potential != current.potential)
+    return candidate.potential > current.potential;
+  const int64_t candidate_scaled = candidate.penalty * current.amount;
+  const int64_t current_scaled = current.penalty * candidate.amount;
+  if (candidate_scaled != current_scaled)
+    return candidate_scaled < current_scaled;
   if (candidate.penalty != current.penalty)
     return candidate.penalty < current.penalty;
   if (candidate.gain != current.gain) return candidate.gain > current.gain;
-  if (candidate.is_new != current.is_new) return candidate.is_new < current.is_new;
   if (candidate.amount != current.amount) return candidate.amount > current.amount;
   if (candidate.source != current.source) return candidate.source < current.source;
   if (candidate.expert != current.expert) return candidate.expert < current.expert;
@@ -157,7 +165,7 @@ __global__ void capacity_v2_kernel(
   __syncthreads();
 
   while (true) {
-    CapacityCandidate best = {-1, -1, -1, -1, 0, LLONG_MAX, -1, true};
+    CapacityCandidate best = {-1, -1, -1, -1, 0, 0, LLONG_MAX, -1, true};
     const int64_t candidate_count = experts * ranks * ranks;
     for (int64_t index = tid; index < candidate_count; index += blockDim.x) {
       const int target = index % ranks;
@@ -167,9 +175,12 @@ __global__ void capacity_v2_kernel(
       const int64_t route_index = source * experts + expert;
       const int64_t offset = route_index * ranks;
       int over = -1;
+      int64_t potential = 0;
       for (int rank = 0; rank < ranks; ++rank) {
-        if (rank == target || loads[rank] <= capacity || !quota[offset + rank])
-          continue;
+        if (rank == target || loads[rank] <= capacity) continue;
+        potential += min(instance[expert * ranks + rank],
+                         loads[rank] - capacity);
+        if (!quota[offset + rank]) continue;
         if (over < 0 || loads[rank] > loads[over] ||
             (loads[rank] == loads[over] && quota[offset + rank] > quota[offset + over]))
           over = rank;
@@ -181,17 +192,24 @@ __global__ void capacity_v2_kernel(
       if (!present && added_by_rank[target] >= max_extra_per_rank) continue;
       const int64_t amount = min(
           min(loads[over] - capacity, capacity - loads[target]), available);
-      int64_t penalty = amount;
+      const int64_t headroom = capacity - loads[target];
+      potential = min(potential, headroom);
+      const int original = replicas[expert * ranks + source]
+                               ? source
+                               : primary[expert];
       const int64_t gain =
-          min(amount, bundle_gain[expert * ranks + source]);
+          over == original && amount == available
+              ? min(amount, bundle_gain[expert * ranks + source])
+              : 0;
       const int64_t covered =
           target == source
               ? amount
               : min(amount,
                     bundle_cover[(source * experts + expert) * ranks + target]);
-      penalty = amount - covered - gain;
+      const int64_t penalty = amount - covered - gain;
       CapacityCandidate candidate = {
-          source, over, target, expert, amount, penalty, gain, !present};
+          source, over, target, expert, amount, potential, penalty, gain,
+          !present};
       if (better_capacity_candidate(candidate, best, loads)) best = candidate;
     }
     candidates[tid] = best;

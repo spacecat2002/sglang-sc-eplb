@@ -417,6 +417,36 @@ def test_kernels() -> None:
     assert v2_loads.cpu().tolist() == [10, 10]
     assert torch.equal(v2_quota.sum(dim=2), v2_demand.t())
 
+    # A scarce replica slot must go to the expert that can remove the
+    # overload, even when a tiny candidate has a better communication score.
+    slot_demand = torch.tensor(
+        [[0, 1], [100, 0]], device="cuda", dtype=torch.int64
+    )
+    slot_replicas = torch.tensor(
+        [[True, False], [True, False]], device="cuda", dtype=torch.bool
+    )
+    slot_loads = torch.empty(2, device="cuda", dtype=torch.int64)
+    slot_quota = torch.empty((2, 2, 2), device="cuda", dtype=torch.int64)
+    _C.select_compute_replicas_v2_into(
+        slot_demand,
+        torch.tensor([[0, 1], [0, 0]], device="cuda", dtype=torch.int64),
+        torch.zeros((2, 2, 2), device="cuda", dtype=torch.int64),
+        slot_replicas,
+        torch.tensor([0, 0], device="cuda"),
+        1,
+        1.0,
+        torch.empty_like(slot_demand),
+        slot_loads,
+        torch.empty_like(slot_loads),
+        torch.empty_like(slot_demand),
+        slot_quota,
+        torch.empty((2, 2), device="cuda", dtype=torch.int64),
+        torch.empty(1, device="cuda", dtype=torch.int64),
+    )
+    assert slot_replicas.cpu().tolist() == [[True, False], [True, True]]
+    assert slot_loads.cpu().tolist() == [51, 50]
+    assert torch.equal(slot_quota.sum(dim=2), slot_demand.t())
+
     # A requested 1.0x limit must actually localize quota from an overloaded
     # rank when the replica set can serve the other rank.
     limit_demand = torch.tensor(
