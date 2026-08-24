@@ -12,6 +12,7 @@ namespace {
 __global__ void current_bundle_gain_kernel(
     const int64_t* source, const int64_t* topk, const int64_t* count,
     const int64_t* primary, const bool* replicas, int64_t* gains,
+    int64_t* covers, int64_t experts,
     int64_t tokens, int64_t k, int64_t ranks) {
   const int64_t token = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (token >= tokens) return;
@@ -40,6 +41,33 @@ __global__ void current_bundle_gain_kernel(
       atomicAdd(reinterpret_cast<unsigned long long*>(
                     gains + expert * ranks + src),
                 static_cast<unsigned long long>(count[token]));
+    unsigned long long covered_low = seen_low;
+    unsigned long long covered_high = seen_high;
+    if (src < 64)
+      covered_low &= ~(1ULL << src);
+    else
+      covered_high &= ~(1ULL << (src & 63));
+    if (!(duplicate & bit)) {
+      if (destination < 64)
+        covered_low &= ~bit;
+      else
+        covered_high &= ~bit;
+    }
+    while (covered_low) {
+      const int target = __ffsll(static_cast<long long>(covered_low)) - 1;
+      atomicAdd(reinterpret_cast<unsigned long long*>(
+                    covers + (src * experts + expert) * ranks + target),
+                static_cast<unsigned long long>(count[token]));
+      covered_low &= covered_low - 1;
+    }
+    while (covered_high) {
+      const int target =
+          64 + __ffsll(static_cast<long long>(covered_high)) - 1;
+      atomicAdd(reinterpret_cast<unsigned long long*>(
+                    covers + (src * experts + expert) * ranks + target),
+                static_cast<unsigned long long>(count[token]));
+      covered_high &= covered_high - 1;
+    }
   }
 }
 
@@ -74,6 +102,7 @@ __device__ bool better_capacity_candidate(
 
 __global__ void capacity_v2_kernel(
     const int64_t* demand, const int64_t* bundle_gain,
+    const int64_t* bundle_cover,
     const int64_t* primary, bool* replicas,
     int64_t* instance, int64_t* loads, int64_t* added_by_rank,
     int64_t* addition_order, int64_t* quota, int64_t* routing,
@@ -136,26 +165,31 @@ __global__ void capacity_v2_kernel(
       const int64_t expert = pair % experts;
       const int source = pair / experts;
       const int64_t route_index = source * experts + expert;
-      const int over = routing[route_index];
-      if (target == over || loads[over] <= capacity || loads[target] >= capacity)
-        continue;
       const int64_t offset = route_index * ranks;
+      int over = -1;
+      for (int rank = 0; rank < ranks; ++rank) {
+        if (rank == target || loads[rank] <= capacity || !quota[offset + rank])
+          continue;
+        if (over < 0 || loads[rank] > loads[over] ||
+            (loads[rank] == loads[over] && quota[offset + rank] > quota[offset + over]))
+          over = rank;
+      }
+      if (over < 0 || loads[target] >= capacity) continue;
       const int64_t available = quota[offset + over];
-      if (!available) continue;
       const bool present = replicas[expert * ranks + target] ||
                            addition_order[expert * ranks + target];
       if (!present && added_by_rank[target] >= max_extra_per_rank) continue;
       const int64_t amount = min(
           min(loads[over] - capacity, capacity - loads[target]), available);
       int64_t penalty = amount;
-      int64_t gain = 0;
-      if (target == source) {
-        gain = min(amount, bundle_gain[expert * ranks + source]);
-        penalty = -gain;
-      } else if (over != source) {
-        // Remote-to-remote moves can split an existing Top-K destination.
-        penalty = amount;
-      }
+      const int64_t gain =
+          min(amount, bundle_gain[expert * ranks + source]);
+      const int64_t covered =
+          target == source
+              ? amount
+              : min(amount,
+                    bundle_cover[(source * experts + expert) * ranks + target]);
+      penalty = amount - covered - gain;
       CapacityCandidate candidate = {
           source, over, target, expert, amount, penalty, gain, !present};
       if (better_capacity_candidate(candidate, best, loads)) best = candidate;
@@ -201,47 +235,57 @@ __global__ void capacity_v2_kernel(
 
 void current_bundle_gains_into(
     torch::Tensor source, torch::Tensor topk, torch::Tensor count,
-    torch::Tensor primary, torch::Tensor replicas, torch::Tensor gains) {
+    torch::Tensor primary, torch::Tensor replicas, torch::Tensor gains,
+    torch::Tensor covers) {
   TORCH_CHECK(source.is_cuda() && topk.is_cuda() && count.is_cuda() &&
-              primary.is_cuda() && replicas.is_cuda() && gains.is_cuda());
+              primary.is_cuda() && replicas.is_cuda() && gains.is_cuda() &&
+              covers.is_cuda());
   TORCH_CHECK(source.scalar_type() == torch::kInt64 &&
               topk.scalar_type() == torch::kInt64 &&
               count.scalar_type() == torch::kInt64 &&
               primary.scalar_type() == torch::kInt64 &&
               replicas.scalar_type() == torch::kBool &&
-              gains.scalar_type() == torch::kInt64);
+              gains.scalar_type() == torch::kInt64 &&
+              covers.scalar_type() == torch::kInt64);
   TORCH_CHECK(source.dim() == 1 && topk.dim() == 2 && count.dim() == 1 &&
               source.size(0) == topk.size(0) && source.size(0) == count.size(0));
   TORCH_CHECK(replicas.sizes() == gains.sizes() &&
               replicas.size(0) == primary.numel());
+  TORCH_CHECK(covers.dim() == 3 && covers.size(0) == gains.size(1) &&
+              covers.size(1) == gains.size(0) &&
+              covers.size(2) == gains.size(1));
   TORCH_CHECK(gains.size(1) <= 128,
               "bundle gain supports at most 128 ranks");
   gains.zero_();
+  covers.zero_();
   auto stream = c10::cuda::getCurrentCUDAStream(source.get_device());
   launch(current_bundle_gain_kernel,
          dim3((source.size(0) + 255) / 256), dim3(256), stream.stream(),
          source.data_ptr<int64_t>(), topk.data_ptr<int64_t>(),
          count.data_ptr<int64_t>(), primary.data_ptr<int64_t>(),
-         replicas.data_ptr<bool>(), gains.data_ptr<int64_t>(), source.size(0),
+         replicas.data_ptr<bool>(), gains.data_ptr<int64_t>(),
+         covers.data_ptr<int64_t>(), gains.size(0), source.size(0),
          topk.size(1), gains.size(1));
   check_cuda(cudaGetLastError());
 }
 
 void select_compute_replicas_v2_into(
     torch::Tensor demand, torch::Tensor bundle_gain,
+    torch::Tensor bundle_cover,
     torch::Tensor replicas, torch::Tensor primary,
     int64_t max_extra_per_rank, double imbalance_limit,
     torch::Tensor instance, torch::Tensor loads,
     torch::Tensor added_by_rank, torch::Tensor addition_order,
     torch::Tensor quota, torch::Tensor routing, torch::Tensor added) {
-  TORCH_CHECK(demand.is_cuda() && bundle_gain.is_cuda() && replicas.is_cuda() &&
-              primary.is_cuda());
+  TORCH_CHECK(demand.is_cuda() && bundle_gain.is_cuda() &&
+              bundle_cover.is_cuda() && replicas.is_cuda() && primary.is_cuda());
   TORCH_CHECK(demand.scalar_type() == torch::kInt64 &&
               replicas.scalar_type() == torch::kBool &&
               primary.scalar_type() == torch::kInt64 &&
               demand.sizes() == replicas.sizes() &&
               bundle_gain.scalar_type() == torch::kInt64 &&
-              bundle_gain.sizes() == demand.sizes());
+              bundle_gain.sizes() == demand.sizes() &&
+              bundle_cover.scalar_type() == torch::kInt64);
   const int64_t experts = demand.size(0);
   const int64_t ranks = demand.size(1);
   TORCH_CHECK(ranks > 0 && ranks <= 128 && max_extra_per_rank >= 0);
@@ -250,11 +294,13 @@ void select_compute_replicas_v2_into(
               addition_order.sizes() == demand.sizes() && added.numel() == 1);
   TORCH_CHECK(quota.dim() == 3 && quota.size(0) == ranks &&
               quota.size(1) == experts && quota.size(2) == ranks);
+  TORCH_CHECK(bundle_cover.sizes() == quota.sizes());
   TORCH_CHECK(routing.dim() == 2 && routing.size(0) == ranks &&
               routing.size(1) == experts);
   auto stream = c10::cuda::getCurrentCUDAStream(demand.get_device());
   launch(capacity_v2_kernel, dim3(1), dim3(256), stream.stream(),
          demand.data_ptr<int64_t>(), bundle_gain.data_ptr<int64_t>(),
+         bundle_cover.data_ptr<int64_t>(),
          primary.data_ptr<int64_t>(),
          replicas.data_ptr<bool>(), instance.data_ptr<int64_t>(),
          loads.data_ptr<int64_t>(), added_by_rank.data_ptr<int64_t>(),

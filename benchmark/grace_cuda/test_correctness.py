@@ -238,6 +238,7 @@ def test_kernels() -> None:
     )
     assert shared_replicas.cpu().tolist() == [[False, True], [False, True]]
     shared_gains = torch.empty((2, 2), device="cuda", dtype=torch.int64)
+    shared_covers = torch.empty((2, 2, 2), device="cuda", dtype=torch.int64)
     _C.current_bundle_gains_into(
         shared_source,
         shared_topk,
@@ -245,8 +246,10 @@ def test_kernels() -> None:
         shared_primary,
         torch.tensor([[False, True], [False, True]], device="cuda"),
         shared_gains,
+        shared_covers,
     )
     assert shared_gains.cpu().tolist() == [[0, 0], [0, 0]]
+    assert shared_covers[0].cpu().tolist() == [[0, 10], [0, 10]]
 
     traffic, compute = _C.traffic(source, topk, count, primary, replicas, 2)
     assert traffic.cpu().tolist() == [[0, 5], [3, 0]]
@@ -382,7 +385,7 @@ def test_kernels() -> None:
     assert into_quota.sum(dim=(0, 1)).cpu().tolist() == [10, 10]
     assert torch.equal(into_quota.sum(dim=2), unbalanced.t())
 
-    v2_demand = torch.tensor([[5, 5], [5, 5]], device="cuda", dtype=torch.int64)
+    v2_demand = torch.tensor([[0, 10], [0, 10]], device="cuda", dtype=torch.int64)
     v2_replicas = initial.clone()
     v2_instance = torch.empty_like(v2_demand)
     v2_loads = torch.empty((2,), device="cuda", dtype=torch.int64)
@@ -393,7 +396,8 @@ def test_kernels() -> None:
     v2_added = torch.empty((1,), device="cuda", dtype=torch.int64)
     _C.select_compute_replicas_v2_into(
         v2_demand,
-        torch.tensor([[0, 0], [0, 5]], device="cuda", dtype=torch.int64),
+        torch.tensor([[0, 0], [0, 10]], device="cuda", dtype=torch.int64),
+        torch.zeros((2, 2, 2), device="cuda", dtype=torch.int64),
         v2_replicas,
         torch.tensor([0, 0], device="cuda"),
         1,
@@ -410,6 +414,7 @@ def test_kernels() -> None:
     assert v2_added.item() == 1
     assert v2_order.cpu().tolist() == [[0, 0], [0, 1]]
     assert v2_quota.sum(dim=(0, 1)).cpu().tolist() == [10, 10]
+    assert v2_loads.cpu().tolist() == [10, 10]
     assert torch.equal(v2_quota.sum(dim=2), v2_demand.t())
 
     # A requested 1.0x limit must actually localize quota from an overloaded

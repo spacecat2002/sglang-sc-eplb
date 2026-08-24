@@ -859,10 +859,12 @@ def replicate_source_top_experts_cuda(
                 primary_tensor,
                 replica_mask,
                 runtime.replica_gains,
+                runtime.candidate_workspaces[0][0],
             )
             _C.select_compute_replicas_v2_into(
                 demand,
                 runtime.replica_gains,
+                runtime.candidate_workspaces[0][0],
                 replica_mask,
                 primary_tensor,
                 max_compute_extra_per_rank,

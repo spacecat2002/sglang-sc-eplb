@@ -62,11 +62,13 @@ void select_compute_replicas_into(
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
     torch::Tensor, torch::Tensor);
 void select_compute_replicas_v2_into(
-    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t, double,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    int64_t, double,
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
     torch::Tensor, torch::Tensor);
 void current_bundle_gains_into(torch::Tensor, torch::Tensor, torch::Tensor,
-                               torch::Tensor, torch::Tensor, torch::Tensor);
+                               torch::Tensor, torch::Tensor, torch::Tensor,
+                               torch::Tensor);
 }  // namespace grace_cuda
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
