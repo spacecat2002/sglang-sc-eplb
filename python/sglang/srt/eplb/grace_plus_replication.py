@@ -13,7 +13,6 @@ from .expert_affinity_graph import RoutedArrays, RoutedToken, as_routed_arrays
 
 
 _CHUNK_SIZE = 200_000
-_MAX_BUDGET_ALTERNATIVE_CANDIDATES = 4
 
 
 def _record_timing(timing: dict[str, float] | None, name: str, started: float) -> None:
@@ -885,6 +884,17 @@ def _quota_summary(quota: np.ndarray) -> ReplicaMetrics:
     )
 
 
+def _source_remote_bound(
+    source_demand: np.ndarray, instance_quota: np.ndarray
+) -> int:
+    """Cheap source-aware remote bound used while scoring replica exports."""
+
+    # ponytail: this is an O(E*R) lower bound; exact bundle traffic is evaluated
+    # once after the candidate set is fixed instead of for every candidate.
+    local = np.minimum(source_demand, instance_quota)
+    return int(source_demand.sum() - local.sum())
+
+
 def _fast_communication_quota(
     source_demand: np.ndarray,
     replicas: Mapping[int, Sequence[int]],
@@ -936,20 +946,23 @@ def _communication_aware_quotas(
             rank_cost,
         )
         summary = _quota_summary(quota)
-        violation = max(
-            (summary.remote / budgets[0]) if budgets[0] else float(summary.remote),
-            (summary.max_pair_traffic / budgets[1])
-            if budgets[1]
-            else float(summary.max_pair_traffic),
-            (summary.max_ingress / budgets[2])
-            if budgets[2]
-            else float(summary.max_ingress),
-            (summary.max_egress / budgets[3])
-            if budgets[3]
-            else float(summary.max_egress),
+        excess = tuple(
+            max(0, value - budget)
+            for value, budget in zip(
+                (
+                    summary.remote,
+                    summary.max_pair_traffic,
+                    summary.max_ingress,
+                    summary.max_egress,
+                ),
+                budgets,
+            )
         )
         key = (
-            violation,
+            sum(value > 0 for value in excess),
+            sum(excess),
+            max(excess),
+            *excess,
             max(summary.compute_load, default=0),
             int(np.square(summary.compute_load).sum()),
             summary.remote,
@@ -963,6 +976,177 @@ def _communication_aware_quotas(
     assert best is not None
     quota = best[1]
     return quota, _route_quota(arrays, quota, source_demand, replicas)
+
+
+def _capacity_export_replicas(
+    source_demand: np.ndarray,
+    replicas: dict[int, tuple[int, ...]],
+    *,
+    num_ranks: int,
+    max_extra_per_rank: int,
+    communication_budgets: tuple[int, int, int, int] | None = None,
+) -> tuple[dict[int, tuple[int, ...]], int]:
+    """Add source-aware capacity exports with a communication tie-break.
+
+    A candidate is evaluated by waterfilling only the affected expert.  The
+    source-demand remote bound is a secondary objective (and budget violation
+    penalty), while compute improvement remains primary.  Exact bundle routing
+    remains the final authority.
+    """
+
+    if max_extra_per_rank == 0:
+        return replicas, 0
+    expert_demand = source_demand.sum(axis=1)
+    added_by_rank = np.zeros(num_ranks, dtype=np.int64)
+    added = 0
+    while added < num_ranks * max_extra_per_rank:
+        instance_quota, compute = _greedy_instance_quotas(
+            expert_demand, replicas, num_ranks
+        )
+        current_key = (int(compute.max(initial=0)), int(np.square(compute).sum()))
+        current_remote = _source_remote_bound(source_demand, instance_quota)
+        best = None
+        for expert, total in enumerate(expert_demand):
+            if not total:
+                continue
+            base = compute - instance_quota[expert]
+            for target in range(num_ranks):
+                if target in replicas[expert] or (
+                    added_by_rank[target] >= max_extra_per_rank
+                ):
+                    continue
+                if compute[target] >= current_key[0]:
+                    continue
+                allocation = _waterfill(
+                    base, replicas[expert] + (target,), int(total)
+                )
+                next_compute = base + allocation
+                compute_key = (
+                    int(next_compute.max(initial=0)),
+                    int(np.square(next_compute).sum()),
+                )
+                # Capacity/export: only export from a currently overloaded
+                # plan, and retain the old strict improvement semantics.
+                if compute_key >= current_key:
+                    continue
+                current_expert_remote = int(
+                    total
+                    - np.minimum(source_demand[expert], instance_quota[expert]).sum()
+                )
+                next_expert_remote = int(
+                    total
+                    - np.minimum(source_demand[expert], allocation).sum()
+                )
+                next_remote = (
+                    current_remote - current_expert_remote + next_expert_remote
+                )
+                budget_violation = (
+                    max(0, next_remote - communication_budgets[0])
+                    if communication_budgets is not None
+                    else 0
+                )
+                candidate = (
+                    compute_key
+                    + (
+                        budget_violation,
+                        next_remote,
+                        -int(source_demand[expert, target]),
+                        int(expert),
+                        int(target),
+                    ),
+                    int(expert),
+                    int(target),
+                )
+                if best is None or candidate[0] < best[0]:
+                    best = candidate
+        if best is None:
+            break
+        _, expert, target = best
+        replicas[expert] += (target,)
+        added_by_rank[target] += 1
+        added += 1
+    return replicas, added
+
+
+def _balance_replica_compute_hybrid(
+    arrays: RoutedArrays,
+    placement: ReplicaPlacement,
+    *,
+    num_ranks: int,
+    max_extra_per_rank: int,
+    communication_budgets: tuple[int, int, int, int] | None,
+    timing: dict[str, float] | None,
+) -> ReplicaPlacement:
+    replicas, primary, replica_mask = _replica_arrays(
+        arrays, placement.replicas_by_expert, num_ranks
+    )
+    source_demand = placement.source_demand
+    if source_demand is None:
+        source_demand = _source_demand(arrays, len(primary), num_ranks)
+    replicas, balance_copies = _capacity_export_replicas(
+        source_demand,
+        replicas,
+        num_ranks=num_ranks,
+        max_extra_per_rank=max_extra_per_rank,
+        communication_budgets=communication_budgets,
+    )
+    replicas, primary, replica_mask = _replica_arrays(arrays, replicas, num_ranks)
+    routing = _default_routing(primary, replica_mask, num_ranks)
+    quota_started = time.perf_counter()
+    if communication_budgets is None:
+        quota, routing = _fast_communication_quota(
+            source_demand, replicas, routing, None
+        )
+    else:
+        quota, _ = _communication_aware_quotas(
+            arrays,
+            source_demand,
+            replicas,
+            routing,
+            communication_budgets,
+        )
+    _record_timing(timing, "quota_solve_ms", quota_started)
+    routing = np.where(quota.sum(axis=2) > 0, quota.argmax(axis=2), routing)
+    allocation_started = time.perf_counter()
+    metrics = _route_quota(arrays, quota, source_demand, replicas)
+    _record_timing(timing, "quota_allocation_ms", allocation_started)
+
+    if communication_budgets is not None and balance_copies:
+        before_key = (
+            max(placement.metrics.compute_load, default=0),
+            int(np.square(placement.metrics.compute_load).sum()),
+        )
+        after_key = (
+            max(metrics.compute_load, default=0),
+            int(np.square(metrics.compute_load).sum()),
+        )
+        if after_key >= before_key:
+            return placement
+
+    if communication_budgets is not None and not _communication_within_budget(
+        metrics, communication_budgets
+    ):
+        fallback_routing = _default_routing(primary, replica_mask, num_ranks)
+        fallback_quota = _routing_quota(source_demand, fallback_routing)
+        fallback_metrics = _route_quota(
+            arrays, fallback_quota, source_demand, replicas
+        )
+        if _communication_within_budget(fallback_metrics, communication_budgets):
+            quota, routing, metrics = (
+                fallback_quota,
+                fallback_routing,
+                fallback_metrics,
+            )
+    return _placement_from_quota(
+        replicas,
+        routing,
+        quota,
+        metrics,
+        source_demand=source_demand,
+        num_ranks=num_ranks,
+        extra_copies=placement.extra_copies,
+        balance_copies=balance_copies,
+    )
 
 
 def _gains_and_traffic(
@@ -1189,7 +1373,7 @@ def balance_replica_compute(
     communication_budget_ratio: float | None = None,
     timing: dict[str, float] | None = None,
 ) -> ReplicaPlacement:
-    """Quickly balance source-expert demand with communication constraints."""
+    """Balance source-expert demand with a source-aware communication tie-break."""
 
     if max_extra_per_rank < 0:
         raise ValueError("invalid balance replication limits")
@@ -1199,354 +1383,16 @@ def balance_replica_compute(
     ):
         raise ValueError("invalid communication budget ratio")
     arrays = as_routed_arrays(tokens)
-    replicas, primary, replica_mask = _replica_arrays(
-        arrays, placement.replicas_by_expert, num_ranks
-    )
-    routing = np.asarray(placement.routing_by_source, dtype=np.intp).copy()
-    source_demand = placement.source_demand
-    if source_demand is None:
-        source_demand = _source_demand(arrays, len(primary), num_ranks)
     communication_budgets = None
     if communication_budget_ratio is not None:
         communication_budgets = _communication_budget(
             placement.metrics, communication_budget_ratio
         )
-    expert_demand = source_demand.sum(axis=1)
-    remote_demand = source_demand.copy()
-    remote_demand[routing.T == np.arange(num_ranks)] = 0
-    remote_sources = np.argsort(-remote_demand, axis=1, kind="stable")
-    expert_order = np.argsort(-expert_demand, kind="stable")
-    balance_by_rank = np.zeros(num_ranks, dtype=np.int64)
-    added = 0
-    if communication_budgets is not None:
-        # Keep the compute-selected replica set and optimize only its quota.
-        unconstrained = balance_replica_compute(
-            arrays,
-            placement,
-            num_ranks=num_ranks,
-            max_extra_per_rank=max_extra_per_rank,
-            communication_budget_ratio=None,
-            timing=timing,
-        )
-        working = unconstrained.replicas_by_expert
-        working_routing = np.asarray(
-            unconstrained.routing_by_source, dtype=np.intp
-        )
-        quota_started = time.perf_counter()
-        working_quota, working_metrics = _communication_aware_quotas(
-            arrays,
-            source_demand,
-            working,
-            working_routing,
-            communication_budgets,
-        )
-        _record_timing(timing, "quota_solve_ms", quota_started)
-        working_routing = np.where(
-            working_quota.sum(axis=2) > 0,
-            working_quota.argmax(axis=2),
-            working_routing,
-        )
-        balance_copies = sum(
-            max(
-                0,
-                len(working[expert])
-                - len(placement.replicas_by_expert[expert]),
-            )
-            for expert in working
-        )
-        return _placement_from_quota(
-            working,
-            working_routing,
-            working_quota,
-            working_metrics,
-            source_demand=source_demand,
-            num_ranks=num_ranks,
-            extra_copies=placement.extra_copies,
-            balance_copies=balance_copies,
-        )
-
-        # Legacy pruning path retained below for reference.
-        # First solve the inexpensive compute-only problem once.  Communication
-        # constraints are applied by pruning added replicas afterwards; this
-        # avoids an exact trace scan for every expert/rank candidate.
-        unconstrained = balance_replica_compute(
-            arrays,
-            placement,
-            num_ranks=num_ranks,
-            max_extra_per_rank=max_extra_per_rank,
-            communication_budget_ratio=None,
-        )
-        if _communication_within_budget(unconstrained.metrics, communication_budgets):
-            return unconstrained
-
-        original = {
-            expert: tuple(ranks)
-            for expert, ranks in placement.replicas_by_expert.items()
-        }
-        working = {
-            expert: tuple(ranks)
-            for expert, ranks in unconstrained.replicas_by_expert.items()
-        }
-        working_routing = np.asarray(
-            unconstrained.routing_by_source, dtype=np.intp
-        )
-        working_quota = _joint_quotas(source_demand, working, working_routing)
-        working_metrics = unconstrained.metrics
-        prune_steps = 0
-        while any(len(working[e]) > len(original[e]) for e in working):
-            removals = []
-            for expert, ranks in working.items():
-                for target in ranks[len(original[expert]) :]:
-                    candidate_replicas = dict(working)
-                    candidate_replicas[expert] = tuple(
-                        rank for rank in ranks if rank != target
-                    )
-                    candidate_quota = _joint_quotas(
-                        source_demand, candidate_replicas, working_routing
-                    )
-                    summary = _quota_summary(candidate_quota)
-                    compute_key = (
-                        max(summary.compute_load, default=0),
-                        int(np.square(summary.compute_load).sum()),
-                    )
-                    removals.append(
-                        (
-                            compute_key,
-                            summary.remote,
-                            int(expert),
-                            int(target),
-                            candidate_quota,
-                        )
-                    )
-            if not removals:
-                break
-            _, _, expert, target, candidate_quota = min(removals)
-            working[expert] = tuple(
-                rank for rank in working[expert] if rank != target
-            )
-            working_quota = candidate_quota
-            working_routing = np.where(
-                working_quota.sum(axis=2) > 0,
-                working_quota.argmax(axis=2),
-                working_routing,
-            )
-            # Exact trace evaluation is deferred until the cheap pruning pass
-            # has removed enough replicas to make a feasible plan plausible.
-            working_metrics = _quota_summary(working_quota)
-            prune_steps += 1
-            if prune_steps % 16 == 0:
-                exact = _quota_for_replicas(
-                    arrays,
-                    source_demand,
-                    working,
-                    working_routing,
-                    communication_budgets,
-                    timing,
-                )
-                if exact is not None and _communication_within_budget(
-                    exact[1], communication_budgets
-                ):
-                    working_quota, working_metrics = exact
-                    break
-        final = _quota_for_replicas(
-            arrays,
-            source_demand,
-            working,
-            working_routing,
-            communication_budgets,
-            timing,
-        )
-        if final is not None:
-            working_quota, working_metrics = final
-            working_routing = np.where(
-                working_quota.sum(axis=2) > 0,
-                working_quota.argmax(axis=2),
-                working_routing,
-            )
-        else:
-            working_quota = _joint_quotas(
-                source_demand, working, working_routing
-            )
-            working_metrics = _route_quota(
-                arrays, working_quota, source_demand, working
-            )
-        balance_copies = sum(
-            max(0, len(working[expert]) - len(original[expert])) for expert in working
-        )
-        if balance_copies == 0 and max_extra_per_rank:
-            # The unconstrained greedy solution can choose a high-traffic copy
-            # and then be fully pruned.  Try a few cheap compute-ranked
-            # alternatives so a feasible lower-traffic copy is not missed.
-            base_quota = _joint_quotas(source_demand, working, working_routing)
-            base_compute = base_quota.sum(axis=(0, 1), dtype=np.int64)
-            alternatives = []
-            for expert in expert_order:
-                for target in range(num_ranks):
-                    if target in working[expert]:
-                        continue
-                    allocation = _waterfill(
-                        base_compute - base_quota[:, expert, :].sum(axis=0),
-                        working[expert] + (target,),
-                        int(expert_demand[expert]),
-                    )
-                    next_compute = (
-                        base_compute
-                        - base_quota[:, expert, :].sum(axis=0)
-                        + allocation
-                    )
-                    alternatives.append(
-                        (
-                            int(next_compute.max()),
-                            int(np.square(next_compute).sum()),
-                            int(expert),
-                            target,
-                        )
-                    )
-            best_alternative = None
-            for _, _, expert, target in sorted(alternatives)[
-                :_MAX_BUDGET_ALTERNATIVE_CANDIDATES
-            ]:
-                candidate_replicas = dict(working)
-                candidate_replicas[expert] = working[expert] + (target,)
-                candidate = _quota_for_replicas(
-                    arrays,
-                    source_demand,
-                    candidate_replicas,
-                    working_routing,
-                    communication_budgets,
-                    timing,
-                )
-                if candidate is None:
-                    continue
-                candidate_quota, candidate_metrics = candidate
-                candidate_key = (
-                    max(candidate_metrics.compute_load, default=0),
-                    int(np.square(candidate_metrics.compute_load).sum()),
-                )
-                base_key = (
-                    max(working_metrics.compute_load, default=0),
-                    int(np.square(working_metrics.compute_load).sum()),
-                )
-                if candidate_key < base_key and (
-                    best_alternative is None or candidate_key < best_alternative[0]
-                ):
-                    best_alternative = (
-                        candidate_key,
-                        candidate_replicas,
-                        candidate_quota,
-                        candidate_metrics,
-                    )
-            if best_alternative is not None:
-                _, working, working_quota, working_metrics = best_alternative
-                working_routing = np.where(
-                    working_quota.sum(axis=2) > 0,
-                    working_quota.argmax(axis=2),
-                    working_routing,
-                )
-                balance_copies = 1
-        return _placement_from_quota(
-            working,
-            working_routing,
-            working_quota,
-            working_metrics,
-            source_demand=source_demand,
-            num_ranks=num_ranks,
-            extra_copies=placement.extra_copies,
-            balance_copies=balance_copies,
-        )
-    else:
-        while added < num_ranks * max_extra_per_rank:
-            instance_quota, compute = _greedy_instance_quotas(
-                expert_demand, replicas, num_ranks
-            )
-            current_key = (int(compute.max()), int(np.square(compute).sum()))
-            best = None
-            for expert in expert_order:
-                if not expert_demand[expert]:
-                    continue
-                base = compute - instance_quota[expert]
-                # Prefer the largest remote source for the historical path.
-                for target_value in remote_sources[expert]:
-                    target = int(target_value)
-                    if replica_mask[expert, target] or (
-                        balance_by_rank[target] >= max_extra_per_rank
-                    ):
-                        continue
-                    ranks = replicas[int(expert)] + (target,)
-                    allocation = _waterfill(
-                        base, ranks, int(expert_demand[expert])
-                    )
-                    next_compute = base + allocation
-                    compute_key = (
-                        int(next_compute.max()),
-                        int(np.square(next_compute).sum()),
-                    )
-                    if compute_key < current_key:
-                        remote = int(
-                            expert_demand[expert]
-                            - sum(
-                                min(
-                                    int(source_demand[expert, rank]),
-                                    int(allocation[rank]),
-                                )
-                                for rank in ranks
-                            )
-                        )
-                        candidate = (
-                            compute_key
-                            + (
-                                remote,
-                                -int(source_demand[expert, target]),
-                                expert,
-                                target,
-                            ),
-                            int(expert),
-                            target,
-                        )
-                        if best is None or candidate[0] < best[0]:
-                            best = candidate
-            if best is None:
-                break
-            _, expert, target = best
-            replicas[expert] += (target,)
-            replica_mask[expert, target] = True
-            balance_by_rank[target] += 1
-            added += 1
-        quota_started = time.perf_counter()
-        quota, routing = _fast_communication_quota(
-            source_demand, replicas, routing, None
-        )
-        _record_timing(timing, "quota_solve_ms", quota_started)
-        routing = np.where(quota.sum(axis=2) > 0, quota.argmax(axis=2), routing)
-        allocation_started = time.perf_counter()
-        metrics = _route_quota(
-            arrays,
-            quota,
-            source_demand,
-            replicas,
-        )
-        _record_timing(timing, "quota_allocation_ms", allocation_started)
-    if communication_budgets is not None:
-        metrics = current_metrics
-    serialized_quota = tuple(
-        tuple(
-            (
-                tuple(int(quota[source, expert, rank]) for rank in replicas[expert])
-                if source_demand[expert, source]
-                else tuple(
-                    int(rank == routing[source, expert]) for rank in replicas[expert]
-                )
-            )
-            for expert in range(len(primary))
-        )
-        for source in range(num_ranks)
-    )
-    return ReplicaPlacement(
-        replicas,
-        tuple(tuple(int(rank) for rank in row) for row in routing),
-        metrics,
-        placement.extra_copies,
-        added,
-        serialized_quota,
-        source_demand,
+    return _balance_replica_compute_hybrid(
+        arrays,
+        placement,
+        num_ranks=num_ranks,
+        max_extra_per_rank=max_extra_per_rank,
+        communication_budgets=communication_budgets,
+        timing=timing,
     )

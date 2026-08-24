@@ -34,6 +34,31 @@ def test_kernels() -> None:
     _C.default_routing_into(into_replicas, primary, into_routing)
     assert torch.equal(into_replicas, replicas)
     assert torch.equal(into_routing, fused_routing)
+    fused_into_replicas = torch.empty_like(replicas)
+    fused_into_routing = torch.empty_like(fused_routing)
+    _C.select_topn_routing_into(
+        demand, primary, 0, fused_into_replicas, fused_into_routing
+    )
+    assert torch.equal(fused_into_replicas, replicas)
+    assert torch.equal(fused_into_routing, fused_routing)
+    fused_all_demand = torch.empty_like(demand)
+    fused_all_replicas = torch.empty_like(replicas)
+    fused_all_routing = torch.empty_like(fused_routing)
+    _C.fused_source_topn_into(
+        source,
+        topk,
+        count,
+        primary,
+        4,
+        2,
+        0,
+        fused_all_demand,
+        fused_all_replicas,
+        fused_all_routing,
+    )
+    assert torch.equal(fused_all_demand, demand)
+    assert torch.equal(fused_all_replicas, replicas)
+    assert torch.equal(fused_all_routing, fused_routing)
 
     traffic, compute = _C.traffic(source, topk, count, primary, replicas, 2)
     assert traffic.cpu().tolist() == [[0, 5], [3, 0]]

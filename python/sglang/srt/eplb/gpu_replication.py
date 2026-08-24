@@ -92,6 +92,32 @@ def _route_cuda(
     )
 
 
+def _within_communication_budget(
+    metrics: ReplicaMetrics, baseline: ReplicaMetrics, ratio: float
+) -> bool:
+    budgets = tuple(
+        math.ceil(value * ratio)
+        for value in (
+            baseline.remote,
+            baseline.max_pair_traffic,
+            baseline.max_ingress,
+            baseline.max_egress,
+        )
+    )
+    return all(
+        value <= limit
+        for value, limit in zip(
+            (
+                metrics.remote,
+                metrics.max_pair_traffic,
+                metrics.max_ingress,
+                metrics.max_egress,
+            ),
+            budgets,
+        )
+    )
+
+
 def _quota_cuda(
     demand: torch.Tensor,
     replica_mask: torch.Tensor,
@@ -289,10 +315,16 @@ def _communication_quota_cuda(
         budgets, device=demand.device, dtype=torch.float64
     )
     values = summary[:, :4].to(torch.float64)
-    violation = torch.where(budget_tensor > 0, values / budget_tensor, values)
+    excess = (values - budget_tensor).clamp_min(0)
     key = torch.stack(
         (
-            violation.max(dim=1).values,
+            (excess > 0).sum(dim=1),
+            excess.sum(dim=1),
+            excess.max(dim=1).values,
+            excess[:, 0],
+            excess[:, 1],
+            excess[:, 2],
+            excess[:, 3],
             summary[:, 4].to(torch.float64),
             summary[:, 5].to(torch.float64),
             summary[:, 0].to(torch.float64),
@@ -393,14 +425,19 @@ class GraceCudaRuntime:
         topk = topk.to(device=self.device, dtype=torch.int64, copy=False).contiguous()
         count = count.to(device=self.device, dtype=torch.int64, copy=False).contiguous()
         self.primary = self._primary_tensor(primary)
-        _C.source_demand_into(
-            source, topk, count, self.num_experts, self.num_ranks, self.demand
+        _C.fused_source_topn_into(
+            source,
+            topk,
+            count,
+            self.primary,
+            self.num_experts,
+            self.num_ranks,
+            int(max_extra_per_rank),
+            self.demand,
+            self.replicas,
+            self.routing,
         )
         demand = self.demand
-        _C.select_topn_into(
-            demand, self.primary, int(max_extra_per_rank), self.replicas
-        )
-        _C.default_routing_into(self.replicas, self.primary, self.routing)
         return demand, self.replicas, self.routing
 
     def build_demand(
@@ -537,14 +574,19 @@ def replicate_source_top_experts_cuda(
                 max_extra_per_rank,
             )
         else:
-            _C.source_demand_into(
-                source, topk, count, num_experts, num_ranks, runtime.demand
+            _C.fused_source_topn_into(
+                source,
+                topk,
+                count,
+                primary_tensor,
+                num_experts,
+                num_ranks,
+                max_extra_per_rank,
+                runtime.demand,
+                runtime.replicas,
+                runtime.routing,
             )
             demand = runtime.demand
-            _C.select_topn_into(
-                demand, primary_tensor, max_extra_per_rank, runtime.replicas
-            )
-            _C.default_routing_into(runtime.replicas, primary_tensor, runtime.routing)
             replica_mask, routing_tensor = runtime.replicas, runtime.routing
     else:
         demand = demand_tensor.to(
@@ -556,10 +598,13 @@ def replicate_source_top_experts_cuda(
             replica_mask = _C.select_topn(demand, primary_tensor, max_extra_per_rank)
             routing_tensor = _C.default_routing(replica_mask, primary_tensor)
         else:
-            _C.select_topn_into(
-                demand, primary_tensor, max_extra_per_rank, runtime.replicas
+            _C.select_topn_routing_into(
+                demand,
+                primary_tensor,
+                max_extra_per_rank,
+                runtime.replicas,
+                runtime.routing,
             )
-            _C.default_routing_into(runtime.replicas, primary_tensor, runtime.routing)
             replica_mask, routing_tensor = runtime.replicas, runtime.routing
     _record(timing, "communication_replication_ms", started)
 
@@ -586,56 +631,10 @@ def replicate_source_top_experts_cuda(
     if max_compute_extra_per_rank:
         if communication_budget_ratio is not None:
             metrics_started = _phase_start(timing)
-            initial_metrics = _route_cuda(
+            budget_baseline = _route_cuda(
                 source, topk, count, primary_tensor, replica_mask, num_ranks
             )
             _record(timing, "communication_replication_ms", metrics_started)
-            quota_started = _phase_start(timing)
-            initial_quota, routing_tensor = _communication_quota_cuda(
-                demand,
-                replica_mask,
-                primary_tensor,
-                routing_tensor,
-                initial_metrics,
-                communication_budget_ratio,
-                expert_demand,
-                demand_order,
-                source_order,
-                workspaces=runtime.candidate_workspaces
-                if runtime is not None
-                else None,
-            )
-            _record(timing, "quota_solve_ms", quota_started)
-            allocation_started = _phase_start(timing)
-            budget_baseline = _quota_route_cuda(
-                source,
-                topk,
-                count,
-                initial_quota,
-                replica_mask,
-                primary_tensor,
-                addition_order,
-                num_ranks,
-                bundle_ordinals,
-            )
-            _record(timing, "quota_allocation_ms", allocation_started)
-        elif compute_imbalance_limit is not None:
-            quota_started = _phase_start(timing)
-            _, routing_tensor = _quota_cuda(
-                demand,
-                replica_mask,
-                primary_tensor,
-                routing_tensor,
-                compute_imbalance_limit,
-                expert_demand,
-                demand_order,
-                source_order,
-                quota_out=quota_out,
-                routing_out=routing_out,
-                instance_out=instance_out,
-                loads_out=loads_out,
-            )
-            _record(timing, "quota_solve_ms", quota_started)
         compute_started = _phase_start(timing)
         if runtime is None:
             replica_mask, balance_copies, addition_order = _C.select_compute_replicas(
@@ -661,23 +660,10 @@ def replicate_source_top_experts_cuda(
             balance_copies = runtime.compute_added
             addition_order = runtime.compute_addition_order
         _record(timing, "compute_replication_ms", compute_started)
-        if communication_budget_ratio is not None:
-            quota_started = _phase_start(timing)
-            _, routing_tensor = _quota_cuda(
-                demand,
-                replica_mask,
-                primary_tensor,
-                routing_tensor,
-                compute_imbalance_limit=-1.0,
-                expert_demand=expert_demand,
-                demand_order=demand_order,
-                source_order=source_order,
-                quota_out=quota_out,
-                routing_out=routing_out,
-                instance_out=instance_out,
-                loads_out=loads_out,
-            )
-            _record(timing, "quota_solve_ms", quota_started)
+        if runtime is None:
+            routing_tensor = _C.default_routing(replica_mask, primary_tensor)
+        else:
+            _C.default_routing_into(replica_mask, primary_tensor, routing_tensor)
     if not needs_quota:
         metrics_started = _phase_start(timing)
         metrics = _route_cuda(
@@ -748,6 +734,38 @@ def replicate_source_top_experts_cuda(
             bundle_ordinals,
         )
         _record(timing, "quota_allocation_ms", allocation_started)
+
+    if communication_budget_ratio is not None:
+        if budget_baseline is None:
+            budget_baseline = _route_cuda(
+                source, topk, count, primary_tensor, replica_mask, num_ranks
+            )
+        if not _within_communication_budget(
+            metrics, budget_baseline, communication_budget_ratio
+        ):
+            safe_metrics = _route_cuda(
+                source, topk, count, primary_tensor, replica_mask, num_ranks
+            )
+            if _within_communication_budget(
+                safe_metrics, budget_baseline, communication_budget_ratio
+            ):
+                routing_tensor = torch.where(
+                    replica_mask.t(),
+                    torch.arange(num_ranks, device=demand.device)[:, None],
+                    primary_tensor[None, :],
+                )
+                quota = torch.zeros(
+                    (num_ranks, num_experts, num_ranks),
+                    device=demand.device,
+                    dtype=demand.dtype,
+                )
+                quota.scatter_(
+                    2,
+                    routing_tensor.unsqueeze(-1),
+                    demand.t().unsqueeze(-1),
+                )
+                addition_order.zero_()
+                metrics = safe_metrics
 
     replica_mask_np = replica_mask.cpu().numpy()
     demand_np = demand.cpu().numpy()

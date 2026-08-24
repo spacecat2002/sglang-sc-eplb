@@ -9,7 +9,11 @@ namespace grace_cuda {
 
 torch::Tensor source_demand(torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
                             int64_t);
+void source_demand_into(torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
+                        int64_t, torch::Tensor);
 torch::Tensor select_topn(torch::Tensor, torch::Tensor, int64_t);
+void select_topn_routing_into(torch::Tensor, torch::Tensor, int64_t,
+                              torch::Tensor, torch::Tensor);
 
 namespace {
 
@@ -24,6 +28,18 @@ __global__ void default_routing_kernel(const bool* replicas,
 }
 
 }  // namespace
+
+void fused_source_topn_into(
+    torch::Tensor source, torch::Tensor topk, torch::Tensor count,
+    torch::Tensor primary, int64_t experts, int64_t ranks,
+    int64_t max_extra_per_rank, torch::Tensor demand, torch::Tensor replicas,
+    torch::Tensor routing) {
+  TORCH_CHECK(source.is_cuda() && topk.is_cuda() && count.is_cuda() &&
+              primary.is_cuda());
+  source_demand_into(source, topk, count, experts, ranks, demand);
+  select_topn_routing_into(demand, primary, max_extra_per_rank, replicas,
+                           routing);
+}
 
 void default_routing_into(torch::Tensor replicas, torch::Tensor primary,
                           torch::Tensor routing) {

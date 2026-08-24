@@ -186,6 +186,7 @@ __global__ __launch_bounds__(128, 1) void select_compute_replicas_kernel(
   __shared__ ComputeCandidate candidates[kThreads];
   __shared__ int64_t current_max;
   __shared__ int64_t current_square;
+  __shared__ int64_t current_remote;
   __shared__ int64_t added;
   __shared__ bool done;
   int64_t allocation[MaxRanks];
@@ -234,6 +235,16 @@ __global__ __launch_bounds__(128, 1) void select_compute_replicas_kernel(
         current_max = max(current_max, loads[rank]);
         current_square += loads[rank] * loads[rank];
       }
+      current_remote = 0;
+      for (int64_t expert = 0; expert < experts; ++expert) {
+        const int64_t total = expert_demand[expert];
+        int64_t local = 0;
+        for (int rank = 0; rank < ranks; ++rank) {
+          local += min(demand[expert * ranks + rank],
+                       instance_quota[expert * ranks + rank]);
+        }
+        current_remote += total - local;
+      }
     }
     __syncthreads();
 
@@ -244,7 +255,8 @@ __global__ __launch_bounds__(128, 1) void select_compute_replicas_kernel(
       const int target = index % ranks;
       const int64_t total = expert_demand[expert];
       if (!total || replicas[expert * ranks + target] ||
-          added_by_rank[target] >= max_extra_per_rank) {
+          added_by_rank[target] >= max_extra_per_rank ||
+          loads[target] >= current_max) {
         continue;
       }
       for (int rank = 0; rank < ranks; ++rank) {
@@ -262,11 +274,18 @@ __global__ __launch_bounds__(128, 1) void select_compute_replicas_kernel(
         local += min(demand[expert * ranks + rank], allocation[rank]);
       }
       if (candidate.next_max > current_max ||
-          (candidate.next_max == current_max &&
-           candidate.next_square >= current_square)) {
+           (candidate.next_max == current_max &&
+            candidate.next_square >= current_square)) {
         continue;
       }
-      candidate.remote = total - local;
+      int64_t current_local = 0;
+      for (int rank = 0; rank < ranks; ++rank) {
+        current_local += min(demand[expert * ranks + rank],
+                             instance_quota[expert * ranks + rank]);
+      }
+      // Source-demand remote bound for the whole plan, replacing the
+      // candidate expert's contribution without scanning the trace.
+      candidate.remote = current_remote - (total - current_local) + (total - local);
       if (better_candidate(candidate, best)) best = candidate;
     }
     candidates[threadIdx.x] = best;
