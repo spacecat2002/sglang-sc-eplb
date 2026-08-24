@@ -852,8 +852,17 @@ def replicate_source_top_experts_cuda(
         if compute_solver == "capacity-v2":
             if runtime is None:
                 raise ValueError("capacity-v2 requires a resident CUDA runtime")
+            _C.current_bundle_gains_into(
+                source,
+                topk,
+                count,
+                primary_tensor,
+                replica_mask,
+                runtime.replica_gains,
+            )
             _C.select_compute_replicas_v2_into(
                 demand,
+                runtime.replica_gains,
                 replica_mask,
                 primary_tensor,
                 max_compute_extra_per_rank,
