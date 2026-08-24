@@ -141,14 +141,75 @@ __global__ void source_quota_kernel(
   }
 }
 
+template <int MaxRanks>
+__device__ void rebalance_compute_quota(
+    int64_t* quota, const bool* replicas, int64_t* loads, int64_t experts,
+    int ranks, int sources, int64_t capacity) {
+  while (true) {
+    int previous[MaxRanks];
+    int edge_source[MaxRanks];
+    int64_t edge_expert[MaxRanks];
+    int queue[MaxRanks];
+    int over = -1;
+    int under = -1;
+    for (int candidate_over = 0;
+         candidate_over < ranks && under < 0; ++candidate_over) {
+      if (loads[candidate_over] <= capacity) continue;
+      for (int rank = 0; rank < ranks; ++rank) previous[rank] = -2;
+      previous[candidate_over] = -1;
+      int head = 0;
+      int tail = 1;
+      queue[0] = candidate_over;
+      while (head < tail && under < 0) {
+        const int from = queue[head++];
+        for (int source = 0; source < sources && under < 0; ++source) {
+          for (int64_t expert = 0; expert < experts && under < 0; ++expert) {
+            if (!quota[(source * experts + expert) * ranks + from]) continue;
+            for (int target = 0; target < ranks; ++target) {
+              if (previous[target] != -2 ||
+                  !replicas[expert * ranks + target]) {
+                continue;
+              }
+              previous[target] = from;
+              edge_source[target] = source;
+              edge_expert[target] = expert;
+              if (loads[target] < capacity) {
+                over = candidate_over;
+                under = target;
+                break;
+              }
+              queue[tail++] = target;
+            }
+          }
+        }
+      }
+    }
+    if (under < 0) return;
+
+    int64_t moved = min(loads[over] - capacity, capacity - loads[under]);
+    for (int rank = under; previous[rank] >= 0; rank = previous[rank]) {
+      moved = min(
+          moved,
+          quota[(edge_source[rank] * experts + edge_expert[rank]) * ranks +
+                previous[rank]]);
+    }
+    for (int rank = under; previous[rank] >= 0; rank = previous[rank]) {
+      const int64_t offset =
+          (edge_source[rank] * experts + edge_expert[rank]) * ranks;
+      quota[offset + previous[rank]] -= moved;
+      quota[offset + rank] += moved;
+    }
+    loads[over] -= moved;
+    loads[under] += moved;
+  }
+}
+
 __device__ bool better_candidate(
-    int64_t next_max, int64_t next_overload, int64_t next_square,
-    int64_t remote,
+    int64_t next_max, int64_t next_square, int64_t remote,
     int64_t local_demand, int64_t expert, int target, int64_t best_max,
-    int64_t best_overload, int64_t best_square, int64_t best_remote,
-    int64_t best_local_demand, int64_t best_expert, int best_target) {
+    int64_t best_square, int64_t best_remote, int64_t best_local_demand,
+    int64_t best_expert, int best_target) {
   if (next_max != best_max) return next_max < best_max;
-  if (next_overload != best_overload) return next_overload < best_overload;
   if (next_square != best_square) return next_square < best_square;
   if (remote != best_remote) return remote < best_remote;
   if (local_demand != best_local_demand) return local_demand > best_local_demand;
@@ -158,7 +219,6 @@ __device__ bool better_candidate(
 
 struct ComputeCandidate {
   int64_t next_max;
-  int64_t next_overload;
   int64_t next_square;
   int64_t remote;
   int64_t local_demand;
@@ -171,10 +231,10 @@ __device__ bool better_candidate(const ComputeCandidate& candidate,
   if (candidate.expert < 0) return false;
   if (best.expert < 0) return true;
   return better_candidate(
-      candidate.next_max, candidate.next_overload, candidate.next_square,
-      candidate.remote, candidate.local_demand, candidate.expert,
-      candidate.target, best.next_max, best.next_overload, best.next_square,
-      best.remote, best.local_demand, best.expert, best.target);
+      candidate.next_max, candidate.next_square, candidate.remote,
+      candidate.local_demand, candidate.expert, candidate.target, best.next_max,
+      best.next_square, best.remote, best.local_demand, best.expert,
+      best.target);
 }
 
 template <int MaxRanks>
@@ -189,7 +249,6 @@ __global__ __launch_bounds__(128, 1) void select_compute_replicas_kernel(
   __shared__ ComputeCandidate candidates[kThreads];
   __shared__ int64_t current_max;
   __shared__ int64_t ideal_capacity;
-  __shared__ int64_t current_overload;
   __shared__ int64_t current_square;
   __shared__ int64_t current_remote;
   __shared__ int64_t added;
@@ -230,19 +289,17 @@ __global__ __launch_bounds__(128, 1) void select_compute_replicas_kernel(
           }
         }
       }
-      current_max = 0;
-      current_square = 0;
       int64_t total = 0;
       for (int64_t expert = 0; expert < experts; ++expert) {
         total += expert_demand[expert];
       }
       ideal_capacity = (total + ranks - 1) / ranks;
-      current_overload = 0;
+      rebalance_compute_quota<MaxRanks>(instance_quota, replicas, loads, experts,
+                                        ranks, 1, ideal_capacity);
+      current_max = 0;
+      current_square = 0;
       for (int rank = 0; rank < ranks; ++rank) {
         current_max = max(current_max, loads[rank]);
-        current_overload += loads[rank] > ideal_capacity
-                                ? loads[rank] - ideal_capacity
-                                : 0;
         current_square += loads[rank] * loads[rank];
       }
       current_remote = 0;
@@ -257,8 +314,9 @@ __global__ __launch_bounds__(128, 1) void select_compute_replicas_kernel(
       }
     }
     __syncthreads();
+    if (current_max <= ideal_capacity) break;
 
-    ComputeCandidate best = {0, 0, 0, 0, 0, -1, -1};
+    ComputeCandidate best = {0, 0, 0, 0, -1, -1};
     for (int64_t index = threadIdx.x; index < experts * ranks;
          index += blockDim.x) {
       const int64_t expert = index / ranks;
@@ -273,22 +331,18 @@ __global__ __launch_bounds__(128, 1) void select_compute_replicas_kernel(
       }
       waterfill_fast<MaxRanks>(base, replicas, expert, target, total, allocation,
                                ranks);
-      ComputeCandidate candidate = {0, 0, 0, 0, demand[expert * ranks + target],
-                                    expert, target};
+      ComputeCandidate candidate = {
+          0, 0, 0, demand[expert * ranks + target], expert, target};
       int64_t local = 0;
       for (int rank = 0; rank < ranks; ++rank) {
         const int64_t next = base[rank] + allocation[rank];
         candidate.next_max = max(candidate.next_max, next);
-        candidate.next_overload += next > ideal_capacity
-                                      ? next - ideal_capacity
-                                      : 0;
         candidate.next_square += next * next;
         local += min(demand[expert * ranks + rank], allocation[rank]);
       }
       if (candidate.next_max > current_max ||
           (candidate.next_max == current_max &&
-           candidate.next_overload >= current_overload &&
-           candidate.next_square >= current_square)) {
+           candidate.next_square > current_square)) {
         continue;
       }
       int64_t current_local = 0;
@@ -458,66 +512,8 @@ __global__ void fused_quota_kernel(
     }
     const int64_t capacity = static_cast<int64_t>(ceil(
         static_cast<double>(total) / ranks * imbalance_limit));
-    while (true) {
-      int over = -1;
-      for (int rank = 0; rank < ranks; ++rank) {
-        if (loads[rank] > capacity) {
-          over = rank;
-          break;
-        }
-      }
-      if (over < 0) break;
-
-      int previous[MaxRanks];
-      int edge_source[MaxRanks];
-      int64_t edge_expert[MaxRanks];
-      int queue[MaxRanks];
-      for (int rank = 0; rank < ranks; ++rank) previous[rank] = -2;
-      previous[over] = -1;
-      int head = 0;
-      int tail = 1;
-      int under = -1;
-      queue[0] = over;
-      while (head < tail && under < 0) {
-        const int from = queue[head++];
-        for (int source = 0; source < ranks && under < 0; ++source) {
-          for (int64_t expert = 0; expert < experts && under < 0; ++expert) {
-            if (!quota[(source * experts + expert) * ranks + from]) continue;
-            for (int target = 0; target < ranks; ++target) {
-              if (previous[target] != -2 ||
-                  !replicas[expert * ranks + target]) {
-                continue;
-              }
-              previous[target] = from;
-              edge_source[target] = source;
-              edge_expert[target] = expert;
-              if (loads[target] < capacity) {
-                under = target;
-                break;
-              }
-              queue[tail++] = target;
-            }
-          }
-        }
-      }
-      if (under < 0) break;
-
-      int64_t moved = min(loads[over] - capacity, capacity - loads[under]);
-      for (int rank = under; previous[rank] >= 0; rank = previous[rank]) {
-        moved = min(
-            moved,
-            quota[(edge_source[rank] * experts + edge_expert[rank]) * ranks +
-                  previous[rank]]);
-      }
-      for (int rank = under; previous[rank] >= 0; rank = previous[rank]) {
-        const int64_t offset =
-            (edge_source[rank] * experts + edge_expert[rank]) * ranks;
-        quota[offset + previous[rank]] -= moved;
-        quota[offset + rank] += moved;
-      }
-      loads[over] -= moved;
-      loads[under] += moved;
-    }
+    rebalance_compute_quota<MaxRanks>(quota, replicas, loads, experts, ranks,
+                                      ranks, capacity);
   }
   __syncthreads();
 
@@ -526,37 +522,31 @@ __global__ void fused_quota_kernel(
     for (int64_t index = 0; index < experts * ranks; ++index) total += demand[index];
     const int64_t capacity = static_cast<int64_t>(ceil(
         static_cast<double>(total) / ranks * imbalance_limit));
-    bool needs_localize = false;
-    for (int rank = 0; rank < ranks; ++rank) {
-      needs_localize |= loads[rank] > capacity;
-    }
-    if (needs_localize) {
-      bool changed = true;
-      while (changed) {
-        changed = false;
-        for (int source = 0; source < ranks; ++source) {
-          int64_t room = capacity - loads[source];
-          for (int64_t index = 0; index < experts && room > 0; ++index) {
-            const int64_t expert = source_order[source * experts + index];
-            if (!replicas[expert * ranks + source]) continue;
-            for (int pass = 0; pass < ranks && room > 0; ++pass) {
-              const int primary_rank = primary[expert];
-              const int secondary = pass - 1;
-              const int target =
-                  pass == 0 ? primary_rank
-                            : secondary + (secondary >= primary_rank);
-              if (target == source || !replicas[expert * ranks + target]) {
-                continue;
-              }
-              const int64_t offset = (source * experts + expert) * ranks;
-              const int64_t moved = min(room, quota[offset + target]);
-              quota[offset + target] -= moved;
-              quota[offset + source] += moved;
-              loads[target] -= moved;
-              loads[source] += moved;
-              room -= moved;
-              changed |= moved != 0;
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (int source = 0; source < ranks; ++source) {
+        int64_t room = capacity - loads[source];
+        for (int64_t index = 0; index < experts && room > 0; ++index) {
+          const int64_t expert = source_order[source * experts + index];
+          if (!replicas[expert * ranks + source]) continue;
+          for (int pass = 0; pass < ranks && room > 0; ++pass) {
+            const int primary_rank = primary[expert];
+            const int secondary = pass - 1;
+            const int target =
+                pass == 0 ? primary_rank
+                          : secondary + (secondary >= primary_rank);
+            if (target == source || !replicas[expert * ranks + target]) {
+              continue;
             }
+            const int64_t offset = (source * experts + expert) * ranks;
+            const int64_t moved = min(room, quota[offset + target]);
+            quota[offset + target] -= moved;
+            quota[offset + source] += moved;
+            loads[target] -= moved;
+            loads[source] += moved;
+            room -= moved;
+            changed |= moved != 0;
           }
         }
       }

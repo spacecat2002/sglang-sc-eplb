@@ -141,7 +141,7 @@ def main() -> None:
             "compute-repl-ms",
             "quota-solve-ms",
             "quota-alloc/eval-ms",
-            "eval-ms",
+            "total-ms",
         ]
     ]
     plan = {}
@@ -194,12 +194,9 @@ def main() -> None:
                 runtime = cuda_runtimes.setdefault(
                     len(experts), GraceCudaRuntime(len(experts), num_ranks)
                 )
-            demand = runtime.build_demand(*gpu_tokens)
-            started = time.perf_counter()
             optimized = runtime.plan(
                 *gpu_tokens,
                 primary,
-                demand=demand,
                 max_extra_per_rank=max_extra,
                 max_compute_extra_per_rank=args.max_compute_extra_experts_per_rank,
                 compute_imbalance_limit=args.compute_imbalance_limit,

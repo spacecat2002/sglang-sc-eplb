@@ -268,6 +268,41 @@ def test_kernels() -> None:
         1.0,
     )
     assert augment_quota.sum(dim=(0, 1)).cpu().tolist() == [10, 10, 10]
+    selected, added, _ = _C.select_compute_replicas(
+        augment_demand,
+        augment_replicas.clone(),
+        augment_demand.sum(dim=1),
+        torch.tensor([2, 1, 0], device="cuda"),
+        1,
+    )
+    assert torch.equal(selected, augment_replicas)
+    assert added.item() == 0
+
+    # The first overloaded rank is fixed above capacity. The solver must still
+    # rebalance a later overloaded rank that has a feasible export path.
+    blocked_demand = torch.tensor(
+        [[15, 0, 0], [7, 0, 0], [16, 0, 0]], device="cuda", dtype=torch.int64
+    )
+    blocked_replicas = torch.tensor(
+        [[True, True, True], [True, False, True], [True, False, False]],
+        device="cuda",
+    )
+    blocked_primary = torch.zeros(3, device="cuda", dtype=torch.int64)
+    blocked_routing = torch.zeros((3, 3), device="cuda", dtype=torch.int64)
+    blocked_expert_order = torch.tensor([2, 0, 1], device="cuda")
+    blocked_source_order = torch.tensor(
+        [[0, 1, 2], [0, 1, 2], [0, 1, 2]], device="cuda"
+    )
+    blocked_quota, _ = _C.solve_quota(
+        blocked_demand,
+        blocked_replicas,
+        blocked_primary,
+        blocked_routing,
+        blocked_expert_order,
+        blocked_source_order,
+        1.0,
+    )
+    assert blocked_quota.sum(dim=(0, 1)).cpu().tolist() == [16, 9, 13]
 
 
 if __name__ == "__main__":

@@ -14,12 +14,14 @@ from sglang.srt.eplb.grace_plus_expert_placement import (
 )
 from sglang.srt.eplb.grace_plus_replication import (
     ReplicaPlacement,
+    _capacity_export_replicas,
     _instance_quotas,
     _greedy_instance_quotas,
     _joint_quotas,
     _quota_prefix,
     _rebalance_quota_compute,
     _route_quota,
+    _source_quotas,
     balance_replica_compute,
     evaluate_replicated_placement,
     replicate_hot_experts,
@@ -329,7 +331,7 @@ def test_compute_balancing_prefers_the_largest_remote_source():
     assert balanced.replicas_by_expert[0][:2] == (0, 1)
 
 
-def test_compute_balancing_rejects_remote_for_variance_only():
+def test_compute_balancing_prioritizes_compute_over_zero_remote():
     tokens = [
         RoutedToken(0, (0,), 10),
         RoutedToken(1, (1,), 8),
@@ -348,8 +350,9 @@ def test_compute_balancing_rejects_remote_for_variance_only():
         max_extra_per_rank=1,
     )
 
-    assert balanced.balance_copies == 0
-    assert balanced.metrics == communication.metrics
+    assert balanced.balance_copies == 2
+    assert balanced.metrics.compute_load == (7, 7, 6)
+    assert balanced.metrics.remote > communication.metrics.remote
 
 
 def test_compute_balancing_zero_budget_still_generates_quota():
@@ -471,6 +474,19 @@ def test_compute_rebalance_moves_quota_between_experts_to_meet_capacity():
     )
 
 
+def test_compute_selector_reuses_existing_augmenting_capacity():
+    replicas = {0: (2,), 1: (0, 2), 2: (1, 2)}
+    selected, added = _capacity_export_replicas(
+        np.array([[4, 0, 0], [12, 0, 0], [14, 0, 0]]),
+        replicas.copy(),
+        num_ranks=3,
+        max_extra_per_rank=1,
+    )
+
+    assert selected == replicas
+    assert added == 0
+
+
 def test_compute_rebalance_uses_an_augmenting_path():
     quota = np.zeros((3, 2, 3), dtype=np.int64)
     quota[0, 0, 0] = 12
@@ -484,6 +500,23 @@ def test_compute_rebalance_uses_an_augmenting_path():
         quota.sum(axis=2),
         np.array([[12, 10], [0, 0], [0, 0]]),
     )
+
+
+def test_compute_rebalance_skips_an_unreachable_overloaded_rank():
+    replicas = {0: (0, 1, 2), 1: (0, 2), 2: (0,)}
+    source_demand = np.array([[15, 0, 0], [7, 0, 0], [16, 0, 0]])
+    instance, loads = _greedy_instance_quotas(
+        source_demand.sum(axis=1), replicas, 3
+    )
+    quota = _source_quotas(
+        source_demand, instance, np.zeros((3, 3), dtype=np.int64)
+    )
+
+    assert loads.tolist() == [16, 8, 14]
+    _rebalance_quota_compute(quota, replicas, loads, capacity=13)
+
+    # Rank 0 is fixed above capacity, but rank 2 can still export to rank 1.
+    assert loads.tolist() == [16, 9, 13]
 
 
 def test_joint_quota_chooses_local_among_compute_optimal_solutions():

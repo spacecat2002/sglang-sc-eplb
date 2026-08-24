@@ -663,8 +663,11 @@ def _rebalance_quota_compute(
                     for expert in range(num_experts):
                         if not quota[source, expert, source_rank]:
                             continue
-                        for target in replicas[expert]:
-                            if previous[target] != -2:
+                        for target in range(num_ranks):
+                            if (
+                                target not in replicas[expert]
+                                or previous[target] != -2
+                            ):
                                 continue
                             previous[target] = source_rank
                             edge_source[target] = source
@@ -1079,12 +1082,16 @@ def _capacity_export_replicas(
         instance_quota, compute = _greedy_instance_quotas(
             expert_demand, replicas, num_ranks
         )
+        _rebalance_quota_compute(
+            instance_quota[None, :, :], replicas, compute, ideal_capacity
+        )
         current_key = (
             int(compute.max(initial=0)),
-            int(np.maximum(compute - ideal_capacity, 0).sum()),
             int(np.square(compute).sum()),
         )
         current_remote = _source_remote_bound(source_demand, instance_quota)
+        if current_key[0] <= ideal_capacity:
+            break
         best = None
         for expert, total in enumerate(expert_demand):
             if not total:
@@ -1101,16 +1108,13 @@ def _capacity_export_replicas(
                 next_compute = base + allocation
                 compute_key = (
                     int(next_compute.max(initial=0)),
-                    int(np.maximum(next_compute - ideal_capacity, 0).sum()),
                     int(np.square(next_compute).sum()),
                 )
-                # Capacity/export: only export from a currently overloaded
-                # plan.  The overload term lets a copy that reaches the
-                # integer capacity unlock a later max-load improvement.
+                # Neutral copies may unlock a later augmenting path, but a
+                # candidate may not worsen the compute-first objective.
                 if compute_key[0] > current_key[0] or (
                     compute_key[0] == current_key[0]
-                    and compute_key[1] >= current_key[1]
-                    and compute_key[2] >= current_key[2]
+                    and compute_key[1] > current_key[1]
                 ):
                     continue
                 current_expert_remote = int(

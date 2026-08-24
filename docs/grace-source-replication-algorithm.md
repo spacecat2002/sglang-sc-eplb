@@ -337,6 +337,24 @@ moved = min(remaining_source_demand, target_capacity)
 
 直到该 source 的需求全部分配完。
 
+### 8.3 全局计算 rebalance
+
+逐 expert waterfill 是快速启发式，并不保证得到 replica graph 上的全局最小峰值。
+例如某个副本集合可以达到 `[10, 10, 10]`，逐 expert 放置却可能先得到
+`[11, 9, 10]`。因此 source quota 构造后还要执行一次全局 rebalance：
+
+1. 计算目标容量 `ceil(total_demand / R * compute_imbalance_limit)`；
+2. 按 rank id 扫描所有过载 rank，并分别在 residual replica graph 上做 BFS；
+3. 一条边表示某个 `(source, expert)` quota 当前在前一 rank 执行，而该 expert 也能在
+   后一 rank 执行；
+4. 找到欠载 rank 后，按整条增广路径的最小剩余 quota 搬运；
+5. 中间 rank 同时接收和转出等量 quota，负载不变；起点减载，终点增载；
+6. 某个过载 rank 没有路径时继续检查其他过载 rank，不能提前停止；
+7. 重复直到所有 rank 满足容量，或所有过载 rank 都不存在增广路径。
+
+这一步使计算容量成为真正的全局第一目标，而不是依赖逐 expert greedy 恰好得到均衡
+结果。只有 replica graph 本身不可行时，最终负载才允许高于目标容量。
+
 ## 9. 阶段四：计算不均衡约束下的 quota localization
 
 当设置 `compute_imbalance_limit=L` 时，允许的 rank capacity 为：
@@ -411,26 +429,28 @@ GRACE 的确定性和较低开销；同时用 source-demand 的远程上界评�
 每一轮：
 
 1. 用 `_greedy_instance_quotas()` 计算当前副本集合的 instance loads；
-2. 当前计算目标为：
+2. 先在当前 replica graph 上执行全局增广；如果现有副本已经能达到理想容量，就不再
+   浪费计算副本槽位；
+3. 当前计算目标为：
 
 ```text
 (max(loads), sum(loads ** 2))
 ```
 
-3. 只考虑当前最大负载以下的 slack target，避免向已经过载的 rank 导出；
 4. 跳过已有副本或已经达到 target rank 槽位上限的候选；
 5. 临时把 expert 加到 target，重新 waterfill 该 expert；
 6. 计算候选的新 load key 和 source-demand 远程上界。
 
-只有候选严格改善计算 key 才保留。实现还记录理想整数容量以上的 overload，作为
-候选比较中的中间 tie-break，避免整数容量边界导致后续无法继续下降。
+达到理想整数容量后搜索立即停止。在尚未达到容量时，候选不允许让计算 key 变差；
+计算 key 完全不变的候选可以保留，因为它可能为后续全局 rebalance 打开一条新的
+增广路径。候选排序中不插入通信或其他代理指标来打断这两个计算目标。
 
 ### 10.3 Tie-break
 
 计算 key 相同时，按以下顺序选择：
 
 ```text
-budget_violation (四项预算的超额数量)
+remote_budget_violation
 remote_after
 -source_demand[e, target]   目标 source 对该 expert 的需求越大越优先
 expert
@@ -451,7 +471,8 @@ added_by_rank[target] += 1
 直到：
 
 - 达到 `R * max_compute_extra_per_rank` 总槽位；或
-- 没有任何候选能严格改善计算目标。
+- 当前最大负载已经达到理想整数容量；或
+- 没有任何计算 key 不变或改善的候选。
 
 ## 11. 通信预算下的 quota 选择
 
