@@ -204,178 +204,164 @@ __device__ void rebalance_compute_quota(
   }
 }
 
-__device__ bool better_candidate(
-    int64_t next_max, int64_t next_square, int64_t remote,
-    int64_t local_demand, int64_t expert, int target, int64_t best_max,
-    int64_t best_square, int64_t best_remote, int64_t best_local_demand,
-    int64_t best_expert, int best_target) {
-  if (next_max != best_max) return next_max < best_max;
-  if (next_square != best_square) return next_square < best_square;
-  if (remote != best_remote) return remote < best_remote;
-  if (local_demand != best_local_demand) return local_demand > best_local_demand;
-  if (expert != best_expert) return expert < best_expert;
-  return target < best_target;
-}
+template <int MaxRanks>
+__device__ bool build_export_plan(
+    const int64_t* demand, const int64_t* primary, const bool* replicas,
+    int64_t* instance, int64_t* loads, int64_t* slots, int64_t* additions,
+    int64_t* plan_quota, int64_t experts, int ranks,
+    int64_t max_extra_per_rank, int64_t threshold, bool communication_first,
+    int64_t* added_out) {
+  for (int rank = 0; rank < ranks; ++rank) loads[rank] = slots[rank] = 0;
+  for (int64_t index = 0; index < experts * ranks; ++index) {
+    instance[index] = additions[index] = 0;
+  }
+  for (int64_t index = 0; index < experts * ranks * ranks; ++index) {
+    plan_quota[index] = 0;
+  }
+  for (int64_t expert = 0; expert < experts; ++expert) {
+    for (int source = 0; source < ranks; ++source) {
+      const int target = replicas[expert * ranks + source] ? source : primary[expert];
+      const int64_t value = demand[expert * ranks + source];
+      instance[expert * ranks + target] += value;
+      loads[target] += value;
+      plan_quota[(source * experts + expert) * ranks + target] = value;
+    }
+  }
 
-struct ComputeCandidate {
-  int64_t next_max;
-  int64_t next_square;
-  int64_t remote;
-  int64_t local_demand;
-  int64_t expert;
-  int target;
-};
+  int64_t added = 0;
+  while (true) {
+    int over = -1;
+    for (int rank = 0; rank < ranks; ++rank) {
+      if (loads[rank] > threshold &&
+          (over < 0 || loads[rank] - threshold > loads[over] - threshold)) {
+        over = rank;
+      }
+    }
+    if (over < 0) {
+      *added_out = added;
+      return true;
+    }
 
-__device__ bool better_candidate(const ComputeCandidate& candidate,
-                                 const ComputeCandidate& best) {
-  if (candidate.expert < 0) return false;
-  if (best.expert < 0) return true;
-  return better_candidate(
-      candidate.next_max, candidate.next_square, candidate.remote,
-      candidate.local_demand, candidate.expert, candidate.target, best.next_max,
-      best.next_square, best.remote, best.local_demand, best.expert,
-      best.target);
+    int64_t best_amount = 0;
+    int best_delta = 0;
+    int best_source = -1;
+    int64_t best_expert = -1;
+    int best_target = -1;
+    bool best_new = false;
+    const int64_t need = loads[over] - threshold;
+    for (int source = 0; source < ranks; ++source) {
+      for (int64_t expert = 0; expert < experts; ++expert) {
+        const int64_t offset = (source * experts + expert) * ranks;
+        const int64_t available = plan_quota[offset + over];
+        if (!available) continue;
+        for (int target = 0; target < ranks; ++target) {
+          const int64_t slack = threshold - loads[target];
+          const bool present = replicas[expert * ranks + target] ||
+                               additions[expert * ranks + target];
+          const bool is_new = !present;
+          if (target == over || slack <= 0 ||
+              (is_new && slots[target] >= max_extra_per_rank)) {
+            continue;
+          }
+          const int64_t amount = min(min(need, available), slack);
+          const int delta = (target != source) - (over != source);
+          bool better = best_expert < 0;
+          if (!better && communication_first && delta != best_delta) {
+            better = delta < best_delta;
+          } else if (!better && amount != best_amount) {
+            better = amount > best_amount;
+          } else if (!better && is_new != best_new) {
+            better = is_new < best_new;
+          } else if (!better && !communication_first && delta != best_delta) {
+            better = delta < best_delta;
+          } else if (!better && expert != best_expert) {
+            better = expert < best_expert;
+          } else if (!better && source != best_source) {
+            better = source < best_source;
+          } else if (!better) {
+            better = target < best_target;
+          }
+          if (better) {
+            best_amount = amount;
+            best_delta = delta;
+            best_source = source;
+            best_expert = expert;
+            best_target = target;
+            best_new = is_new;
+          }
+        }
+      }
+    }
+    if (best_expert < 0) return false;
+    if (best_new) {
+      additions[best_expert * ranks + best_target] = ++added;
+      ++slots[best_target];
+    }
+    instance[best_expert * ranks + over] -= best_amount;
+    instance[best_expert * ranks + best_target] += best_amount;
+    const int64_t offset = (best_source * experts + best_expert) * ranks;
+    plan_quota[offset + over] -= best_amount;
+    plan_quota[offset + best_target] += best_amount;
+    loads[over] -= best_amount;
+    loads[best_target] += best_amount;
+  }
 }
 
 template <int MaxRanks>
-__global__ __launch_bounds__(128, 1) void select_compute_replicas_kernel(
-    const int64_t* demand, const int64_t* expert_demand,
-    const int64_t* demand_order, bool* replicas, int64_t* instance_quota,
-    int64_t* loads, int64_t* added_by_rank,
-    int64_t* addition_order, int64_t* added_out, int64_t experts, int64_t ranks,
-    int64_t max_extra_per_rank) {
-  if (blockIdx.x) return;
-  constexpr int kThreads = 128;
-  __shared__ ComputeCandidate candidates[kThreads];
-  __shared__ int64_t current_max;
-  __shared__ int64_t ideal_capacity;
-  __shared__ int64_t current_square;
-  __shared__ int64_t current_remote;
-  __shared__ int64_t added;
-  __shared__ bool done;
-  int64_t allocation[MaxRanks];
-  int64_t base[MaxRanks];
-  if (threadIdx.x == 0) {
-    added = 0;
-    for (int rank = 0; rank < ranks; ++rank) {
-      loads[rank] = 0;
-      added_by_rank[rank] = 0;
-    }
-    for (int64_t index = 0; index < experts * ranks; ++index) {
-      instance_quota[index] = 0;
-      addition_order[index] = 0;
+__global__ void select_compute_replicas_kernel(
+    const int64_t* demand, const int64_t* primary, bool* replicas,
+    int64_t* instance, int64_t* loads, int64_t* added_by_rank,
+    int64_t* addition_order, int64_t* plan_quota, int64_t* routing,
+    int64_t* added_out, int64_t experts, int64_t ranks, int64_t max_extra_per_rank) {
+  if (blockIdx.x || threadIdx.x) return;
+  int64_t total = 0;
+  for (int64_t index = 0; index < experts * ranks; ++index) total += demand[index];
+  int64_t low = (total + ranks - 1) / ranks;
+  int64_t high = total;
+  int64_t ignored = 0;
+  if (!build_export_plan<MaxRanks>(
+          demand, primary, replicas, instance, loads, added_by_rank,
+          addition_order, plan_quota, experts, ranks, max_extra_per_rank, low, false,
+          &ignored)) {
+    while (low < high) {
+      const int64_t middle = (low + high) / 2;
+      if (build_export_plan<MaxRanks>(
+              demand, primary, replicas, instance, loads, added_by_rank,
+              addition_order, plan_quota, experts, ranks, max_extra_per_rank, middle, false,
+              &ignored)) {
+        high = middle;
+      } else {
+        low = middle + 1;
+      }
     }
   }
-  __syncthreads();
-  while (added < ranks * max_extra_per_rank) {
-    if (threadIdx.x == 0) {
-      for (int rank = 0; rank < ranks; ++rank) loads[rank] = 0;
-      // The Python reference rebuilds the stable (fixed, flexible) order
-      // after every added replica.  Keep that contract here; using the order
-      // from the first iteration changes the waterfill result.
-      for (int flexible = 0; flexible < 2; ++flexible) {
-        for (int64_t position = 0; position < experts; ++position) {
-          const int64_t expert = demand_order[position];
-          int replica_count = 0;
-          for (int rank = 0; rank < ranks; ++rank) {
-            replica_count += replicas[expert * ranks + rank];
-          }
-          if ((replica_count > 1) != flexible) continue;
-          waterfill_fast<MaxRanks>(loads, replicas, expert, -1,
-                                   expert_demand[expert], allocation, ranks);
-          for (int rank = 0; rank < ranks; ++rank) {
-            instance_quota[expert * ranks + rank] = allocation[rank];
-            loads[rank] += allocation[rank];
-          }
-        }
-      }
-      int64_t total = 0;
-      for (int64_t expert = 0; expert < experts; ++expert) {
-        total += expert_demand[expert];
-      }
-      ideal_capacity = (total + ranks - 1) / ranks;
-      rebalance_compute_quota<MaxRanks>(instance_quota, replicas, loads, experts,
-                                        ranks, 1, ideal_capacity);
-      current_max = 0;
-      current_square = 0;
-      for (int rank = 0; rank < ranks; ++rank) {
-        current_max = max(current_max, loads[rank]);
-        current_square += loads[rank] * loads[rank];
-      }
-      current_remote = 0;
-      for (int64_t expert = 0; expert < experts; ++expert) {
-        const int64_t total = expert_demand[expert];
-        int64_t local = 0;
-        for (int rank = 0; rank < ranks; ++rank) {
-          local += min(demand[expert * ranks + rank],
-                       instance_quota[expert * ranks + rank]);
-        }
-        current_remote += total - local;
-      }
-    }
-    __syncthreads();
-    if (current_max <= ideal_capacity) break;
-
-    ComputeCandidate best = {0, 0, 0, 0, -1, -1};
-    for (int64_t index = threadIdx.x; index < experts * ranks;
-         index += blockDim.x) {
-      const int64_t expert = index / ranks;
-      const int target = index % ranks;
-      const int64_t total = expert_demand[expert];
-      if (!total || replicas[expert * ranks + target] ||
-          added_by_rank[target] >= max_extra_per_rank) {
-        continue;
-      }
-      for (int rank = 0; rank < ranks; ++rank) {
-        base[rank] = loads[rank] - instance_quota[expert * ranks + rank];
-      }
-      waterfill_fast<MaxRanks>(base, replicas, expert, target, total, allocation,
-                               ranks);
-      ComputeCandidate candidate = {
-          0, 0, 0, demand[expert * ranks + target], expert, target};
-      int64_t local = 0;
-      for (int rank = 0; rank < ranks; ++rank) {
-        const int64_t next = base[rank] + allocation[rank];
-        candidate.next_max = max(candidate.next_max, next);
-        candidate.next_square += next * next;
-        local += min(demand[expert * ranks + rank], allocation[rank]);
-      }
-      if (candidate.next_max > current_max ||
-          (candidate.next_max == current_max &&
-           candidate.next_square > current_square)) {
-        continue;
-      }
-      int64_t current_local = 0;
-      for (int rank = 0; rank < ranks; ++rank) {
-        current_local += min(demand[expert * ranks + rank],
-                             instance_quota[expert * ranks + rank]);
-      }
-      // Source-demand remote bound for the whole plan, replacing the
-      // candidate expert's contribution without scanning the trace.
-      candidate.remote = current_remote - (total - current_local) + (total - local);
-      if (better_candidate(candidate, best)) best = candidate;
-    }
-    candidates[threadIdx.x] = best;
-    __syncthreads();
-    if (threadIdx.x == 0) {
-      ComputeCandidate winner = candidates[0];
-      for (int index = 1; index < kThreads; ++index) {
-        if (better_candidate(candidates[index], winner)) {
-          winner = candidates[index];
-        }
-      }
-      done = winner.expert < 0;
-      if (!done) {
-        replicas[winner.expert * ranks + winner.target] = true;
-        addition_order[winner.expert * ranks + winner.target] = added + 1;
-        ++added_by_rank[winner.target];
-        ++added;
-      }
-    }
-    __syncthreads();
-    if (done) break;
+  if (!build_export_plan<MaxRanks>(
+          demand, primary, replicas, instance, loads, added_by_rank,
+          addition_order, plan_quota, experts, ranks, max_extra_per_rank, low, true,
+          added_out)) {
+    build_export_plan<MaxRanks>(
+        demand, primary, replicas, instance, loads, added_by_rank,
+        addition_order, plan_quota, experts, ranks, max_extra_per_rank, low, false,
+        added_out);
   }
-  if (threadIdx.x == 0) added_out[0] = added;
+  for (int64_t index = 0; index < experts * ranks; ++index) {
+    replicas[index] = replicas[index] || addition_order[index];
+  }
+  for (int source = 0; source < ranks; ++source) {
+    for (int64_t expert = 0; expert < experts; ++expert) {
+      if (!demand[expert * ranks + source]) {
+        routing[source * experts + expert] =
+            replicas[expert * ranks + source] ? source : primary[expert];
+        continue;
+      }
+      const int64_t offset = (source * experts + expert) * ranks;
+      int target = 0;
+      for (int rank = 1; rank < ranks; ++rank) {
+        if (plan_quota[offset + rank] > plan_quota[offset + target]) target = rank;
+      }
+      routing[source * experts + expert] = target;
+    }
+  }
 }
 
 __global__ void localize_quota_kernel(
@@ -835,22 +821,20 @@ std::tuple<torch::Tensor, torch::Tensor> solve_quota(
 }
 
 void select_compute_replicas_into(
-    torch::Tensor demand, torch::Tensor replicas, torch::Tensor expert_demand,
-    torch::Tensor demand_order, int64_t max_extra_per_rank,
+    torch::Tensor demand, torch::Tensor replicas, torch::Tensor primary,
+    int64_t max_extra_per_rank,
     torch::Tensor instance, torch::Tensor loads, torch::Tensor added_by_rank,
-    torch::Tensor addition_order, torch::Tensor added) {
-  TORCH_CHECK(demand.is_cuda() && replicas.is_cuda() &&
-              expert_demand.is_cuda() && demand_order.is_cuda());
+    torch::Tensor addition_order, torch::Tensor plan_quota,
+    torch::Tensor routing, torch::Tensor added) {
+  TORCH_CHECK(demand.is_cuda() && replicas.is_cuda() && primary.is_cuda());
   TORCH_CHECK(demand.scalar_type() == torch::kInt64 &&
               replicas.scalar_type() == torch::kBool &&
-              expert_demand.scalar_type() == torch::kInt64 &&
-              demand_order.scalar_type() == torch::kInt64 &&
+              primary.scalar_type() == torch::kInt64 &&
               demand.sizes() == replicas.sizes());
   const int64_t experts = demand.size(0);
   const int64_t ranks = demand.size(1);
   TORCH_CHECK(ranks > 0 && ranks <= kMaxRanks, "compute replicas support 1-128 ranks");
-  TORCH_CHECK(expert_demand.numel() == experts &&
-              demand_order.numel() == experts && max_extra_per_rank >= 0);
+  TORCH_CHECK(primary.numel() == experts && max_extra_per_rank >= 0);
   TORCH_CHECK(instance.is_cuda() && instance.scalar_type() == torch::kInt64 &&
               instance.sizes() == demand.sizes());
   TORCH_CHECK(loads.is_cuda() && loads.scalar_type() == torch::kInt64 &&
@@ -859,66 +843,75 @@ void select_compute_replicas_into(
               added_by_rank.numel() == ranks);
   TORCH_CHECK(addition_order.is_cuda() && addition_order.scalar_type() == torch::kInt64 &&
               addition_order.sizes() == demand.sizes());
+  TORCH_CHECK(plan_quota.is_cuda() && plan_quota.scalar_type() == torch::kInt64 &&
+              plan_quota.dim() == 3 && plan_quota.size(0) == ranks &&
+              plan_quota.size(1) == experts && plan_quota.size(2) == ranks);
+  TORCH_CHECK(routing.is_cuda() && routing.scalar_type() == torch::kInt64 &&
+              routing.dim() == 2 && routing.size(0) == ranks &&
+              routing.size(1) == experts);
   TORCH_CHECK(added.is_cuda() && added.scalar_type() == torch::kInt64 && added.numel() == 1);
   auto stream = c10::cuda::getCurrentCUDAStream(demand.get_device());
   if (ranks <= 4) {
-    launch(select_compute_replicas_kernel<4>, dim3(1), dim3(128), stream.stream(),
-           demand.data_ptr<int64_t>(), expert_demand.data_ptr<int64_t>(),
-           demand_order.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
+    launch(select_compute_replicas_kernel<4>, dim3(1), dim3(32), stream.stream(),
+           demand.data_ptr<int64_t>(), primary.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
            instance.data_ptr<int64_t>(), loads.data_ptr<int64_t>(),
            added_by_rank.data_ptr<int64_t>(), addition_order.data_ptr<int64_t>(),
+           plan_quota.data_ptr<int64_t>(), routing.data_ptr<int64_t>(),
            added.data_ptr<int64_t>(), experts, ranks, max_extra_per_rank);
   } else if (ranks <= 8) {
-    launch(select_compute_replicas_kernel<8>, dim3(1), dim3(128), stream.stream(),
-           demand.data_ptr<int64_t>(), expert_demand.data_ptr<int64_t>(),
-           demand_order.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
+    launch(select_compute_replicas_kernel<8>, dim3(1), dim3(32), stream.stream(),
+           demand.data_ptr<int64_t>(), primary.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
            instance.data_ptr<int64_t>(), loads.data_ptr<int64_t>(),
            added_by_rank.data_ptr<int64_t>(), addition_order.data_ptr<int64_t>(),
+           plan_quota.data_ptr<int64_t>(), routing.data_ptr<int64_t>(),
            added.data_ptr<int64_t>(), experts, ranks, max_extra_per_rank);
   } else if (ranks <= 16) {
-    launch(select_compute_replicas_kernel<16>, dim3(1), dim3(128), stream.stream(),
-           demand.data_ptr<int64_t>(), expert_demand.data_ptr<int64_t>(),
-           demand_order.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
+    launch(select_compute_replicas_kernel<16>, dim3(1), dim3(32), stream.stream(),
+           demand.data_ptr<int64_t>(), primary.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
            instance.data_ptr<int64_t>(), loads.data_ptr<int64_t>(),
            added_by_rank.data_ptr<int64_t>(), addition_order.data_ptr<int64_t>(),
+           plan_quota.data_ptr<int64_t>(), routing.data_ptr<int64_t>(),
            added.data_ptr<int64_t>(), experts, ranks, max_extra_per_rank);
   } else if (ranks <= 32) {
-    launch(select_compute_replicas_kernel<32>, dim3(1), dim3(128), stream.stream(),
-           demand.data_ptr<int64_t>(), expert_demand.data_ptr<int64_t>(),
-           demand_order.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
+    launch(select_compute_replicas_kernel<32>, dim3(1), dim3(32), stream.stream(),
+           demand.data_ptr<int64_t>(), primary.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
            instance.data_ptr<int64_t>(), loads.data_ptr<int64_t>(),
            added_by_rank.data_ptr<int64_t>(), addition_order.data_ptr<int64_t>(),
+           plan_quota.data_ptr<int64_t>(), routing.data_ptr<int64_t>(),
            added.data_ptr<int64_t>(), experts, ranks, max_extra_per_rank);
   } else if (ranks <= 64) {
-    launch(select_compute_replicas_kernel<64>, dim3(1), dim3(128), stream.stream(),
-           demand.data_ptr<int64_t>(), expert_demand.data_ptr<int64_t>(),
-           demand_order.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
+    launch(select_compute_replicas_kernel<64>, dim3(1), dim3(32), stream.stream(),
+           demand.data_ptr<int64_t>(), primary.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
            instance.data_ptr<int64_t>(), loads.data_ptr<int64_t>(),
            added_by_rank.data_ptr<int64_t>(), addition_order.data_ptr<int64_t>(),
+           plan_quota.data_ptr<int64_t>(), routing.data_ptr<int64_t>(),
            added.data_ptr<int64_t>(), experts, ranks, max_extra_per_rank);
   } else {
-    launch(select_compute_replicas_kernel<128>, dim3(1), dim3(128), stream.stream(),
-           demand.data_ptr<int64_t>(), expert_demand.data_ptr<int64_t>(),
-           demand_order.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
+    launch(select_compute_replicas_kernel<128>, dim3(1), dim3(32), stream.stream(),
+           demand.data_ptr<int64_t>(), primary.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
            instance.data_ptr<int64_t>(), loads.data_ptr<int64_t>(),
            added_by_rank.data_ptr<int64_t>(), addition_order.data_ptr<int64_t>(),
+           plan_quota.data_ptr<int64_t>(), routing.data_ptr<int64_t>(),
            added.data_ptr<int64_t>(), experts, ranks, max_extra_per_rank);
   }
   check_cuda(cudaGetLastError());
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> select_compute_replicas(
-    torch::Tensor demand, torch::Tensor replicas, torch::Tensor expert_demand,
-    torch::Tensor demand_order, int64_t max_extra_per_rank) {
+    torch::Tensor demand, torch::Tensor replicas, torch::Tensor primary,
+    int64_t max_extra_per_rank) {
   auto next_replicas = replicas.clone();
   auto instance = torch::zeros_like(demand);
   auto loads = torch::zeros({demand.size(1)}, demand.options());
   auto added_by_rank = torch::zeros_like(loads);
   auto addition_order = torch::zeros_like(demand);
+  auto plan_quota = torch::zeros({demand.size(1), demand.size(0), demand.size(1)},
+                                 demand.options());
+  auto routing = torch::zeros({demand.size(1), demand.size(0)}, demand.options());
   auto added = torch::zeros({1}, demand.options());
-  select_compute_replicas_into(demand, next_replicas, expert_demand, demand_order,
+  select_compute_replicas_into(demand, next_replicas, primary,
                                max_extra_per_rank, instance, loads, added_by_rank,
-                               addition_order, added);
+                               addition_order, plan_quota, routing, added);
   return {next_replicas, added, addition_order};
 }
 

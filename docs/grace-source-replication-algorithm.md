@@ -420,59 +420,34 @@ source_demand
 expert_demand
 ```
 
-计算副本搜索不再只按远端 source 做逐副本排序，而是采用 source-aware 的
-capacity/export 混合判据。候选只对受影响 expert 做临时 waterfill，因此保留了
-GRACE 的确定性和较低开销；同时用 source-demand 的远程上界评估通信代价。
+计算副本搜索采用与 UltraEP placement solver 相同形态的 capacity/export
+求解过程，但保留 GRACE 的 source-aware 通信目标。它不枚举一个副本、重算一次全局
+placement，而是在一个候选 rank capacity 下批量构造完整 export plan。
 
 ### 10.2 候选生成
 
-每一轮：
+1. 从最低通信 quota 开始：source 有本地副本就本地执行，否则在 primary 执行；
+2. 计算理想容量 `ceil(total / R)`，先直接运行一次 feasibility oracle；
+3. 若理想容量不可行，只在 `[ideal, initial_max_load]` 中二分最小可行 threshold；
+4. oracle 为每个 rank 维护 `excess=max(load-threshold, 0)`、目标 slack 和新增副本槽位；
+5. 从过载 rank 的 `(source, expert)` quota 中选择可导出的正负载，一次更新 source
+   excess、target slack、replica occupancy 和 export quota；
+6. 已有副本不消耗计算槽位；新副本只有在实际承接正 quota 时才占用一个槽位；
+7. 所有过载 rank 都消除时，该 threshold 可行，并得到完整 export plan。
 
-1. 用 `_greedy_instance_quotas()` 计算当前副本集合的 instance loads；
-2. 先在当前 replica graph 上执行全局增广；如果现有副本已经能达到理想容量，就不再
-   浪费计算副本槽位；
-3. 当前计算目标为：
-
-```text
-(max(loads), sum(loads ** 2))
-```
-
-4. 跳过已有副本或已经达到 target rank 槽位上限的候选；
-5. 临时把 expert 加到 target，重新 waterfill 该 expert；
-6. 计算候选的新 load key 和 source-demand 远程上界。
-
-达到理想整数容量后搜索立即停止。在尚未达到容量时，候选不允许让计算 key 变差；
-计算 key 完全不变的候选可以保留，因为它可能为后续全局 rebalance 打开一条新的
-增广路径。候选排序中不插入通信或其他代理指标来打断这两个计算目标。
+因此计算目标直接是最小可行 threshold，而不是依赖逐副本 greedy 的局部 load key。
 
 ### 10.3 Tie-break
 
-计算 key 相同时，按以下顺序选择：
+先用 capacity-first oracle 确定最小可行 threshold，再在同一 threshold 重建一次
+communication-first plan。它优先把 quota 导出到产生该 expert 请求的 source rank，
+因为此时新增副本可以把一次远程执行变成本地执行；其次比较可搬运 quota、是否可复用
+已有副本和稳定的 expert/rank id。若通信优先的构造因槽位选择而失败，则回退到同一
+threshold 的 capacity-first plan，计算均衡不会被通信目标破坏。
 
-```text
-remote_budget_violation
-remote_after
--source_demand[e, target]   目标 source 对该 expert 的需求越大越优先
-expert
-target
-```
-
-这保证计算负载目标相同的时候，优先选择更可能带来本地执行收益的复制。
-
-### 10.4 应用候选
-
-每轮只应用一个全局最佳候选：
-
-```text
-replicas[e] += (target,)
-added_by_rank[target] += 1
-```
-
-直到：
-
-- 达到 `R * max_compute_extra_per_rank` 总槽位；或
-- 当前最大负载已经达到理想整数容量；或
-- 没有任何计算 key 不变或改善的候选。
+最终 plan 同时给出 `(expert, target, quota)` export。副本集合先由其中承接正 quota 的
+新边确定，source quota 随后按相同 replica graph 构造，并只用 residual augmenting
+path 做容量正确性修复，不再让 quota repair 承担主要副本规划。
 
 ## 11. 通信预算下的 quota 选择
 
@@ -491,6 +466,10 @@ budget = ceil(baseline_metric * communication_budget_ratio)
 ### 11.1 四轮通信感知 quota
 
 `_communication_aware_quotas()` 不删除已经存在的 replicas，只改变 quota 和 preferred routing。
+
+CUDA 常驻 runtime 在 `communication_budget_ratio` 为 `None` 或 `1.0` 且启用计算副本时，
+直接消费 capacity/export solver 已生成的 source quota，不再运行下面的旧 quota 重求解；
+其他预算比例仍保留多候选路径用于比较预算 violation。
 
 每轮执行：
 

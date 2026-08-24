@@ -9,7 +9,10 @@ Build from the repository root:
     python setup.py build_ext --inplace
 
 The extension has separate CUDA translation units for demand histogram,
-source-aware Top-N placement, and traffic evaluation. ptx.cuh contains the
-cache-load helper; tma.cuh is reserved for contiguous quota-prefix tiles,
-where TMA is appropriate. Sparse trace histogram and routing use coalesced
-loads and atomics.
+source-aware Top-N placement, capacity/export planning, quota routing, and
+traffic evaluation. Compute replicas are selected by probing the ideal rank
+capacity first, then binary-searching only when that threshold is infeasible.
+The final export pass prefers source-local targets at the same feasible
+capacity and creates a replica only when it receives positive quota. The
+GPU-resident runtime consumes that export quota directly, so the hot path does
+not rerun the old per-expert quota solver.

@@ -32,10 +32,11 @@ std::tuple<torch::Tensor, torch::Tensor> quota_traffic(
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
     torch::Tensor, torch::Tensor, torch::Tensor, int64_t);
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> select_compute_replicas(
-    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t);
+    torch::Tensor, torch::Tensor, torch::Tensor, int64_t);
 void select_compute_replicas_into(
-    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
-    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor);
+    torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor);
 }  // namespace grace_cuda
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

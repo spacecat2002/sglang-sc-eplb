@@ -487,6 +487,21 @@ def test_compute_selector_reuses_existing_augmenting_capacity():
     assert added == 0
 
 
+def test_compute_selector_copies_locally_instead_of_balancing_remotely():
+    replicas = {0: (0, 1), 1: (1, 0)}
+    source_demand = np.array([[0, 10, 0], [10, 0, 10]])
+
+    selected, added = _capacity_export_replicas(
+        source_demand,
+        replicas.copy(),
+        num_ranks=3,
+        max_extra_per_rank=1,
+    )
+
+    assert selected[1] == (1, 0, 2)
+    assert added == 1
+
+
 def test_compute_rebalance_uses_an_augmenting_path():
     quota = np.zeros((3, 2, 3), dtype=np.int64)
     quota[0, 0, 0] = 12

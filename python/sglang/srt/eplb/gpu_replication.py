@@ -667,7 +667,12 @@ def replicate_source_top_experts_cuda(
     instance_out = runtime.instance if runtime is not None else None
     loads_out = runtime.loads if runtime is not None else None
     needs_quota = compute_imbalance_limit is not None or max_compute_extra_per_rank > 0
-    if needs_quota:
+    direct_export_quota = (
+        runtime is not None
+        and max_compute_extra_per_rank > 0
+        and communication_budget_ratio in (None, 1.0)
+    )
+    if needs_quota and not direct_export_quota:
         expert_demand = demand.sum(dim=1)
         demand_order = torch.argsort(expert_demand, descending=True, stable=True)
         source_order = torch.argsort(demand.t(), dim=1, descending=True, stable=True)
@@ -690,21 +695,21 @@ def replicate_source_top_experts_cuda(
             replica_mask, balance_copies, addition_order = _C.select_compute_replicas(
                 demand,
                 replica_mask,
-                expert_demand,
-                demand_order,
+                primary_tensor,
                 max_compute_extra_per_rank,
             )
         else:
             _C.select_compute_replicas_into(
                 demand,
                 replica_mask,
-                expert_demand,
-                demand_order,
+                primary_tensor,
                 max_compute_extra_per_rank,
                 runtime.compute_instance,
                 runtime.compute_loads,
                 runtime.compute_added_by_rank,
                 runtime.compute_addition_order,
+                runtime.quota,
+                runtime.routing,
                 runtime.compute_added,
             )
             balance_copies = runtime.compute_added
@@ -712,20 +717,36 @@ def replicate_source_top_experts_cuda(
         _record(timing, "compute_replication_ms", compute_started)
         if runtime is None:
             routing_tensor = _C.default_routing(replica_mask, primary_tensor)
-        else:
-            _C.default_routing_into(replica_mask, primary_tensor, routing_tensor)
-        # Compute replicas change which experts are flexible.  Quota must use
-        # the post-replication order, not the order used to select copies.
-        flexible = replica_mask.sum(dim=1) > 1
-        expert_order = demand_order[
-            torch.argsort(flexible[demand_order].to(torch.int8), stable=True)
-        ]
+        if not direct_export_quota:
+            # Compute replicas change which experts are flexible.
+            flexible = replica_mask.sum(dim=1) > 1
+            expert_order = demand_order[
+                torch.argsort(flexible[demand_order].to(torch.int8), stable=True)
+            ]
     if not needs_quota:
         metrics_started = _phase_start(timing)
         metrics = _route_cuda(
             source, topk, count, primary_tensor, replica_mask, num_ranks
         )
         _record(timing, "quota_allocation_ms", metrics_started)
+    elif direct_export_quota:
+        quota_started = _phase_start(timing)
+        quota = runtime.quota
+        _record(timing, "quota_solve_ms", quota_started)
+        allocation_started = _phase_start(timing)
+        bundle_ordinals = _bundle_ordinals_cuda(source, topk, count, num_experts)
+        metrics = _quota_route_cuda(
+            source,
+            topk,
+            count,
+            quota,
+            replica_mask,
+            primary_tensor,
+            addition_order,
+            num_ranks,
+            bundle_ordinals,
+        )
+        _record(timing, "quota_allocation_ms", allocation_started)
     elif communication_budget_ratio is None:
         quota_started = _phase_start(timing)
         quota, routing_tensor = _quota_cuda(

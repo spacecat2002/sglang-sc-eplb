@@ -161,10 +161,8 @@ def test_kernels() -> None:
 
     unbalanced = torch.tensor([[10, 0], [10, 0]], device="cuda", dtype=torch.int64)
     initial = torch.tensor([[True, False], [True, False]], device="cuda")
-    expert_demand = unbalanced.sum(dim=1)
-    expert_order = torch.tensor([0, 1], device="cuda", dtype=torch.int64)
     balanced, added, addition_order = _C.select_compute_replicas(
-        unbalanced, initial, expert_demand, expert_order, 1
+        unbalanced, initial, torch.tensor([0, 0], device="cuda"), 1
     )
     assert balanced.cpu().tolist() == [[True, True], [True, False]]
     assert added.item() == 1
@@ -174,22 +172,27 @@ def test_kernels() -> None:
     into_loads = torch.empty((2,), device="cuda", dtype=torch.int64)
     into_added_by_rank = torch.empty_like(into_loads)
     into_order = torch.empty_like(unbalanced)
+    into_quota = torch.empty((2, 2, 2), device="cuda", dtype=torch.int64)
+    into_routing = torch.empty((2, 2), device="cuda", dtype=torch.int64)
     into_added = torch.empty((1,), device="cuda", dtype=torch.int64)
     _C.select_compute_replicas_into(
         unbalanced,
         into_replicas,
-        expert_demand,
-        expert_order,
+        torch.tensor([0, 0], device="cuda"),
         1,
         into_instance,
         into_loads,
         into_added_by_rank,
         into_order,
+        into_quota,
+        into_routing,
         into_added,
     )
     assert torch.equal(into_replicas, balanced)
     assert torch.equal(into_order, addition_order)
     assert into_added.item() == added.item()
+    assert into_quota.sum(dim=(0, 1)).cpu().tolist() == [10, 10]
+    assert torch.equal(into_quota.sum(dim=2), unbalanced.t())
 
     # A requested 1.0x limit must actually localize quota from an overloaded
     # rank when the replica set can serve the other rank.
@@ -271,12 +274,43 @@ def test_kernels() -> None:
     selected, added, _ = _C.select_compute_replicas(
         augment_demand,
         augment_replicas.clone(),
-        augment_demand.sum(dim=1),
-        torch.tensor([2, 1, 0], device="cuda"),
+        augment_primary,
         1,
     )
     assert torch.equal(selected, augment_replicas)
     assert added.item() == 0
+
+    # At the same optimal threshold, prefer a new source-local copy over
+    # exporting the source's load to an already-present remote replica.
+    local_demand = torch.tensor(
+        [
+            [0, 0, 0, 10],
+            [10, 0, 0, 0],
+            [0, 5, 0, 0],
+            [0, 0, 10, 0],
+            [0, 0, 0, 5],
+        ],
+        device="cuda",
+        dtype=torch.int64,
+    )
+    local_replicas = torch.tensor(
+        [
+            [True, True, False, False],
+            [True, False, False, False],
+            [False, True, False, False],
+            [False, False, True, False],
+            [False, False, False, True],
+        ],
+        device="cuda",
+    )
+    local_selected, local_added, _ = _C.select_compute_replicas(
+        local_demand,
+        local_replicas,
+        torch.tensor([0, 0, 1, 2, 3], device="cuda"),
+        1,
+    )
+    assert local_selected[0].cpu().tolist() == [True, True, False, True]
+    assert local_added.item() == 1
 
     # The first overloaded rank is fixed above capacity. The solver must still
     # rebalance a later overloaded rank that has a feasible export path.
