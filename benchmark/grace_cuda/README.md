@@ -10,8 +10,9 @@ Build from the repository root:
 
 With `--affinity-placement`, the initial placement uses the same normalized
 spectral embedding, deterministic k-means, exact-size repair, and lexicographic
-Hungarian rank assignment as the Python implementation. Compute balancing is
-left to the replica and quota solver after primary placement.
+Hungarian rank assignment as the Python implementation. It then applies the
+same four-round, exact Top-K congestion move refinement as GRACE+, without its
+optional swap pass; capacity may vary by the GRACE+ default 15% bound.
 
 The extension also has CUDA stages for demand histogram, source-aware Top-N
 placement, capacity/export planning, quota routing, and traffic evaluation.

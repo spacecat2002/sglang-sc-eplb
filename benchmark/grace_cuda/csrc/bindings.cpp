@@ -17,6 +17,11 @@ void group_source_into(torch::Tensor, torch::Tensor, torch::Tensor,
 void congestion_hungarian_into(torch::Tensor, torch::Tensor, torch::Tensor,
                                torch::Tensor, torch::Tensor, torch::Tensor,
                                torch::Tensor, torch::Tensor);
+void refine_congestion_into(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    int64_t, int64_t, double, int64_t, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor);
 torch::Tensor source_demand(torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
                             int64_t);
 void source_demand_into(torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
@@ -59,6 +64,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("spectral_groups_into", &grace_cuda::spectral_groups_into);
   m.def("group_source_into", &grace_cuda::group_source_into);
   m.def("congestion_hungarian_into", &grace_cuda::congestion_hungarian_into);
+  m.def("refine_congestion_into", &grace_cuda::refine_congestion_into);
   m.def("source_demand", &grace_cuda::source_demand);
   m.def("source_demand_into", &grace_cuda::source_demand_into);
   m.def("fused_source_topn", &grace_cuda::fused_source_topn);

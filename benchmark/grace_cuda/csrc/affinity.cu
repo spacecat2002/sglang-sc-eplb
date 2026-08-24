@@ -538,6 +538,255 @@ __global__ void congestion_hungarian_kernel(
     primary[expert] = assignment[groups[expert]];
 }
 
+__global__ void occurrence_count_kernel(const int64_t* topk, int64_t* counts,
+                                        int64_t entries) {
+  const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index < entries)
+    atomicAdd(reinterpret_cast<unsigned long long*>(counts + topk[index]), 1ULL);
+}
+
+__global__ void occurrence_prefix_kernel(int64_t* counts, int64_t* offsets,
+                                         int64_t* cursors, int64_t experts) {
+  if (blockIdx.x || threadIdx.x) return;
+  int64_t offset = 0;
+  for (int64_t expert = 0; expert < experts; ++expert) {
+    offsets[expert] = offset;
+    cursors[expert] = 0;
+    offset += counts[expert];
+  }
+  offsets[experts] = offset;
+}
+
+__global__ void occurrence_fill_kernel(const int64_t* topk,
+                                       const int64_t* offsets,
+                                       int64_t* cursors, int64_t* tokens,
+                                       int64_t entries, int64_t k) {
+  const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= entries) return;
+  const int64_t expert = topk[index];
+  const int64_t position = atomicAdd(
+      reinterpret_cast<unsigned long long*>(cursors + expert), 1ULL);
+  tokens[offsets[expert] + position] = index / k;
+}
+
+__global__ void refinement_state_kernel(
+    const int64_t* source, const int64_t* topk, const int64_t* count,
+    const int64_t* demand, const int64_t* primary, int64_t* slots,
+    int64_t* loads, int64_t* traffic, int64_t tokens, int64_t k,
+    int64_t experts, int ranks) {
+  const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index < experts) {
+    const int rank = primary[index];
+    int64_t total = 0;
+    for (int source_rank = 0; source_rank < ranks; ++source_rank)
+      total += demand[index * ranks + source_rank];
+    atomicAdd(reinterpret_cast<unsigned long long*>(slots + rank), 1ULL);
+    atomicAdd(reinterpret_cast<unsigned long long*>(loads + rank),
+              static_cast<unsigned long long>(total));
+  }
+  if (index >= tokens) return;
+  for (int64_t column = 0; column < k; ++column) {
+    const int rank = primary[topk[index * k + column]];
+    bool first = true;
+    for (int64_t previous = 0; previous < column; ++previous)
+      first &= primary[topk[index * k + previous]] != rank;
+    if (first && source[index] != rank)
+      atomicAdd(reinterpret_cast<unsigned long long*>(
+                    traffic + source[index] * ranks + rank),
+                static_cast<unsigned long long>(count[index]));
+  }
+}
+
+__global__ void congestion_move_candidates_kernel(
+    const int64_t* source, const int64_t* topk, const int64_t* count,
+    const int64_t* demand, const int64_t* primary, const int64_t* offsets,
+    const int64_t* occurrence_tokens, const int64_t* slots,
+    const int64_t* loads, const int64_t* traffic, int64_t* candidates,
+    int64_t k, int64_t experts, int ranks, int64_t minimum_capacity,
+    int64_t maximum_capacity, double compute_limit) {
+  const int64_t candidate = blockIdx.x;
+  const int64_t expert = candidate / ranks;
+  const int target = candidate % ranks;
+  const int old = primary[expert];
+  __shared__ unsigned long long delta[256];
+  for (int index = threadIdx.x; index < 2 * ranks; index += blockDim.x)
+    delta[index] = 0;
+  __syncthreads();
+  if (target == old || slots[old] <= minimum_capacity ||
+      slots[target] >= maximum_capacity) {
+    if (!threadIdx.x) candidates[candidate * 5] = 0;
+    return;
+  }
+  for (int64_t position = offsets[expert] + threadIdx.x;
+       position < offsets[expert + 1]; position += blockDim.x) {
+    const int64_t token = occurrence_tokens[position];
+    int old_count = 0;
+    int target_count = 0;
+    for (int64_t column = 0; column < k; ++column) {
+      const int rank = primary[topk[token * k + column]];
+      old_count += rank == old;
+      target_count += rank == target;
+    }
+    const int source_rank = source[token];
+    const int64_t weight = count[token];
+    if (old_count == 1 && source_rank != old)
+      atomicAdd(delta + source_rank, static_cast<unsigned long long>(-weight));
+    if (!target_count && source_rank != target)
+      atomicAdd(delta + ranks + source_rank,
+                static_cast<unsigned long long>(weight));
+  }
+  __syncthreads();
+  if (threadIdx.x) return;
+  int64_t expert_demand = 0;
+  int64_t total_demand = 0;
+  int64_t current_peak = 0;
+  for (int rank = 0; rank < ranks; ++rank) {
+    expert_demand += demand[expert * ranks + rank];
+    total_demand += loads[rank];
+    current_peak = max(current_peak, loads[rank]);
+  }
+  const int64_t next_old = loads[old] - expert_demand;
+  const int64_t next_target = loads[target] + expert_demand;
+  int64_t compute_peak = 0;
+  for (int rank = 0; rank < ranks; ++rank)
+    compute_peak = max(compute_peak, rank == old ? next_old :
+                       rank == target ? next_target : loads[rank]);
+  const double limit_peak = compute_limit * total_demand / ranks;
+  const double allowed_peak =
+      limit_peak > current_peak ? limit_peak : static_cast<double>(current_peak);
+  if (compute_peak > allowed_peak) {
+    candidates[candidate * 5] = 0;
+    return;
+  }
+  int64_t remote = 0;
+  int64_t pair = 0;
+  int64_t max_ingress = 0;
+  int64_t max_egress = 0;
+  for (int source_rank = 0; source_rank < ranks; ++source_rank) {
+    int64_t egress = 0;
+    for (int rank = 0; rank < ranks; ++rank) {
+      int64_t value = traffic[source_rank * ranks + rank];
+      if (rank == old) value += static_cast<int64_t>(delta[source_rank]);
+      if (rank == target)
+        value += static_cast<int64_t>(delta[ranks + source_rank]);
+      remote += value;
+      egress += value;
+      pair = max(pair, value);
+    }
+    max_egress = max(max_egress, egress);
+  }
+  for (int rank = 0; rank < ranks; ++rank) {
+    int64_t ingress = 0;
+    for (int source_rank = 0; source_rank < ranks; ++source_rank) {
+      int64_t value = traffic[source_rank * ranks + rank];
+      if (rank == old) value += static_cast<int64_t>(delta[source_rank]);
+      if (rank == target)
+        value += static_cast<int64_t>(delta[ranks + source_rank]);
+      ingress += value;
+    }
+    max_ingress = max(max_ingress, ingress);
+  }
+  candidates[candidate * 5] = 1;
+  candidates[candidate * 5 + 1] = max(max_ingress, max_egress);
+  candidates[candidate * 5 + 2] = pair;
+  candidates[candidate * 5 + 3] = remote;
+  candidates[candidate * 5 + 4] = compute_peak;
+}
+
+__global__ void select_congestion_move_kernel(
+    const int64_t* traffic, const int64_t* candidates, int64_t* selected,
+    int64_t experts, int ranks) {
+  if (blockIdx.x || threadIdx.x) return;
+  int64_t current_remote = 0;
+  int64_t current_pair = 0;
+  int64_t current_ingress = 0;
+  int64_t current_egress = 0;
+  for (int source = 0; source < ranks; ++source) {
+    int64_t egress = 0;
+    for (int rank = 0; rank < ranks; ++rank) {
+      const int64_t value = traffic[source * ranks + rank];
+      current_remote += value;
+      egress += value;
+      current_pair = max(current_pair, value);
+    }
+    current_egress = max(current_egress, egress);
+  }
+  for (int rank = 0; rank < ranks; ++rank) {
+    int64_t ingress = 0;
+    for (int source = 0; source < ranks; ++source)
+      ingress += traffic[source * ranks + rank];
+    current_ingress = max(current_ingress, ingress);
+  }
+  const int64_t current_bottleneck = max(current_ingress, current_egress);
+  int64_t best = -1;
+  for (int64_t candidate = 0; candidate < experts * ranks; ++candidate) {
+    const int64_t* value = candidates + candidate * 5;
+    if (!value[0]) continue;
+    const bool improves = value[1] < current_bottleneck ||
+        (value[1] == current_bottleneck &&
+         (value[2] < current_pair ||
+          (value[2] == current_pair && value[3] < current_remote)));
+    if (!improves) continue;
+    if (best < 0) {
+      best = candidate;
+      continue;
+    }
+    const int64_t* previous = candidates + best * 5;
+    bool better = false;
+    for (int key = 1; key < 5; ++key) {
+      if (value[key] != previous[key]) {
+        better = value[key] < previous[key];
+        break;
+      }
+    }
+    if (better) best = candidate;
+  }
+  selected[0] = best < 0 ? -1 : best / ranks;
+  selected[1] = best < 0 ? -1 : best % ranks;
+}
+
+__global__ void apply_congestion_move_kernel(
+    const int64_t* source, const int64_t* topk, const int64_t* count,
+    const int64_t* demand, int64_t* primary, const int64_t* offsets,
+    const int64_t* occurrence_tokens, int64_t* slots, int64_t* loads,
+    int64_t* traffic, const int64_t* selected, int64_t k, int ranks) {
+  const int64_t expert = selected[0];
+  if (expert < 0) return;
+  const int target = selected[1];
+  const int old = primary[expert];
+  for (int64_t position = offsets[expert] + threadIdx.x;
+       position < offsets[expert + 1]; position += blockDim.x) {
+    const int64_t token = occurrence_tokens[position];
+    int old_count = 0;
+    int target_count = 0;
+    for (int64_t column = 0; column < k; ++column) {
+      const int rank = primary[topk[token * k + column]];
+      old_count += rank == old;
+      target_count += rank == target;
+    }
+    const int source_rank = source[token];
+    if (old_count == 1 && source_rank != old)
+      atomicAdd(reinterpret_cast<unsigned long long*>(
+                    traffic + source_rank * ranks + old),
+                static_cast<unsigned long long>(-count[token]));
+    if (!target_count && source_rank != target)
+      atomicAdd(reinterpret_cast<unsigned long long*>(
+                    traffic + source_rank * ranks + target),
+                static_cast<unsigned long long>(count[token]));
+  }
+  __syncthreads();
+  if (!threadIdx.x) {
+    int64_t expert_demand = 0;
+    for (int rank = 0; rank < ranks; ++rank)
+      expert_demand += demand[expert * ranks + rank];
+    --slots[old];
+    ++slots[target];
+    loads[old] -= expert_demand;
+    loads[target] += expert_demand;
+    primary[expert] = target;
+  }
+}
+
 }  // namespace
 
 void affinity_primary_into(
@@ -692,6 +941,93 @@ void congestion_hungarian_into(
          cost.data_ptr<int64_t>(), work.data_ptr<int64_t>(),
          assignment.data_ptr<int64_t>(), primary.data_ptr<int64_t>(),
          groups.numel(), ranks);
+  check_cuda(cudaGetLastError());
+}
+
+void refine_congestion_into(
+    torch::Tensor source, torch::Tensor topk, torch::Tensor count,
+    torch::Tensor demand, torch::Tensor primary, int64_t minimum_capacity,
+    int64_t maximum_capacity, double compute_limit, int64_t rounds,
+    torch::Tensor occurrence_counts, torch::Tensor occurrence_offsets,
+    torch::Tensor occurrence_cursors, torch::Tensor occurrence_tokens,
+    torch::Tensor slots, torch::Tensor loads, torch::Tensor traffic,
+    torch::Tensor candidates, torch::Tensor selected) {
+  const int64_t experts = demand.size(0);
+  const int ranks = demand.size(1);
+  const int64_t entries = topk.numel();
+  TORCH_CHECK(source.is_cuda() && topk.is_cuda() && count.is_cuda() &&
+              demand.is_cuda() && primary.is_cuda());
+  TORCH_CHECK(occurrence_counts.is_cuda() && occurrence_offsets.is_cuda() &&
+              occurrence_cursors.is_cuda() && occurrence_tokens.is_cuda() &&
+              slots.is_cuda() && loads.is_cuda() && traffic.is_cuda() &&
+              candidates.is_cuda() && selected.is_cuda());
+  TORCH_CHECK(source.scalar_type() == torch::kInt64 &&
+              topk.scalar_type() == torch::kInt64 &&
+              count.scalar_type() == torch::kInt64 &&
+              demand.scalar_type() == torch::kInt64 &&
+              primary.scalar_type() == torch::kInt64);
+  TORCH_CHECK(experts >= ranks && ranks > 0 && ranks <= 128 &&
+              minimum_capacity >= 1 && maximum_capacity >= minimum_capacity &&
+              compute_limit >= 1 && rounds >= 0);
+  TORCH_CHECK(occurrence_counts.numel() == experts &&
+              occurrence_offsets.numel() == experts + 1 &&
+              occurrence_cursors.numel() == experts &&
+              occurrence_tokens.numel() == entries && slots.numel() == ranks &&
+              loads.numel() == ranks && traffic.numel() == ranks * ranks &&
+              candidates.numel() == experts * ranks * 5 && selected.numel() == 2);
+  TORCH_CHECK(occurrence_counts.scalar_type() == torch::kInt64 &&
+              occurrence_offsets.scalar_type() == torch::kInt64 &&
+              occurrence_cursors.scalar_type() == torch::kInt64 &&
+              occurrence_tokens.scalar_type() == torch::kInt64 &&
+              slots.scalar_type() == torch::kInt64 &&
+              loads.scalar_type() == torch::kInt64 &&
+              traffic.scalar_type() == torch::kInt64 &&
+              candidates.scalar_type() == torch::kInt64 &&
+              selected.scalar_type() == torch::kInt64);
+  occurrence_counts.zero_();
+  slots.zero_();
+  loads.zero_();
+  traffic.zero_();
+  auto stream = c10::cuda::getCurrentCUDAStream(source.get_device());
+  launch(occurrence_count_kernel, dim3((entries + 255) / 256), dim3(256),
+         stream.stream(), topk.data_ptr<int64_t>(),
+         occurrence_counts.data_ptr<int64_t>(), entries);
+  launch(occurrence_prefix_kernel, dim3(1), dim3(1), stream.stream(),
+         occurrence_counts.data_ptr<int64_t>(),
+         occurrence_offsets.data_ptr<int64_t>(),
+         occurrence_cursors.data_ptr<int64_t>(), experts);
+  launch(occurrence_fill_kernel, dim3((entries + 255) / 256), dim3(256),
+         stream.stream(), topk.data_ptr<int64_t>(),
+         occurrence_offsets.data_ptr<int64_t>(),
+         occurrence_cursors.data_ptr<int64_t>(),
+         occurrence_tokens.data_ptr<int64_t>(), entries, topk.size(1));
+  const int64_t state_items = source.numel() > experts ? source.numel() : experts;
+  launch(refinement_state_kernel, dim3((state_items + 255) / 256), dim3(256),
+         stream.stream(), source.data_ptr<int64_t>(), topk.data_ptr<int64_t>(),
+         count.data_ptr<int64_t>(), demand.data_ptr<int64_t>(),
+         primary.data_ptr<int64_t>(), slots.data_ptr<int64_t>(),
+         loads.data_ptr<int64_t>(), traffic.data_ptr<int64_t>(), source.numel(),
+         topk.size(1), experts, ranks);
+  for (int64_t round = 0; round < rounds; ++round) {
+    launch(congestion_move_candidates_kernel, dim3(experts * ranks), dim3(256),
+           stream.stream(), source.data_ptr<int64_t>(), topk.data_ptr<int64_t>(),
+           count.data_ptr<int64_t>(), demand.data_ptr<int64_t>(),
+           primary.data_ptr<int64_t>(), occurrence_offsets.data_ptr<int64_t>(),
+           occurrence_tokens.data_ptr<int64_t>(), slots.data_ptr<int64_t>(),
+           loads.data_ptr<int64_t>(), traffic.data_ptr<int64_t>(),
+           candidates.data_ptr<int64_t>(), topk.size(1), experts, ranks,
+           minimum_capacity, maximum_capacity, compute_limit);
+    launch(select_congestion_move_kernel, dim3(1), dim3(1), stream.stream(),
+           traffic.data_ptr<int64_t>(), candidates.data_ptr<int64_t>(),
+           selected.data_ptr<int64_t>(), experts, ranks);
+    launch(apply_congestion_move_kernel, dim3(1), dim3(256), stream.stream(),
+           source.data_ptr<int64_t>(), topk.data_ptr<int64_t>(),
+           count.data_ptr<int64_t>(), demand.data_ptr<int64_t>(),
+           primary.data_ptr<int64_t>(), occurrence_offsets.data_ptr<int64_t>(),
+           occurrence_tokens.data_ptr<int64_t>(), slots.data_ptr<int64_t>(),
+           loads.data_ptr<int64_t>(), traffic.data_ptr<int64_t>(),
+           selected.data_ptr<int64_t>(), topk.size(1), ranks);
+  }
   check_cuda(cudaGetLastError());
 }
 

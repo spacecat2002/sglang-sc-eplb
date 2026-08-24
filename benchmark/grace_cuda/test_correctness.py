@@ -126,6 +126,33 @@ def test_kernels() -> None:
     )
     assert strict_traffic.sum().item() == 0
 
+    move_primary = torch.tensor([0, 0, 1, 1], device="cuda", dtype=torch.int64)
+    move_source = torch.tensor([1, 0, 0, 0], device="cuda", dtype=torch.int64)
+    move_topk = torch.tensor([[0], [1], [2], [3]], device="cuda", dtype=torch.int64)
+    move_count = torch.tensor([20, 1, 10, 10], device="cuda", dtype=torch.int64)
+    move_demand = _C.source_demand(move_source, move_topk, move_count, 4, 2)
+    _C.refine_congestion_into(
+        move_source,
+        move_topk,
+        move_count,
+        move_demand,
+        move_primary,
+        1,
+        3,
+        2.0,
+        4,
+        torch.empty(4, device="cuda", dtype=torch.int64),
+        torch.empty(5, device="cuda", dtype=torch.int64),
+        torch.empty(4, device="cuda", dtype=torch.int64),
+        torch.empty(4, device="cuda", dtype=torch.int64),
+        torch.empty(2, device="cuda", dtype=torch.int64),
+        torch.empty(2, device="cuda", dtype=torch.int64),
+        torch.empty((2, 2), device="cuda", dtype=torch.int64),
+        torch.empty((4, 2, 5), device="cuda", dtype=torch.int64),
+        torch.empty(2, device="cuda", dtype=torch.int64),
+    )
+    assert move_primary.cpu().tolist() == [1, 0, 0, 0]
+
     primary = torch.tensor([0, 0, 1, 1], device="cuda", dtype=torch.int64)
     replicas = _C.select_topn(demand, primary, 0)
     assert replicas.cpu().tolist() == [
