@@ -112,120 +112,6 @@ def _fill_minimum(graph: CoRoutingGraph, groups: list[list[int]], minimum: int) 
             groups[target].append(expert)
 
 
-def _improve_balanced_swaps(
-    graph: CoRoutingGraph, groups: list[list[int]], rounds: int = 8
-) -> None:
-    """Improve intra-group affinity without changing group sizes."""
-
-    for _ in range(rounds):
-        best = None
-        for left in range(len(groups)):
-            for right in range(left + 1, len(groups)):
-                left_group, right_group = groups[left], groups[right]
-                for left_expert in left_group:
-                    left_without = [
-                        expert for expert in left_group if expert != left_expert
-                    ]
-                    for right_expert in right_group:
-                        right_without = [
-                            expert for expert in right_group if expert != right_expert
-                        ]
-                        old = _affinity(graph, left_expert, left_without) + _affinity(
-                            graph, right_expert, right_without
-                        )
-                        new = _affinity(graph, left_expert, right_without) + _affinity(
-                            graph, right_expert, left_without
-                        )
-                        gain = new - old
-                        candidate = (gain, left_expert, right_expert, left, right)
-                        if gain > 0 and (best is None or candidate > best):
-                            best = candidate
-        if best is None:
-            return
-        _, left_expert, right_expert, left, right = best
-        groups[left].remove(left_expert)
-        groups[right].remove(right_expert)
-        groups[left].append(right_expert)
-        groups[right].append(left_expert)
-
-
-def _balance_group_compute(
-    graph: CoRoutingGraph, groups: list[list[int]]
-) -> None:
-    """Balance group demand first; preserve affinity on compute ties."""
-
-    loads = [sum(graph.demand[expert] for expert in group) for group in groups]
-    for _ in range(len(graph.experts)):
-        current = (max(loads), sum(load * load for load in loads))
-        best_key = None
-        best_move = None
-        for left, left_group in enumerate(groups):
-            for right in range(left + 1, len(groups)):
-                right_group = groups[right]
-                for left_expert in left_group:
-                    for right_expert in right_group:
-                        next_left = (
-                            loads[left]
-                            - graph.demand[left_expert]
-                            + graph.demand[right_expert]
-                        )
-                        next_right = (
-                            loads[right]
-                            - graph.demand[right_expert]
-                            + graph.demand[left_expert]
-                        )
-                        next_loads = loads.copy()
-                        next_loads[left], next_loads[right] = next_left, next_right
-                        compute = (
-                            max(next_loads),
-                            sum(load * load for load in next_loads),
-                        )
-                        if compute >= current:
-                            continue
-                        affinity_gain = (
-                            _affinity(
-                                graph,
-                                left_expert,
-                                [e for e in right_group if e != right_expert],
-                            )
-                            + _affinity(
-                                graph,
-                                right_expert,
-                                [e for e in left_group if e != left_expert],
-                            )
-                            - _affinity(
-                                graph,
-                                left_expert,
-                                [e for e in left_group if e != left_expert],
-                            )
-                            - _affinity(
-                                graph,
-                                right_expert,
-                                [e for e in right_group if e != right_expert],
-                            )
-                        )
-                        key = (
-                            compute,
-                            -affinity_gain,
-                            min(left_expert, right_expert),
-                            max(left_expert, right_expert),
-                            left,
-                            right,
-                        )
-                        if best_key is None or key < best_key:
-                            best_key = key
-                            best_move = (left_expert, right_expert, left, right)
-        if best_move is None:
-            return
-        left_expert, right_expert, left, right = best_move
-        groups[left].remove(left_expert)
-        groups[right].remove(right_expert)
-        groups[left].append(right_expert)
-        groups[right].append(left_expert)
-        loads[left] += graph.demand[right_expert] - graph.demand[left_expert]
-        loads[right] += graph.demand[left_expert] - graph.demand[right_expert]
-
-
 def _exact_groups(
     graph: CoRoutingGraph, groups: list[list[int]], target: int
 ) -> list[list[int]]:
@@ -261,7 +147,6 @@ def _exact_groups(
             ),
         )
         groups[target_group].append(expert)
-    _improve_balanced_swaps(graph, groups)
     return groups
 
 
@@ -276,9 +161,7 @@ def _controlled_groups(
     if equal_size:
         if len(experts) % num_groups:
             raise ValueError("exact group sizes require divisible expert count")
-        groups = _exact_groups(graph, groups, len(experts) // num_groups)
-        _balance_group_compute(graph, groups)
-        return groups
+        return _exact_groups(graph, groups, len(experts) // num_groups)
     ideal = len(experts) // num_groups
     delta = max(1, round(ideal * nonuniform_ratio))
     minimum = max(1, ideal - delta)

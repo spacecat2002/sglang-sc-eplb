@@ -87,6 +87,7 @@ def test_kernels() -> None:
         embedding.contiguous(),
         affinity,
         centers,
+        torch.empty(4, device="cuda", dtype=torch.float64),
         strict_groups,
         next_groups,
         group_sizes,
@@ -124,19 +125,6 @@ def test_kernels() -> None:
         2,
     )
     assert strict_traffic.sum().item() == 0
-
-    compute_groups = torch.tensor([0, 0, 1, 1], device="cuda", dtype=torch.int64)
-    compute_demand = torch.tensor(
-        [[100, 0], [90, 0], [10, 0], [0, 0]],
-        device="cuda",
-        dtype=torch.int64,
-    )
-    compute_group_loads = torch.empty(2, device="cuda", dtype=torch.int64)
-    _C.balance_group_compute_into(
-        compute_demand, affinity, compute_groups, compute_group_loads
-    )
-    assert torch.bincount(compute_groups, minlength=2).cpu().tolist() == [2, 2]
-    assert compute_group_loads.cpu().tolist() == [100, 100]
 
     primary = torch.tensor([0, 0, 1, 1], device="cuda", dtype=torch.int64)
     replicas = _C.select_topn(demand, primary, 0)

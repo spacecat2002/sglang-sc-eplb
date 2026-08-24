@@ -11,11 +11,9 @@ void affinity_histogram_into(torch::Tensor, torch::Tensor, torch::Tensor,
                              torch::Tensor, torch::Tensor, torch::Tensor);
 void spectral_groups_into(torch::Tensor, torch::Tensor, torch::Tensor,
                           torch::Tensor, torch::Tensor, torch::Tensor,
-                          torch::Tensor);
+                          torch::Tensor, torch::Tensor);
 void group_source_into(torch::Tensor, torch::Tensor, torch::Tensor,
                        torch::Tensor, torch::Tensor);
-void balance_group_compute_into(torch::Tensor, torch::Tensor, torch::Tensor,
-                                torch::Tensor);
 void congestion_hungarian_into(torch::Tensor, torch::Tensor, torch::Tensor,
                                torch::Tensor, torch::Tensor, torch::Tensor,
                                torch::Tensor, torch::Tensor);
@@ -60,7 +58,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("affinity_histogram_into", &grace_cuda::affinity_histogram_into);
   m.def("spectral_groups_into", &grace_cuda::spectral_groups_into);
   m.def("group_source_into", &grace_cuda::group_source_into);
-  m.def("balance_group_compute_into", &grace_cuda::balance_group_compute_into);
   m.def("congestion_hungarian_into", &grace_cuda::congestion_hungarian_into);
   m.def("source_demand", &grace_cuda::source_demand);
   m.def("source_demand_into", &grace_cuda::source_demand_into);

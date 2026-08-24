@@ -546,6 +546,7 @@ class GraceCudaRuntime:
             raise ValueError("strict spectral placement requires experts divisible by ranks")
         started = _phase_start(timing)
         source, topk, count = _cuda_arrays((source, topk, count), self.device)
+        phase_started = _phase_start(timing)
         _C.affinity_histogram_into(
             source,
             topk,
@@ -554,6 +555,8 @@ class GraceCudaRuntime:
             self.affinity,
             self.affinity_degree,
         )
+        _record(timing, "affinity_histogram_ms", phase_started)
+        phase_started = _phase_start(timing)
         self.affinity_float.copy_(self.affinity)
         self.affinity_scale.copy_(self.affinity_degree)
         self.affinity_scale.sqrt_().reciprocal_()
@@ -564,6 +567,8 @@ class GraceCudaRuntime:
             self.affinity_float,
             out=(self.affinity_eigenvalues, self.affinity_eigenvectors),
         )
+        _record(timing, "affinity_eigh_ms", phase_started)
+        phase_started = _phase_start(timing)
         self.affinity_embedding.copy_(
             self.affinity_eigenvectors[:, -self.num_ranks :]
         )
@@ -577,17 +582,14 @@ class GraceCudaRuntime:
             self.affinity_embedding,
             self.affinity,
             self.affinity_centers,
+            self.affinity_eigenvalues,
             self.affinity_groups,
             self.affinity_next_groups,
             self.affinity_group_sizes,
             self.affinity_overflow,
         )
-        _C.balance_group_compute_into(
-            self.demand,
-            self.affinity,
-            self.affinity_groups,
-            self.affinity_group_sizes,
-        )
+        _record(timing, "affinity_grouping_ms", phase_started)
+        phase_started = _phase_start(timing)
         _C.group_source_into(
             source,
             topk,
@@ -605,6 +607,7 @@ class GraceCudaRuntime:
             self.affinity_group_to_rank,
             self.primary,
         )
+        _record(timing, "affinity_hungarian_ms", phase_started)
         _record(timing, "communication_replication_ms", started)
         return self.primary
 

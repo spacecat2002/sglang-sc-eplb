@@ -54,29 +54,6 @@ def test_grace_plus_accepts_arrays_and_tokens():
     )
 
 
-def test_equal_spectral_groups_balance_compute_before_rank_mapping():
-    tokens = [
-        RoutedToken(0, (0,), 100),
-        RoutedToken(0, (1,), 90),
-        RoutedToken(1, (2,), 10),
-        RoutedToken(1, (3,), 1),
-    ]
-    graph = build_co_routing_graph(tokens, experts=range(4))
-    placement = grace_expert_placement(
-        graph,
-        num_ranks=2,
-        equal_experts=True,
-    )
-    loads = [
-        sum(
-            graph.demand[expert]
-            for expert in placement.experts_by_rank[rank]
-        )
-        for rank in range(2)
-    ]
-    assert max(loads) <= 101
-
-
 def test_ingress_egress_objective_is_supported():
     tokens = [
         RoutedToken(0, (0, 1), 20),

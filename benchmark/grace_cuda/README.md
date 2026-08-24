@@ -10,8 +10,8 @@ Build from the repository root:
 
 With `--affinity-placement`, the initial placement uses the same normalized
 spectral embedding, deterministic k-means, exact-size repair, and lexicographic
-Hungarian rank assignment as the Python implementation. A fixed-size swap pass
-balances group demand before rank assignment; affinity breaks compute ties.
+Hungarian rank assignment as the Python implementation. Compute balancing is
+left to the replica and quota solver after primary placement.
 
 The extension also has CUDA stages for demand histogram, source-aware Top-N
 placement, capacity/export planning, quota routing, and traffic evaluation.
