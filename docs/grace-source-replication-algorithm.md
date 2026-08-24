@@ -138,8 +138,20 @@ ideal = ceil(sum(demand) / num_ranks)
 ```
 
 CUDA kernel 和 Python 参考实现首先直接探测 `ideal`。若 ideal 可行，就不做二分；
-若不可行，才在 ideal 和初始最大负载之间二分。二者寻找的都是相同 oracle 能构造出
-的最低 threshold。
+若不可行，才在 `ideal + 1` 和初始最大负载之间二分。二者寻找的都是相同 oracle 能
+构造出的最低整数 threshold。
+
+这里不使用 `T = ideal, ideal + 1, ideal + 2, ...` 的逐单位递增。已知可行上界且 oracle
+只能回答“可行/不可行”时，二分最坏只需要：
+
+```text
+ceil(log2(initial_max_load - ideal + 1))
+```
+
+次 feasibility 判断；逐单位递增最多需要 `initial_max_load - ideal` 次。若二者相差
+数万，线性探测会把同一份 export plan 重建数万次，无法满足微秒级目标。除非未来
+solver 能直接从失败 plan 推导出下一个必需 threshold，才可能用 parametric search
+或 breakpoint jump 取代二分；当前启发式 oracle 没有提供这种严格下界。
 
 这里的 feasibility oracle 是确定性的启发式构造，不是对所有 export 组合做穷举或
 max-flow。因此“最低”指当前 oracle 判定可行的最低 threshold，不代表一般组合优化
@@ -196,48 +208,167 @@ export，则该 threshold 不可行。
 
 ### 3.4 计算优先与通信 tie-break
 
-threshold 搜索先运行 capacity-first oracle。候选按以下 key 选择：
+这一部分分成两层，不能把它们混成一个很长的候选 key：
 
 ```text
--amount
-is_new_replica
-communication_delta
-expert
-source
-target
+外层：寻找尽可能低的计算 threshold T
+内层：在不超过 T 的候选中，选择通信代价更小的 export
 ```
 
-其中：
+因此，计算均衡不需要再放入内层 key。外层已经要求所有 rank 满足：
+
+```text
+load[r] <= T
+```
+
+并通过 ideal probe 和二分搜索尽量降低 `T`。内层只负责回答：在同一个 `T` 下，有
+多个合法搬运方案时应该选哪一个。
+
+#### 通信感知的低负载 target 选择
+
+选择低负载 `target` 时，论文层面可以把 key 写成三项：
+
+```text
+(CommunicationCost, -ExportAmount, ReplicaCost)
+```
+
+其中 `CommunicationCost` 自身是一个二元组：
+
+```text
+CommunicationCost = (DeltaCommunication, ProjectedIngress)
+```
+
+所以代码实际比较的核心字段是：
+
+```text
+communication_delta
+projected_target_ingress
+-amount
+is_new_replica
+```
+
+它们按字典序比较，即只有前一项相同时才比较下一项。这样没有把大量通信指标塞进
+候选 key，但在多个低负载 rank 都能接收 quota 时，不再只按 rank id 选择。
+
+第一项 `communication_delta` 表示把一份 `(source, expert)` quota 从 `over` 搬到
+`target` 后，本地/远程执行状态的变化：
 
 ```text
 communication_delta
     = (target != source) - (over != source)
 ```
 
-它的取值含义是：
+其中布尔表达式为真时按 `1` 计算，为假时按 `0` 计算，所以只有三种结果：
 
 ```text
--1  远程执行变成本地执行
- 0  通信状态不变
- 1  本地执行变成远程执行
+-1  原来 over != source，搬运后 target == source：远程变本地
+ 0  over 和 target 都不是 source：从一个远程 rank 搬到另一个远程 rank
++1  原来 over == source，搬运后 target != source：本地变远程
 ```
 
-capacity-first 先保证 solver 找到尽可能低的 oracle-feasible threshold。确定该
-threshold 后，
-再在同一 threshold 下运行 communication-first oracle，其 key 为：
+合法 export 要求 `target != over`，所以不存在“从本地 source 搬到同一个本地
+source”的 `0` 情况。
+
+例如 `source=2`：
 
 ```text
-communication_delta
--amount
-is_new_replica
+over=0 -> target=2    DeltaCommunication = -1
+over=0 -> target=3    DeltaCommunication =  0
+over=2 -> target=3    DeltaCommunication = +1
+```
+
+因此，在相同计算 threshold 下，solver 优先选择 `-1`，其次选择 `0`，最后才选择
+`+1`。这使计算均衡过程中优先把 quota 搬回请求来源 rank，避免为了均衡计算无条件
+增加远程通信。
+
+如果多个 target 的 `communication_delta` 相同，再比较搬运后的预计 ingress：
+
+```text
+projected_target_ingress
+    = ingress[target] + (target != source ? amount : 0)
+```
+
+`ingress[target]` 随每次 export 增量维护。如果旧执行位置 `over` 是远程 rank，则从
+`ingress[over]` 减去 `amount`；如果新位置 `target` 是远程 rank，则向
+`ingress[target]` 加上 `amount`。因此，在两个远程低负载 rank 的计算余量相同时，
+solver 会优先选择预计 ingress 更低的那个，避免把通信继续集中到已经繁忙的 rank。
+
+这里维护的是按 source-expert quota 估算的 ingress，不是 Top-K bundle 去重后的精确
+ingress。它只需要 `O(num_ranks)` 状态，并能在一次 export 后常数时间更新，适合 CUDA
+热路径。
+
+下一项 `-amount` 表示在通信变化和预计 ingress 相同的候选中，优先一次搬运更多负载。这里使用负数
+的原因与步骤一的 `-demand` 相同：排序按升序比较，`amount` 越大，`-amount` 越小，
+因此越早被选择。例如 `amount=30` 的 key 为 `-30`，会排在 `amount=10` 的 `-10`
+之前。这样通常能用更少的 export 操作消除过载。
+
+最后一项 `is_new_replica` 是副本成本：
+
+```text
+0  target 已经有该 expert 的副本
+1  需要在 target 新建计算副本
+```
+
+所以只有通信变化、预计 ingress 和搬运量都相同时，solver 才优先复用已有副本。这可
+以节省每个 rank 有限的 `max_compute_extra_per_rank` 槽位，留给后续只能通过新副本
+完成的 export。
+
+#### ID 字段不是优化目标
+
+实际代码在核心 key 后还附加：
+
+```text
 expert
 source
 target
 ```
 
-因此计算峰值不变时，优先把 quota 搬到请求来源 rank；这类 export 通常既均衡计算，
-又降低通信。如果 communication-first 的局部选择耗尽槽位而无法完成整个 plan，代码
-回退到同一 threshold 的 capacity-first plan，不牺牲计算均衡。
+完整工程 key 因而是：
+
+```text
+(
+    communication_delta,
+    projected_target_ingress,
+    -amount,
+    is_new_replica,
+    expert,
+    source,
+    target,
+)
+```
+
+后三项不表达算法偏好，只在前面核心字段完全相同时保证结果确定。没有这些字段，相同输入
+可能因为线程归约顺序或容器遍历顺序不同而选择不同候选，给 Python/CUDA 对齐和测试
+带来困难。论文描述算法目标时可以省略它们。
+
+#### Capacity-first fallback
+
+通信优先的局部选择可能过早用完某个 target 的副本槽位，导致后续无法完成整个
+threshold plan。为了不让通信偏好破坏第一优先级的计算均衡，threshold 搜索先使用：
+
+```text
+(-amount, is_new_replica, communication_delta)
+```
+
+确认该 `T` 对当前 oracle 可行。确定最低可行 `T` 后，再使用通信感知 key 重建完整
+plan。如果 communication-first 重建失败，就回退到同一个 `T` 的 capacity-first
+plan。这个回退只牺牲通信 tie-break，不提高已经找到的计算 threshold。
+
+#### 为什么只加入近似 ingress
+
+实现加入了可增量维护的 `projected_target_ingress`，但没有把精确 `max_ingress`、
+`max_egress` 和 `max_pair` 全部放入每次 export 的局部 key，原因有三点：
+
+1. 它们是整份 routing plan 的全局指标，不是单条 `(source, expert)` export 的独立成本；
+2. 一个 token 的多个 Top-K expert 若落到同一 target，精确通信只计一次，局部 demand
+   无法知道最终 bundle 是否会被去重；
+3. 每枚举一个候选都重算完整 traffic 会显著增加 kernel 状态和计算量，不适合微秒级
+   planner。
+
+因此局部 solver 使用 `communication_delta + projected_target_ingress` 作为廉价通信
+代理；完整 plan 产生后，再统一评估 `remote`、`max_pair`、`max_ingress` 和
+`max_egress`。这保持了清晰的优先级：外层计算均衡，内层选择通信压力更低的 target，
+最终阶段做精确通信检查。
 
 ### 3.5 一次输出副本、quota 和 routing
 

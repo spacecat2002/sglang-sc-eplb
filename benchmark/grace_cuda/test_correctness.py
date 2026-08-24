@@ -312,6 +312,23 @@ def test_kernels() -> None:
     assert local_selected[0].cpu().tolist() == [True, True, False, True]
     assert local_added.item() == 1
 
+    # Ranks 1 and 2 have equal compute slack, but rank 1 already has remote
+    # ingress. The communication pass sends expert 0 to rank 2 first.
+    ingress_demand = torch.tensor(
+        [[10, 0, 0], [5, 0, 0], [0, 0, 5]],
+        device="cuda",
+        dtype=torch.int64,
+    )
+    ingress_replicas = torch.eye(3, device="cuda", dtype=torch.bool)
+    _, ingress_added, ingress_order = _C.select_compute_replicas(
+        ingress_demand,
+        ingress_replicas,
+        torch.arange(3, device="cuda", dtype=torch.int64),
+        1,
+    )
+    assert ingress_added.item() == 2
+    assert ingress_order[0].cpu().tolist() == [0, 2, 1]
+
     # Direct exports get stuck at [8, 8, 4]. Graph augmentation adds the two
     # edges needed for the multi-hop [7, 7, 6] plan.
     chain_demand = torch.diag(

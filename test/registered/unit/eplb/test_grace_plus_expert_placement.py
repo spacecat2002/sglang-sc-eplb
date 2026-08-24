@@ -14,6 +14,7 @@ from sglang.srt.eplb.grace_plus_expert_placement import (
 )
 from sglang.srt.eplb.grace_plus_replication import (
     ReplicaPlacement,
+    _capacity_export_plan,
     _capacity_export_replicas,
     _instance_quotas,
     _greedy_instance_quotas,
@@ -220,6 +221,21 @@ def test_source_top_experts_runs_compute_solver_in_one_call():
     )
 
     assert fused == separate
+
+
+def test_capacity_export_prefers_lower_ingress_target():
+    replicas, added, quota = _capacity_export_plan(
+        np.array([[10, 0, 0], [5, 0, 0], [0, 0, 5]], dtype=np.int64),
+        {0: (0,), 1: (1,), 2: (2,)},
+        num_ranks=3,
+        max_extra_per_rank=1,
+    )
+
+    # Rank 1 already receives five remote units, while rank 2's five units are
+    # local. With equal compute slack, the communication pass chooses rank 2.
+    assert replicas[0] == (0, 2, 1)
+    assert added == 2
+    assert quota.sum(axis=(0, 1)).tolist() == [7, 6, 7]
 
 
 def test_compute_balancing_adds_replica_and_reroutes_static_demand():

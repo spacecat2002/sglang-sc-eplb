@@ -206,6 +206,7 @@ __device__ void rebalance_compute_quota(
 
 struct ExportCandidate {
   int64_t amount;
+  int64_t target_ingress;
   int64_t expert;
   int source;
   int target;
@@ -220,6 +221,10 @@ __device__ bool better_export_candidate(const ExportCandidate& candidate,
   if (candidate.expert < 0) return false;
   if (communication_first && candidate.delta != current.delta) {
     return candidate.delta < current.delta;
+  }
+  if (communication_first &&
+      candidate.target_ingress != current.target_ingress) {
+    return candidate.target_ingress < current.target_ingress;
   }
   if (candidate.amount != current.amount) return candidate.amount > current.amount;
   if (candidate.is_new != current.is_new) return candidate.is_new < current.is_new;
@@ -238,10 +243,10 @@ __device__ bool build_export_plan(
     int64_t* plan_quota, int64_t experts, int ranks,
     int64_t max_extra_per_rank, int64_t threshold, bool communication_first,
     int64_t* added_out, ExportCandidate* candidates, int* state,
-    int64_t* shared_added, const int* rank_order) {
+    int64_t* shared_added, const int* rank_order, int64_t* ingress) {
   const int thread = threadIdx.x;
   for (int rank = thread; rank < ranks; rank += blockDim.x) {
-    loads[rank] = slots[rank] = 0;
+    loads[rank] = slots[rank] = ingress[rank] = 0;
   }
   for (int64_t index = thread; index < experts * ranks; index += blockDim.x) {
     instance[index] = additions[index] = 0;
@@ -260,6 +265,10 @@ __device__ bool build_export_plan(
               static_cast<unsigned long long>(value));
     atomicAdd(reinterpret_cast<unsigned long long*>(loads + target),
               static_cast<unsigned long long>(value));
+    if (target != source) {
+      atomicAdd(reinterpret_cast<unsigned long long*>(ingress + target),
+                static_cast<unsigned long long>(value));
+    }
     plan_quota[(source * experts + expert) * ranks + target] = value;
   }
   if (thread == 0) *shared_added = 0;
@@ -285,7 +294,7 @@ __device__ bool build_export_plan(
     }
 
     const int64_t need = loads[over] - threshold;
-    ExportCandidate best = {0, -1, -1, -1, 0, false};
+    ExportCandidate best = {0, 0, -1, -1, -1, 0, false};
     const int64_t candidate_count = experts * ranks * ranks;
     for (int64_t index = thread; index < candidate_count; index += blockDim.x) {
       const int target = index % ranks;
@@ -303,8 +312,10 @@ __device__ bool build_export_plan(
         continue;
       }
       ExportCandidate candidate = {
-          min(min(need, available), slack), expert, source, target,
+          min(min(need, available), slack), 0, expert, source, target,
           (target != source) - (over != source), is_new};
+      candidate.target_ingress =
+          ingress[target] + (target != source ? candidate.amount : 0);
       if (better_export_candidate(candidate, best, communication_first)) {
         best = candidate;
       }
@@ -333,6 +344,8 @@ __device__ bool build_export_plan(
         plan_quota[offset + best.target] += best.amount;
         loads[over] -= best.amount;
         loads[best.target] += best.amount;
+        if (over != best.source) ingress[over] -= best.amount;
+        if (best.target != best.source) ingress[best.target] += best.amount;
       }
     }
     __syncthreads();
@@ -353,6 +366,7 @@ __global__ void select_compute_replicas_kernel(
   __shared__ int64_t shared_added;
   __shared__ int64_t bounds[2];
   __shared__ int64_t ideal_capacity;
+  __shared__ int64_t ingress[MaxRanks];
   __shared__ int rank_order[MaxRanks];
   int64_t local_total = 0;
   for (int64_t index = threadIdx.x; index < experts * ranks;
@@ -404,14 +418,16 @@ __global__ void select_compute_replicas_kernel(
           demand, primary, replicas, instance, loads, added_by_rank,
           addition_order, plan_quota, experts, ranks, max_extra_per_rank,
           bounds[0], false, &ignored, candidates, state, &shared_added,
-          rank_order)) {
+          rank_order, ingress)) {
+    if (threadIdx.x == 0) ++bounds[0];
+    __syncthreads();
     while (bounds[0] < bounds[1]) {
       const int64_t middle = (bounds[0] + bounds[1]) / 2;
       if (build_export_plan<MaxRanks>(
               demand, primary, replicas, instance, loads, added_by_rank,
               addition_order, plan_quota, experts, ranks, max_extra_per_rank,
               middle, false, &ignored, candidates, state, &shared_added,
-              rank_order)) {
+              rank_order, ingress)) {
         if (threadIdx.x == 0) bounds[1] = middle;
       } else {
         if (threadIdx.x == 0) bounds[0] = middle + 1;
@@ -423,12 +439,12 @@ __global__ void select_compute_replicas_kernel(
           demand, primary, replicas, instance, loads, added_by_rank,
           addition_order, plan_quota, experts, ranks, max_extra_per_rank,
           bounds[0], true, added_out, candidates, state, &shared_added,
-          rank_order)) {
+          rank_order, ingress)) {
     build_export_plan<MaxRanks>(
         demand, primary, replicas, instance, loads, added_by_rank,
         addition_order, plan_quota, experts, ranks, max_extra_per_rank,
         bounds[0], false, added_out, candidates, state, &shared_added,
-        rank_order);
+        rank_order, ingress);
   }
   for (int64_t index = threadIdx.x; index < experts * ranks;
        index += blockDim.x) {
@@ -439,6 +455,16 @@ __global__ void select_compute_replicas_kernel(
     while (true) {
       rebalance_compute_quota<MaxRanks>(plan_quota, replicas, loads, experts,
                                         ranks, ranks, ideal_capacity);
+      for (int target = 0; target < ranks; ++target) {
+        ingress[target] = 0;
+        for (int source = 0; source < ranks; ++source) {
+          if (source == target) continue;
+          for (int64_t expert = 0; expert < experts; ++expert) {
+            ingress[target] +=
+                plan_quota[(source * experts + expert) * ranks + target];
+          }
+        }
+      }
       int over = -1;
       for (int rank = 0; rank < ranks; ++rank) {
         if (loads[rank] > ideal_capacity) {
@@ -450,6 +476,7 @@ __global__ void select_compute_replicas_kernel(
 
       int64_t best_amount = 0;
       int64_t best_target_load = 0;
+      int64_t best_target_ingress = 0;
       int best_delta = 0;
       int best_source = -1;
       int64_t best_expert = -1;
@@ -465,13 +492,17 @@ __global__ void select_compute_replicas_kernel(
               continue;
             }
             const int delta = (target != source) - (over != source);
+            const int64_t target_ingress =
+                ingress[target] + (target != source ? available : 0);
             bool better = best_expert < 0;
-            if (!better && loads[target] != best_target_load) {
+            if (!better && delta != best_delta) {
+              better = delta < best_delta;
+            } else if (!better && target_ingress != best_target_ingress) {
+              better = target_ingress < best_target_ingress;
+            } else if (!better && loads[target] != best_target_load) {
               better = loads[target] < best_target_load;
             } else if (!better && available != best_amount) {
               better = available > best_amount;
-            } else if (!better && delta != best_delta) {
-              better = delta < best_delta;
             } else if (!better && expert != best_expert) {
               better = expert < best_expert;
             } else if (!better && source != best_source) {
@@ -482,6 +513,7 @@ __global__ void select_compute_replicas_kernel(
             if (better) {
               best_amount = available;
               best_target_load = loads[target];
+              best_target_ingress = target_ingress;
               best_delta = delta;
               best_source = source;
               best_expert = expert;

@@ -1117,6 +1117,9 @@ def _capacity_export_plan(
         loads = initial_load.copy()
         selected = mask.copy()
         slots = np.zeros(num_ranks, dtype=np.int64)
+        ingress = quota.sum(axis=(0, 1), dtype=np.int64)
+        for rank in range(num_ranks):
+            ingress[rank] -= quota[rank, :, rank].sum(dtype=np.int64)
         order: list[tuple[int, int]] = []
         for source_rank in sorted(
             range(num_ranks), key=lambda rank: (-initial_load[rank], rank)
@@ -1140,8 +1143,19 @@ def _capacity_export_plan(
                                 continue
                             amount = min(need, available, slack)
                             delta = int(target != source) - int(source_rank != source)
+                            target_ingress = int(ingress[target]) + (
+                                amount if target != source else 0
+                            )
                             key = (
-                                (delta, -amount, new, expert, source, target)
+                                (
+                                    delta,
+                                    target_ingress,
+                                    -amount,
+                                    new,
+                                    expert,
+                                    source,
+                                    target,
+                                )
                                 if communication_first
                                 else (-amount, new, delta, expert, source, target)
                             )
@@ -1159,6 +1173,10 @@ def _capacity_export_plan(
                 quota[source, expert, target] += amount
                 loads[source_rank] -= amount
                 loads[target] += amount
+                if source_rank != source:
+                    ingress[source_rank] -= amount
+                if target != source:
+                    ingress[target] += amount
         next_replicas = {
             expert: replicas[expert]
             + tuple(
@@ -1171,13 +1189,17 @@ def _capacity_export_plan(
         return next_replicas, len(order), quota
 
     low, high = ideal, int(initial_load.max(initial=0))
-    while low < high:
-        middle = (low + high) // 2
-        if build(middle, False) is None:
-            low = middle + 1
-        else:
-            high = middle
-    result = build(low, True) or build(low, False)
+    capacity_result = build(ideal, False)
+    if capacity_result is None:
+        low += 1
+        while low < high:
+            middle = (low + high) // 2
+            if build(middle, False) is None:
+                low = middle + 1
+            else:
+                high = middle
+        capacity_result = build(low, False)
+    result = build(low, True) or capacity_result
     assert result is not None
     return result
 
@@ -1216,6 +1238,9 @@ def _balance_replica_compute_hybrid(
         _rebalance_quota_compute(quota, replicas, loads, capacity)
         if not np.any(loads > capacity):
             break
+        ingress = quota.sum(axis=(0, 1), dtype=np.int64)
+        for rank in range(num_ranks):
+            ingress[rank] -= quota[rank, :, rank].sum(dtype=np.int64)
         best = None
         for over in np.flatnonzero(loads > capacity):
             for source in range(num_ranks):
@@ -1231,10 +1256,14 @@ def _balance_replica_compute_hybrid(
                         ):
                             continue
                         delta = int(target != source) - int(over != source)
+                        projected_ingress = int(ingress[target]) + (
+                            available if target != source else 0
+                        )
                         key = (
+                            delta,
+                            projected_ingress,
                             int(loads[target]),
                             -available,
-                            delta,
                             expert,
                             source,
                             target,
