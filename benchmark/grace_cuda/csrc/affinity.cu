@@ -12,25 +12,149 @@ namespace {
 __global__ void affinity_histogram_kernel(
     const int64_t* source, const int64_t* topk, const int64_t* count,
     int64_t* demand, int64_t* affinity, int64_t* degree, int64_t tokens,
-    int64_t k, int64_t experts, int64_t ranks) {
-  const int64_t token = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (token >= tokens) return;
-  const int64_t weight = count[token];
-  for (int64_t left = 0; left < k; ++left) {
-    const int64_t a = topk[token * k + left];
-    atomicAdd(reinterpret_cast<unsigned long long*>(demand + a * ranks + source[token]),
-              static_cast<unsigned long long>(weight));
-    for (int64_t right = left + 1; right < k; ++right) {
-      const int64_t b = topk[token * k + right];
-      atomicAdd(reinterpret_cast<unsigned long long*>(affinity + a * experts + b),
+    int64_t k, int64_t experts, int64_t ranks, bool clear_output) {
+  if (clear_output) {
+    for (int64_t index = threadIdx.x; index < experts * ranks;
+         index += blockDim.x)
+      demand[index] = 0;
+    for (int64_t index = threadIdx.x; index < experts * experts;
+         index += blockDim.x)
+      affinity[index] = 0;
+    __syncthreads();
+  }
+  for (int64_t token =
+           static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       token < tokens;
+       token += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    const int64_t weight = count[token];
+    for (int64_t left = 0; left < k; ++left) {
+      const int64_t a = topk[token * k + left];
+      atomicAdd(reinterpret_cast<unsigned long long*>(
+                    demand + a * ranks + source[token]),
                 static_cast<unsigned long long>(weight));
-      atomicAdd(reinterpret_cast<unsigned long long*>(affinity + b * experts + a),
-                static_cast<unsigned long long>(weight));
-      atomicAdd(reinterpret_cast<unsigned long long*>(degree + a),
-                static_cast<unsigned long long>(weight));
-      atomicAdd(reinterpret_cast<unsigned long long*>(degree + b),
-                static_cast<unsigned long long>(weight));
+      for (int64_t right = left + 1; right < k; ++right) {
+        const int64_t b = topk[token * k + right];
+        atomicAdd(reinterpret_cast<unsigned long long*>(
+                      affinity + a * experts + b),
+                  static_cast<unsigned long long>(weight));
+        atomicAdd(reinterpret_cast<unsigned long long*>(
+                      affinity + b * experts + a),
+                  static_cast<unsigned long long>(weight));
+      }
     }
+  }
+}
+
+__global__ void affinity_degree_kernel(const int64_t* affinity,
+                                       int64_t* degree, int64_t experts) {
+  for (int64_t expert =
+           static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       expert < experts;
+       expert += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    int64_t total = 0;
+    for (int64_t other = 0; other < experts; ++other)
+      total += affinity[expert * experts + other];
+    degree[expert] = total;
+  }
+}
+
+__global__ void affinity_scale_kernel(const int64_t* degree, double* scale,
+                                      int64_t experts) {
+  const int64_t expert =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (expert >= experts) return;
+  scale[expert] = degree[expert]
+                      ? 1.0 / sqrt(static_cast<double>(degree[expert]))
+                      : 0.0;
+}
+
+__global__ void normalize_affinity_kernel(const int64_t* affinity,
+                                          const double* scale,
+                                          double* normalized,
+                                          int64_t elements,
+                                          int64_t experts) {
+  const int64_t index =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= elements) return;
+  normalized[index] = static_cast<double>(affinity[index]) *
+                      scale[index / experts] * scale[index % experts];
+}
+
+__global__ void affinity_subspace_kernel(
+    const int64_t* affinity, const int64_t* degree, const double* initial,
+    double* embedding, int64_t experts, int iterations) {
+  if (blockIdx.x) return;
+  __shared__ double vectors[256][4];
+  __shared__ double next[256][4];
+  __shared__ double scale[256];
+  __shared__ double reduction[256];
+
+  const int expert = threadIdx.x;
+  if (expert < experts) {
+    scale[expert] = degree[expert]
+                        ? rsqrt(static_cast<double>(degree[expert]))
+                        : 0.0;
+    for (int column = 0; column < 4; ++column)
+      vectors[expert][column] = initial[expert * 4 + column];
+  }
+  __syncthreads();
+
+  for (int iteration = 0; iteration < iterations; ++iteration) {
+    if (expert < experts)
+      for (int column = 0; column < 4; ++column) {
+        double value = 0.0;
+        for (int64_t other = 0; other < experts; ++other)
+          value += static_cast<double>(affinity[expert * experts + other]) *
+                   scale[other] * vectors[other][column];
+        next[expert][column] = value * scale[expert];
+      }
+    __syncthreads();
+
+    for (int column = 0; column < 4; ++column) {
+      for (int previous = 0; previous < column; ++previous) {
+        reduction[expert] =
+            expert < experts
+                ? next[expert][column] * next[expert][previous]
+                : 0.0;
+        __syncthreads();
+        for (int offset = 128; offset; offset >>= 1) {
+          if (expert < offset)
+            reduction[expert] += reduction[expert + offset];
+          __syncthreads();
+        }
+        if (expert < experts)
+          next[expert][column] -=
+              reduction[0] * next[expert][previous];
+        __syncthreads();
+      }
+      reduction[expert] =
+          expert < experts ? next[expert][column] * next[expert][column] : 0.0;
+      __syncthreads();
+      for (int offset = 128; offset; offset >>= 1) {
+        if (expert < offset)
+          reduction[expert] += reduction[expert + offset];
+        __syncthreads();
+      }
+      const double inverse_norm =
+          reduction[0] > 0.0 ? rsqrt(reduction[0]) : 0.0;
+      if (expert < experts)
+        next[expert][column] *= inverse_norm;
+      __syncthreads();
+    }
+    if (expert < experts)
+      for (int column = 0; column < 4; ++column)
+        vectors[expert][column] = next[expert][column];
+    __syncthreads();
+  }
+
+  if (expert < experts) {
+    double norm = 0.0;
+    for (int column = 0; column < 4; ++column)
+      norm += vectors[expert][column] * vectors[expert][column];
+    const double inverse_norm = norm > 1e-24 ? rsqrt(norm) : 0.0;
+    for (int column = 0; column < 4; ++column)
+      embedding[expert * 4 + column] =
+          vectors[expert][column] * inverse_norm;
   }
 }
 
@@ -98,100 +222,198 @@ __global__ void affinity_groups_kernel(
 __global__ void group_source_kernel(
     const int64_t* source, const int64_t* topk, const int64_t* count,
     const int64_t* groups, int64_t* group_source, int64_t tokens, int64_t k,
-    int ranks) {
-  const int64_t token = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (token >= tokens) return;
-  for (int64_t column = 0; column < k; ++column) {
-    const int64_t group = groups[topk[token * k + column]];
-    bool first = true;
-    for (int64_t previous = 0; previous < column; ++previous)
-      if (groups[topk[token * k + previous]] == group) first = false;
-    if (first)
-      atomicAdd(reinterpret_cast<unsigned long long*>(
-                    group_source + group * ranks + source[token]),
-                static_cast<unsigned long long>(count[token]));
+    int ranks, bool clear_output) {
+  if (clear_output) {
+    for (int index = threadIdx.x; index < ranks * ranks;
+         index += blockDim.x)
+      group_source[index] = 0;
+    __syncthreads();
+  }
+  for (int64_t token =
+           static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       token < tokens;
+       token += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    for (int64_t column = 0; column < k; ++column) {
+      const int64_t group = groups[topk[token * k + column]];
+      bool first = true;
+      for (int64_t previous = 0; previous < column; ++previous)
+        if (groups[topk[token * k + previous]] == group) first = false;
+      if (first)
+        atomicAdd(reinterpret_cast<unsigned long long*>(
+                      group_source + group * ranks + source[token]),
+                  static_cast<unsigned long long>(count[token]));
+    }
   }
 }
+
+template <int MaxRanks>
+__global__ void group_source_shared_kernel(
+    const int64_t* source, const int64_t* topk, const int64_t* count,
+    const int64_t* groups, int64_t* group_source, int64_t tokens, int64_t k,
+    int ranks, bool merge_output) {
+  __shared__ int64_t local[MaxRanks * MaxRanks];
+  const int bins = ranks * ranks;
+  for (int index = threadIdx.x; index < bins; index += blockDim.x)
+    local[index] = 0;
+  __syncthreads();
+  for (int64_t token =
+           static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       token < tokens;
+       token += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    unsigned long long seen = 0;
+    const int64_t src = source[token];
+    const int64_t weight = count[token];
+    for (int64_t column = 0; column < k; ++column) {
+      const int64_t group = groups[topk[token * k + column]];
+      const auto bit = 1ULL << group;
+      if (!(seen & bit)) {
+        seen |= bit;
+        atomicAdd(reinterpret_cast<unsigned long long*>(
+                      local + group * ranks + src),
+                  static_cast<unsigned long long>(weight));
+      }
+    }
+  }
+  __syncthreads();
+  for (int index = threadIdx.x; index < bins; index += blockDim.x) {
+    if (merge_output)
+      atomicAdd(reinterpret_cast<unsigned long long*>(group_source + index),
+                static_cast<unsigned long long>(local[index]));
+    else
+      group_source[index] = local[index];
+  }
+}
+
+
+
 
 __global__ void map_groups_kernel(const int64_t* group_source,
                                   const int64_t* groups,
                                   int64_t* group_to_rank, int64_t* primary,
                                   int64_t experts, int ranks) {
-  if (blockIdx.x || threadIdx.x) return;
-  bool used_group[128] = {};
-  bool used_rank[128] = {};
-  int64_t egress[128] = {};
-  int64_t max_ingress = 0;
-  int64_t max_pair = 0;
+  if (blockIdx.x) return;
+  __shared__ bool used_group[128];
+  __shared__ bool used_rank[128];
+  __shared__ int64_t egress[128];
+  __shared__ int64_t group_totals[128];
+  __shared__ int64_t group_peaks[128];
+  __shared__ int64_t bottlenecks[128];
+  __shared__ int64_t pairs[128];
+  __shared__ int64_t remotes[128];
+  __shared__ int group_order[128];
+  __shared__ int selected_rank;
+  __shared__ int64_t max_ingress;
+  __shared__ int64_t max_pair;
+
+  for (int rank = threadIdx.x; rank < ranks; rank += blockDim.x) {
+    used_group[rank] = false;
+    used_rank[rank] = false;
+    egress[rank] = 0;
+  }
+  if (threadIdx.x == 0) max_ingress = max_pair = 0;
+  __syncthreads();
+
+  for (int candidate = threadIdx.x; candidate < ranks;
+       candidate += blockDim.x) {
+    int64_t total = 0;
+    int64_t peak = 0;
+    for (int source = 0; source < ranks; ++source) {
+      const int64_t value = group_source[candidate * ranks + source];
+      total += value;
+      if (value > peak) peak = value;
+    }
+    group_totals[candidate] = total;
+    group_peaks[candidate] = peak;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0)
+    for (int step = 0; step < ranks; ++step) {
+      int selected_group = -1;
+      int64_t selected_total = -1;
+      int64_t selected_peak = -1;
+      for (int candidate = 0; candidate < ranks; ++candidate) {
+        if (used_group[candidate]) continue;
+        const int64_t total = group_totals[candidate];
+        const int64_t peak = group_peaks[candidate];
+        if (total > selected_total ||
+            (total == selected_total &&
+             (peak > selected_peak ||
+              (peak == selected_peak &&
+               (selected_group < 0 || candidate < selected_group))))) {
+          selected_group = candidate;
+          selected_total = total;
+          selected_peak = peak;
+        }
+      }
+      group_order[step] = selected_group;
+      used_group[selected_group] = true;
+    }
+  __syncthreads();
 
   for (int step = 0; step < ranks; ++step) {
-    int group = -1;
-    int64_t group_total = -1;
-    int64_t group_peak = -1;
-    for (int candidate = 0; candidate < ranks; ++candidate) {
-      if (used_group[candidate]) continue;
-      int64_t total = 0;
-      int64_t peak = 0;
-      for (int source = 0; source < ranks; ++source) {
-        const int64_t value = group_source[candidate * ranks + source];
-        total += value;
-        if (value > peak) peak = value;
+    const int selected_group = group_order[step];
+    const int64_t selected_total = group_totals[selected_group];
+    for (int rank = threadIdx.x; rank < ranks; rank += blockDim.x) {
+      if (used_rank[rank]) {
+        bottlenecks[rank] = pairs[rank] = remotes[rank] = LLONG_MAX;
+        continue;
       }
-      if (total > group_total ||
-          (total == group_total &&
-           (peak > group_peak ||
-            (peak == group_peak && (group < 0 || candidate < group))))) {
-        group = candidate;
-        group_total = total;
-        group_peak = peak;
-      }
-    }
-
-    int best_rank = -1;
-    int64_t best_bottleneck = LLONG_MAX;
-    int64_t best_pair = LLONG_MAX;
-    int64_t best_remote = LLONG_MAX;
-    for (int rank = 0; rank < ranks; ++rank) {
-      if (used_rank[rank]) continue;
-      const int64_t remote =
-          group_total - group_source[group * ranks + rank];
+      const int64_t remote = selected_total -
+                             group_source[selected_group * ranks + rank];
       int64_t projected_egress = 0;
       int64_t projected_pair = max_pair;
       for (int source = 0; source < ranks; ++source) {
         const int64_t added = source == rank
                                   ? 0
-                                  : group_source[group * ranks + source];
+                                  : group_source[selected_group * ranks + source];
         const int64_t value = egress[source] + added;
         if (value > projected_egress) projected_egress = value;
         if (added > projected_pair) projected_pair = added;
       }
       const int64_t ingress = remote > max_ingress ? remote : max_ingress;
-      const int64_t bottleneck =
+      bottlenecks[rank] =
           ingress > projected_egress ? ingress : projected_egress;
-      if (bottleneck < best_bottleneck ||
-          (bottleneck == best_bottleneck &&
-           (projected_pair < best_pair ||
-            (projected_pair == best_pair &&
-             (remote < best_remote ||
-              (remote == best_remote && (best_rank < 0 || rank < best_rank))))))) {
-        best_rank = rank;
-        best_bottleneck = bottleneck;
-        best_pair = projected_pair;
-        best_remote = remote;
-      }
+      pairs[rank] = projected_pair;
+      remotes[rank] = remote;
     }
-    used_group[group] = true;
-    used_rank[best_rank] = true;
-    group_to_rank[group] = best_rank;
-    if (best_remote > max_ingress) max_ingress = best_remote;
-    for (int source = 0; source < ranks; ++source)
-      if (source != best_rank) {
-        const int64_t added = group_source[group * ranks + source];
-        egress[source] += added;
-        if (added > max_pair) max_pair = added;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      selected_rank = -1;
+      int64_t best_bottleneck = LLONG_MAX;
+      int64_t best_pair = LLONG_MAX;
+      int64_t best_remote = LLONG_MAX;
+      for (int rank = 0; rank < ranks; ++rank) {
+        const int64_t bottleneck = bottlenecks[rank];
+        const int64_t pair = pairs[rank];
+        const int64_t remote = remotes[rank];
+        if (bottleneck < best_bottleneck ||
+            (bottleneck == best_bottleneck &&
+             (pair < best_pair ||
+              (pair == best_pair &&
+               (remote < best_remote ||
+                (remote == best_remote &&
+                 (selected_rank < 0 || rank < selected_rank))))))) {
+          selected_rank = rank;
+          best_bottleneck = bottleneck;
+          best_pair = pair;
+          best_remote = remote;
+        }
       }
+      used_rank[selected_rank] = true;
+      group_to_rank[selected_group] = selected_rank;
+      if (best_remote > max_ingress) max_ingress = best_remote;
+      for (int source = 0; source < ranks; ++source)
+        if (source != selected_rank) {
+          const int64_t added =
+              group_source[selected_group * ranks + source];
+          egress[source] += added;
+          if (added > max_pair) max_pair = added;
+        }
+    }
+    __syncthreads();
   }
-  for (int64_t expert = 0; expert < experts; ++expert)
+  for (int64_t expert = threadIdx.x; expert < experts;
+       expert += blockDim.x)
     primary[expert] = group_to_rank[groups[expert]];
 }
 
@@ -199,7 +421,7 @@ __global__ void spectral_exact_groups_kernel(
     const double* embedding, const int64_t* affinity, double* centers,
     double* distances,
     int64_t* labels, int64_t* next_labels, int64_t* sizes, int64_t* overflow,
-    int64_t experts, int ranks) {
+    int64_t experts, int ranks, int dimensions) {
   if (blockIdx.x) return;
   __shared__ int unchanged;
   __shared__ int64_t selected_item;
@@ -210,27 +432,18 @@ __global__ void spectral_exact_groups_kernel(
   if (threadIdx.x == 0) overflow[0] = 0;
   __syncthreads();
 
-  for (int center_count = 1; center_count < ranks; ++center_count) {
-    for (int64_t expert = threadIdx.x; expert < experts; expert += blockDim.x) {
-      bool is_center = false;
-      for (int center = 0; center < center_count; ++center)
-        is_center |= overflow[center] == expert;
-      double nearest = DBL_MAX;
-      if (!is_center) {
-        for (int center = 0; center < center_count; ++center) {
-          const int64_t center_expert = overflow[center];
-          double distance = 0;
-          for (int dim = 0; dim < ranks; ++dim) {
-            const double delta = embedding[expert * ranks + dim] -
-                                 embedding[center_expert * ranks + dim];
-            distance += delta * delta;
-          }
-          nearest = min(nearest, distance);
-        }
-      }
-      distances[expert] = is_center ? -1.0 : nearest;
+  for (int64_t expert = threadIdx.x; expert < experts;
+       expert += blockDim.x) {
+    double distance = 0;
+    for (int dim = 0; dim < dimensions; ++dim) {
+      const double delta = embedding[expert * dimensions + dim] -
+                           embedding[dim];
+      distance += delta * delta;
     }
-    __syncthreads();
+    distances[expert] = expert ? distance : -1.0;
+  }
+  __syncthreads();
+  for (int center_count = 1; center_count < ranks; ++center_count) {
     if (threadIdx.x == 0) {
       int64_t selected = -1;
       double best = -1.0;
@@ -243,12 +456,28 @@ __global__ void spectral_exact_groups_kernel(
       overflow[center_count] = selected;
     }
     __syncthreads();
+    const int64_t center_expert = overflow[center_count];
+    for (int64_t expert = threadIdx.x; expert < experts;
+         expert += blockDim.x) {
+      if (expert == center_expert) {
+        distances[expert] = -1.0;
+        continue;
+      }
+      double distance = 0;
+      for (int dim = 0; dim < dimensions; ++dim) {
+        const double delta = embedding[expert * dimensions + dim] -
+                             embedding[center_expert * dimensions + dim];
+        distance += delta * delta;
+      }
+      distances[expert] = min(distances[expert], distance);
+    }
+    __syncthreads();
   }
-  for (int64_t index = threadIdx.x; index < ranks * ranks;
+  for (int64_t index = threadIdx.x; index < ranks * dimensions;
        index += blockDim.x) {
-    const int center = index / ranks;
-    const int dim = index % ranks;
-    centers[index] = embedding[overflow[center] * ranks + dim];
+    const int center = index / dimensions;
+    const int dim = index % dimensions;
+    centers[index] = embedding[overflow[center] * dimensions + dim];
   }
   __syncthreads();
 
@@ -261,9 +490,9 @@ __global__ void spectral_exact_groups_kernel(
       double best_distance = DBL_MAX;
       for (int group = 0; group < ranks; ++group) {
         double distance = 0;
-        for (int dim = 0; dim < ranks; ++dim) {
-          const double delta = embedding[expert * ranks + dim] -
-                               centers[group * ranks + dim];
+        for (int dim = 0; dim < dimensions; ++dim) {
+          const double delta = embedding[expert * dimensions + dim] -
+                               centers[group * dimensions + dim];
           distance += delta * delta;
         }
         if (distance < best_distance) {
@@ -286,9 +515,9 @@ __global__ void spectral_exact_groups_kernel(
         for (int64_t expert = 0; expert < experts; ++expert) {
           if (next_labels[expert] != donor) continue;
           double distance = 0;
-          for (int dim = 0; dim < ranks; ++dim) {
-            const double delta = embedding[expert * ranks + dim] -
-                                 centers[donor * ranks + dim];
+          for (int dim = 0; dim < dimensions; ++dim) {
+            const double delta = embedding[expert * dimensions + dim] -
+                                 centers[donor * dimensions + dim];
             distance += delta * delta;
           }
           if (distance > farthest) {
@@ -305,14 +534,14 @@ __global__ void spectral_exact_groups_kernel(
     __syncthreads();
     for (int64_t expert = threadIdx.x; expert < experts; expert += blockDim.x)
       if (next_labels[expert] != labels[expert]) atomicExch(&unchanged, 0);
-    for (int64_t index = threadIdx.x; index < ranks * ranks;
+    for (int64_t index = threadIdx.x; index < ranks * dimensions;
          index += blockDim.x) {
-      const int group = index / ranks;
-      const int dim = index % ranks;
+      const int group = index / dimensions;
+      const int dim = index % dimensions;
       double total = 0;
       for (int64_t expert = 0; expert < experts; ++expert)
         if (next_labels[expert] == group)
-          total += embedding[expert * ranks + dim];
+          total += embedding[expert * dimensions + dim];
       centers[index] = total / sizes[group];
     }
     for (int64_t expert = threadIdx.x; expert < experts; expert += blockDim.x)
@@ -418,43 +647,81 @@ __global__ void spectral_exact_groups_kernel(
   }
 }
 
+
+template <int FixedExperts, int FixedRanks>
 __global__ void affinity_swaps_kernel(
     const int64_t* affinity, int64_t* labels, int64_t* group_affinity,
-    int64_t* gains, int64_t experts, int ranks) {
+    int64_t* gains, int64_t runtime_experts, int runtime_ranks) {
   if (blockIdx.x) return;
-  __shared__ int64_t best_gains[256];
-  __shared__ int64_t best_indices[256];
+  const int64_t experts = FixedExperts ? FixedExperts : runtime_experts;
+  const int ranks = FixedRanks ? FixedRanks : runtime_ranks;
+  __shared__ int64_t best_gains[1024];
+  __shared__ int64_t best_indices[1024];
   __shared__ int64_t selected;
-  for (int round = 0; round < 8; ++round) {
-    for (int64_t index = threadIdx.x; index < experts * ranks;
-         index += blockDim.x) {
-      const int64_t expert = index / ranks;
-      const int group = index % ranks;
-      int64_t total = 0;
-      for (int64_t other = 0; other < experts; ++other)
-        if (labels[other] == group)
-          total += affinity[expert * experts + other];
-      group_affinity[index] = total;
+  __shared__ int selected_left_group;
+  __shared__ int selected_right_group;
+  __shared__ int member_counts[4];
+  __shared__ int member_positions[256];
+  __shared__ int64_t group_members[256];
+  if constexpr (FixedExperts == 256 && FixedRanks == 4) {
+    if (threadIdx.x < 4) member_counts[threadIdx.x] = 0;
+    __syncthreads();
+    if (threadIdx.x < 256) {
+      const int group = labels[threadIdx.x];
+      const int position = atomicAdd(member_counts + group, 1);
+      group_members[group * 64 + position] = threadIdx.x;
+      member_positions[threadIdx.x] = position;
     }
     __syncthreads();
+  }
+  for (int64_t index = threadIdx.x; index < experts * ranks;
+       index += blockDim.x) {
+    const int64_t expert = index / ranks;
+    const int group = index % ranks;
+    int64_t total = 0;
+    for (int64_t other = 0; other < experts; ++other)
+      if (labels[other] == group)
+        total += affinity[expert * experts + other];
+    group_affinity[index] = total;
+  }
+  __syncthreads();
 
+  for (int round = 0; round < 8; ++round) {
     int64_t best_gain = 0;
     int64_t best_index = -1;
-    for (int64_t index = threadIdx.x; index < experts * experts;
-         index += blockDim.x) {
-      const int64_t left_expert = index / experts;
-      const int64_t right_expert = index % experts;
+    const int64_t candidate_count =
+        FixedExperts == 256 && FixedRanks == 4 ? 6 * 64 * 64
+                                               : experts * experts;
+    for (int64_t candidate = threadIdx.x; candidate < candidate_count;
+         candidate += blockDim.x) {
+      int64_t left_expert;
+      int64_t right_expert;
+      if constexpr (FixedExperts == 256 && FixedRanks == 4) {
+        const int pair_index = candidate >> 12;
+        const int position = candidate & 4095;
+        const int left_group =
+            pair_index < 3 ? 0 : pair_index < 5 ? 1 : 2;
+        const int right_group =
+            pair_index < 3 ? pair_index + 1
+                           : pair_index < 5 ? pair_index - 1 : 3;
+        left_expert =
+            group_members[left_group * 64 + (position >> 6)];
+        right_expert =
+            group_members[right_group * 64 + (position & 63)];
+      } else {
+        left_expert = candidate / experts;
+        right_expert = candidate % experts;
+        if (labels[left_expert] >= labels[right_expert]) continue;
+      }
       const int left = labels[left_expert];
       const int right = labels[right_expert];
-      int64_t gain = LLONG_MIN;
-      if (left < right) {
-        const int64_t pair = affinity[index];
-        gain = group_affinity[left_expert * ranks + right] - pair +
-               group_affinity[right_expert * ranks + left] - pair -
-               group_affinity[left_expert * ranks + left] -
-               group_affinity[right_expert * ranks + right];
-      }
-      gains[index] = gain;
+      const int64_t index = left_expert * experts + right_expert;
+      const int64_t pair = affinity[index];
+      const int64_t gain =
+          group_affinity[left_expert * ranks + right] - pair +
+          group_affinity[right_expert * ranks + left] - pair -
+          group_affinity[left_expert * ranks + left] -
+          group_affinity[right_expert * ranks + right];
       if (gain > best_gain ||
           (gain == best_gain && gain > 0 && index > best_index)) {
         best_gain = gain;
@@ -464,26 +731,288 @@ __global__ void affinity_swaps_kernel(
     best_gains[threadIdx.x] = best_gain;
     best_indices[threadIdx.x] = best_index;
     __syncthreads();
-    if (threadIdx.x == 0) {
-      for (int lane = 1; lane < blockDim.x; ++lane) {
-        if (best_gains[lane] > best_gain ||
-            (best_gains[lane] == best_gain && best_gains[lane] > 0 &&
-             best_indices[lane] > best_index)) {
-          best_gain = best_gains[lane];
-          best_index = best_indices[lane];
-        }
+    for (int offset = blockDim.x / 2; offset; offset >>= 1) {
+      if (threadIdx.x < offset &&
+          (best_gains[threadIdx.x + offset] > best_gains[threadIdx.x] ||
+           (best_gains[threadIdx.x + offset] == best_gains[threadIdx.x] &&
+            best_gains[threadIdx.x + offset] > 0 &&
+            best_indices[threadIdx.x + offset] >
+                best_indices[threadIdx.x]))) {
+        best_gains[threadIdx.x] = best_gains[threadIdx.x + offset];
+        best_indices[threadIdx.x] = best_indices[threadIdx.x + offset];
       }
-      selected = best_index;
+      __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+      selected = best_indices[0];
       if (selected >= 0) {
         const int64_t left = selected / experts;
         const int64_t right = selected % experts;
         const int64_t group = labels[left];
+        selected_left_group = group;
+        selected_right_group = labels[right];
+        if constexpr (FixedExperts == 256 && FixedRanks == 4) {
+          const int left_position = member_positions[left];
+          const int right_position = member_positions[right];
+          group_members[selected_left_group * 64 + left_position] = right;
+          group_members[selected_right_group * 64 + right_position] = left;
+          member_positions[right] = left_position;
+          member_positions[left] = right_position;
+        }
         labels[left] = labels[right];
         labels[right] = group;
       }
     }
     __syncthreads();
     if (selected < 0) break;
+    const int64_t left = selected / experts;
+    const int64_t right = selected % experts;
+    for (int64_t expert = threadIdx.x; expert < experts;
+         expert += blockDim.x) {
+      const int64_t left_affinity = affinity[expert * experts + left];
+      const int64_t right_affinity = affinity[expert * experts + right];
+      group_affinity[expert * ranks + selected_left_group] +=
+          right_affinity - left_affinity;
+      group_affinity[expert * ranks + selected_right_group] +=
+          left_affinity - right_affinity;
+    }
+    __syncthreads();
+  }
+}
+
+__device__ bool better_group_swap(int64_t peak, int64_t squared,
+                                  int64_t affinity_gain, int64_t index,
+                                  int64_t best_peak, int64_t best_squared,
+                                  int64_t best_affinity_gain,
+                                  int64_t best_index) {
+  return index >= 0 &&
+         (best_index < 0 || peak < best_peak ||
+          (peak == best_peak &&
+           (squared < best_squared ||
+            (squared == best_squared &&
+             (affinity_gain > best_affinity_gain ||
+              (affinity_gain == best_affinity_gain && index < best_index))))));
+}
+
+// ponytail: exhaustive O(32 * E^2) swaps are adequate for current <=256
+// experts; use a candidate shortlist only if this becomes measurable.
+template <int FixedExperts, int FixedRanks>
+__global__ void balance_affinity_groups_kernel(
+    const int64_t* demand, const int64_t* affinity, int64_t* labels,
+    int64_t* expert_loads, int64_t* group_loads, int64_t* group_affinity,
+    int64_t runtime_experts, int runtime_ranks) {
+  if (blockIdx.x) return;
+  const int64_t experts = FixedExperts ? FixedExperts : runtime_experts;
+  const int ranks = FixedRanks ? FixedRanks : runtime_ranks;
+  __shared__ int64_t best_peaks[1024];
+  __shared__ int64_t best_squared[1024];
+  __shared__ int64_t best_affinity_gains[1024];
+  __shared__ int64_t best_indices[1024];
+  __shared__ int64_t current_peak;
+  __shared__ int64_t current_squared;
+  __shared__ int64_t peak_values[3];
+  __shared__ int peak_groups[3];
+  __shared__ int64_t selected;
+  __shared__ int selected_left_group;
+  __shared__ int selected_right_group;
+  __shared__ int member_counts[4];
+  __shared__ int member_positions[256];
+  __shared__ int64_t group_members[256];
+
+  for (int rank = threadIdx.x; rank < ranks; rank += blockDim.x)
+    group_loads[rank] = 0;
+  __syncthreads();
+  for (int64_t expert = threadIdx.x; expert < experts;
+       expert += blockDim.x) {
+    int64_t load = 0;
+    for (int rank = 0; rank < ranks; ++rank)
+      load += demand[expert * ranks + rank];
+    expert_loads[expert] = load;
+    atomicAdd(reinterpret_cast<unsigned long long*>(group_loads + labels[expert]),
+              static_cast<unsigned long long>(load));
+  }
+  __syncthreads();
+  if constexpr (FixedExperts == 256 && FixedRanks == 4) {
+    if (threadIdx.x < 4) member_counts[threadIdx.x] = 0;
+    __syncthreads();
+    if (threadIdx.x < 256) {
+      const int group = labels[threadIdx.x];
+      const int position = atomicAdd(member_counts + group, 1);
+      group_members[group * 64 + position] = threadIdx.x;
+      member_positions[threadIdx.x] = position;
+    }
+    __syncthreads();
+  }
+
+  for (int64_t index = threadIdx.x; index < experts * ranks;
+       index += blockDim.x) {
+    const int64_t expert = index / ranks;
+    const int group = index % ranks;
+    int64_t total = 0;
+    for (int64_t other = 0; other < experts; ++other)
+      if (labels[other] == group)
+        total += affinity[expert * experts + other];
+    group_affinity[index] = total;
+  }
+  __syncthreads();
+
+  const int max_rounds = ranks > 16 ? 16 : 32;
+  for (int round = 0; round < max_rounds; ++round) {
+    if (threadIdx.x == 0) {
+      current_peak = 0;
+      current_squared = 0;
+      for (int slot = 0; slot < 3; ++slot) {
+        peak_values[slot] = -1;
+        peak_groups[slot] = -1;
+      }
+      for (int rank = 0; rank < ranks; ++rank) {
+        current_peak = max(current_peak, group_loads[rank]);
+        current_squared += group_loads[rank] * group_loads[rank];
+        for (int slot = 0; slot < 3; ++slot)
+          if (group_loads[rank] > peak_values[slot]) {
+            for (int tail = 2; tail > slot; --tail) {
+              peak_values[tail] = peak_values[tail - 1];
+              peak_groups[tail] = peak_groups[tail - 1];
+            }
+            peak_values[slot] = group_loads[rank];
+            peak_groups[slot] = rank;
+            break;
+          }
+      }
+    }
+    __syncthreads();
+
+    int64_t best_peak = LLONG_MAX;
+    int64_t best_square = LLONG_MAX;
+    int64_t best_gain = LLONG_MIN;
+    int64_t best_index = -1;
+    const int64_t candidate_count =
+        FixedExperts == 256 && FixedRanks == 4 ? 6 * 64 * 64
+                                               : experts * experts;
+    for (int64_t candidate = threadIdx.x; candidate < candidate_count;
+         candidate += blockDim.x) {
+      int64_t left_expert;
+      int64_t right_expert;
+      if constexpr (FixedExperts == 256 && FixedRanks == 4) {
+        const int pair = candidate >> 12;
+        const int position = candidate & 4095;
+        const int left_group =
+            pair < 3 ? 0 : pair < 5 ? 1 : 2;
+        const int right_group =
+            pair < 3 ? pair + 1 : pair < 5 ? pair - 1 : 3;
+        left_expert =
+            group_members[left_group * 64 + (position >> 6)];
+        right_expert =
+            group_members[right_group * 64 + (position & 63)];
+        if (left_expert > right_expert) {
+          const int64_t expert = left_expert;
+          left_expert = right_expert;
+          right_expert = expert;
+        }
+      } else {
+        left_expert = candidate / experts;
+        right_expert = candidate % experts;
+        if (left_expert >= right_expert) continue;
+      }
+      const int64_t index = left_expert * experts + right_expert;
+      const int left = labels[left_expert];
+      const int right = labels[right_expert];
+      if (left == right) continue;
+      const int64_t next_left = group_loads[left] - expert_loads[left_expert] +
+                                expert_loads[right_expert];
+      const int64_t next_right = group_loads[right] - expert_loads[right_expert] +
+                                 expert_loads[left_expert];
+      int64_t peak = max(next_left, next_right);
+      for (int slot = 0; slot < 3; ++slot)
+        if (peak_groups[slot] != left && peak_groups[slot] != right)
+          peak = max(peak, peak_values[slot]);
+      const int64_t squared =
+          current_squared - group_loads[left] * group_loads[left] -
+          group_loads[right] * group_loads[right] + next_left * next_left +
+          next_right * next_right;
+      const int64_t pair = affinity[index];
+      const int64_t gain =
+          group_affinity[left_expert * ranks + right] - pair +
+          group_affinity[right_expert * ranks + left] - pair -
+          group_affinity[left_expert * ranks + left] -
+          group_affinity[right_expert * ranks + right];
+      const bool improves =
+          peak < current_peak ||
+          (peak == current_peak &&
+           (squared < current_squared ||
+            (squared == current_squared && gain > 0)));
+      if (improves &&
+          better_group_swap(peak, squared, gain, index, best_peak, best_square,
+                            best_gain, best_index)) {
+        best_peak = peak;
+        best_square = squared;
+        best_gain = gain;
+        best_index = index;
+      }
+    }
+    best_peaks[threadIdx.x] = best_peak;
+    best_squared[threadIdx.x] = best_square;
+    best_affinity_gains[threadIdx.x] = best_gain;
+    best_indices[threadIdx.x] = best_index;
+    __syncthreads();
+    for (int offset = blockDim.x / 2; offset; offset >>= 1) {
+      if (threadIdx.x < offset &&
+          better_group_swap(
+              best_peaks[threadIdx.x + offset],
+              best_squared[threadIdx.x + offset],
+              best_affinity_gains[threadIdx.x + offset],
+              best_indices[threadIdx.x + offset], best_peaks[threadIdx.x],
+              best_squared[threadIdx.x],
+              best_affinity_gains[threadIdx.x], best_indices[threadIdx.x])) {
+        best_peaks[threadIdx.x] = best_peaks[threadIdx.x + offset];
+        best_squared[threadIdx.x] = best_squared[threadIdx.x + offset];
+        best_affinity_gains[threadIdx.x] =
+            best_affinity_gains[threadIdx.x + offset];
+        best_indices[threadIdx.x] = best_indices[threadIdx.x + offset];
+      }
+      __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+      selected = best_indices[0];
+      if (selected >= 0) {
+        const int64_t left_expert = selected / experts;
+        const int64_t right_expert = selected % experts;
+        const int left = labels[left_expert];
+        const int right = labels[right_expert];
+        selected_left_group = left;
+        selected_right_group = right;
+        if constexpr (FixedExperts == 256 && FixedRanks == 4) {
+          const int left_position = member_positions[left_expert];
+          const int right_position = member_positions[right_expert];
+          group_members[left * 64 + left_position] = right_expert;
+          group_members[right * 64 + right_position] = left_expert;
+          member_positions[right_expert] = left_position;
+          member_positions[left_expert] = right_position;
+        }
+        group_loads[left] +=
+            expert_loads[right_expert] - expert_loads[left_expert];
+        group_loads[right] +=
+            expert_loads[left_expert] - expert_loads[right_expert];
+        labels[left_expert] = right;
+        labels[right_expert] = left;
+      }
+    }
+    __syncthreads();
+    if (selected < 0) break;
+    const int64_t left_expert = selected / experts;
+    const int64_t right_expert = selected % experts;
+    for (int64_t expert = threadIdx.x; expert < experts;
+         expert += blockDim.x) {
+      const int64_t left_affinity =
+          affinity[expert * experts + left_expert];
+      const int64_t right_affinity =
+          affinity[expert * experts + right_expert];
+      group_affinity[expert * ranks + selected_left_group] +=
+          right_affinity - left_affinity;
+      group_affinity[expert * ranks + selected_right_group] +=
+          left_affinity - right_affinity;
+    }
+    __syncthreads();
   }
 }
 
@@ -895,24 +1424,39 @@ void affinity_primary_into(
               primary.scalar_type() == torch::kInt64);
 
   auto stream = c10::cuda::getCurrentCUDAStream(source.get_device());
-  demand.zero_();
-  affinity.zero_();
-  degree.zero_();
-  group_source.zero_();
   const int64_t tokens = source.size(0);
-  launch(affinity_histogram_kernel, dim3((tokens + 255) / 256), dim3(256),
+  launch(affinity_histogram_kernel, dim3(1), dim3(256),
          stream.stream(), source.data_ptr<int64_t>(), topk.data_ptr<int64_t>(),
          count.data_ptr<int64_t>(), demand.data_ptr<int64_t>(),
          affinity.data_ptr<int64_t>(), degree.data_ptr<int64_t>(), tokens,
-         topk.size(1), experts, ranks);
+         topk.size(1), experts, ranks, true);
+  launch(affinity_degree_kernel, dim3(1), dim3(256),
+         stream.stream(), affinity.data_ptr<int64_t>(),
+         degree.data_ptr<int64_t>(), experts);
   launch(affinity_groups_kernel, dim3(1), dim3(1), stream.stream(),
          demand.data_ptr<int64_t>(), affinity.data_ptr<int64_t>(),
          degree.data_ptr<int64_t>(), score.data_ptr<int64_t>(),
          groups.data_ptr<int64_t>(), experts, ranks);
-  launch(group_source_kernel, dim3((tokens + 255) / 256), dim3(256),
-         stream.stream(), source.data_ptr<int64_t>(), topk.data_ptr<int64_t>(),
-         count.data_ptr<int64_t>(), groups.data_ptr<int64_t>(),
-         group_source.data_ptr<int64_t>(), tokens, topk.size(1), ranks);
+  if (ranks <= 16)
+    launch(group_source_shared_kernel<16>, dim3(1), dim3(256), stream.stream(),
+           source.data_ptr<int64_t>(), topk.data_ptr<int64_t>(),
+           count.data_ptr<int64_t>(), groups.data_ptr<int64_t>(),
+           group_source.data_ptr<int64_t>(), tokens, topk.size(1), ranks, false);
+  else if (ranks <= 32)
+    launch(group_source_shared_kernel<32>, dim3(1), dim3(256), stream.stream(),
+           source.data_ptr<int64_t>(), topk.data_ptr<int64_t>(),
+           count.data_ptr<int64_t>(), groups.data_ptr<int64_t>(),
+           group_source.data_ptr<int64_t>(), tokens, topk.size(1), ranks, false);
+  else if (ranks <= 64)
+    launch(group_source_shared_kernel<64>, dim3(1), dim3(256), stream.stream(),
+           source.data_ptr<int64_t>(), topk.data_ptr<int64_t>(),
+           count.data_ptr<int64_t>(), groups.data_ptr<int64_t>(),
+           group_source.data_ptr<int64_t>(), tokens, topk.size(1), ranks, false);
+  else
+    launch(group_source_kernel, dim3(1), dim3(256), stream.stream(),
+           source.data_ptr<int64_t>(), topk.data_ptr<int64_t>(),
+           count.data_ptr<int64_t>(), groups.data_ptr<int64_t>(),
+           group_source.data_ptr<int64_t>(), tokens, topk.size(1), ranks, true);
   launch(map_groups_kernel, dim3(1), dim3(1), stream.stream(),
          group_source.data_ptr<int64_t>(), groups.data_ptr<int64_t>(),
          group_to_rank.data_ptr<int64_t>(), primary.data_ptr<int64_t>(), experts,
@@ -922,17 +1466,74 @@ void affinity_primary_into(
 
 void affinity_histogram_into(torch::Tensor source, torch::Tensor topk,
                              torch::Tensor count, torch::Tensor demand,
-                             torch::Tensor affinity, torch::Tensor degree) {
-  demand.zero_();
-  affinity.zero_();
-  degree.zero_();
+                             torch::Tensor affinity, torch::Tensor degree,
+                             int64_t solver_sms) {
+  TORCH_CHECK(solver_sms > 0, "solver_sms must be positive");
   auto stream = c10::cuda::getCurrentCUDAStream(source.get_device());
   const int64_t tokens = source.size(0);
-  launch(affinity_histogram_kernel, dim3((tokens + 255) / 256), dim3(256),
+  if (solver_sms > 1) {
+    check_cuda(cudaMemsetAsync(demand.data_ptr<int64_t>(), 0,
+                               demand.numel() * sizeof(int64_t), stream.stream()));
+    check_cuda(cudaMemsetAsync(affinity.data_ptr<int64_t>(), 0,
+                               affinity.numel() * sizeof(int64_t), stream.stream()));
+  }
+  launch(affinity_histogram_kernel, dim3(solver_sms), dim3(256),
          stream.stream(), source.data_ptr<int64_t>(), topk.data_ptr<int64_t>(),
          count.data_ptr<int64_t>(), demand.data_ptr<int64_t>(),
          affinity.data_ptr<int64_t>(), degree.data_ptr<int64_t>(), tokens,
-         topk.size(1), demand.size(0), demand.size(1));
+         topk.size(1), demand.size(0), demand.size(1), solver_sms == 1);
+  const int64_t experts = demand.size(0);
+  launch(affinity_degree_kernel, dim3(solver_sms), dim3(256),
+         stream.stream(), affinity.data_ptr<int64_t>(),
+         degree.data_ptr<int64_t>(), experts);
+  check_cuda(cudaGetLastError());
+}
+
+void normalize_affinity_into(torch::Tensor affinity, torch::Tensor degree,
+                             torch::Tensor scale, torch::Tensor normalized) {
+  const int64_t experts = degree.numel();
+  TORCH_CHECK(affinity.is_cuda() && affinity.scalar_type() == torch::kInt64 &&
+              affinity.is_contiguous() && affinity.dim() == 2 &&
+              affinity.size(0) == experts && affinity.size(1) == experts);
+  TORCH_CHECK(degree.is_cuda() && degree.scalar_type() == torch::kInt64 &&
+              degree.is_contiguous());
+  TORCH_CHECK(scale.is_cuda() && scale.scalar_type() == torch::kFloat64 &&
+              scale.is_contiguous() && scale.numel() == experts);
+  TORCH_CHECK(normalized.is_cuda() &&
+              normalized.scalar_type() == torch::kFloat64 &&
+              normalized.is_contiguous() && normalized.sizes() == affinity.sizes());
+  auto stream = c10::cuda::getCurrentCUDAStream(affinity.get_device());
+  launch(affinity_scale_kernel, dim3((experts + 255) / 256), dim3(256),
+         stream.stream(), degree.data_ptr<int64_t>(), scale.data_ptr<double>(),
+         experts);
+  const int64_t elements = affinity.numel();
+  launch(normalize_affinity_kernel, dim3((elements + 255) / 256), dim3(256),
+         stream.stream(), affinity.data_ptr<int64_t>(), scale.data_ptr<double>(),
+         normalized.data_ptr<double>(), elements, experts);
+  check_cuda(cudaGetLastError());
+}
+
+void affinity_subspace_into(torch::Tensor affinity, torch::Tensor degree,
+                            torch::Tensor initial, torch::Tensor embedding,
+                            int64_t iterations) {
+  const int64_t experts = degree.numel();
+  TORCH_CHECK(affinity.is_cuda() && affinity.scalar_type() == torch::kInt64 &&
+              affinity.is_contiguous() && affinity.size(0) == experts &&
+              affinity.size(1) == experts && experts <= 256);
+  TORCH_CHECK(degree.is_cuda() && degree.scalar_type() == torch::kInt64 &&
+              degree.is_contiguous());
+  TORCH_CHECK(initial.is_cuda() && initial.scalar_type() == torch::kFloat64 &&
+              initial.is_contiguous() && initial.size(0) == experts &&
+              initial.size(1) == 4);
+  TORCH_CHECK(embedding.is_cuda() &&
+              embedding.scalar_type() == torch::kFloat64 &&
+              embedding.is_contiguous() && embedding.sizes() == initial.sizes());
+  TORCH_CHECK(iterations > 0);
+  auto stream = c10::cuda::getCurrentCUDAStream(affinity.get_device());
+  launch(affinity_subspace_kernel, dim3(1), dim3(256), stream.stream(),
+         affinity.data_ptr<int64_t>(), degree.data_ptr<int64_t>(),
+         initial.data_ptr<double>(), embedding.data_ptr<double>(), experts,
+         static_cast<int>(iterations));
   check_cuda(cudaGetLastError());
 }
 
@@ -943,13 +1544,15 @@ void spectral_groups_into(torch::Tensor embedding, torch::Tensor affinity,
                           torch::Tensor overflow, torch::Tensor group_affinity,
                           torch::Tensor swap_gains) {
   const int64_t experts = embedding.size(0);
-  const int64_t ranks = embedding.size(1);
+  const int dimensions = embedding.size(1);
+  const int ranks = sizes.numel();
   TORCH_CHECK(embedding.is_cuda() && embedding.scalar_type() == torch::kFloat64 &&
-              embedding.is_contiguous() && experts % ranks == 0);
+              embedding.is_contiguous() && dimensions > 0 && ranks > 0 &&
+              experts % ranks == 0);
   TORCH_CHECK(affinity.is_cuda() && affinity.scalar_type() == torch::kInt64 &&
               affinity.size(0) == experts && affinity.size(1) == experts);
   TORCH_CHECK(centers.is_cuda() && centers.scalar_type() == torch::kFloat64 &&
-              centers.numel() == ranks * ranks);
+              centers.numel() == ranks * dimensions);
   TORCH_CHECK(distances.is_cuda() &&
               distances.scalar_type() == torch::kFloat64 &&
               distances.numel() == experts);
@@ -968,17 +1571,53 @@ void spectral_groups_into(torch::Tensor embedding, torch::Tensor affinity,
          centers.data_ptr<double>(), distances.data_ptr<double>(),
          groups.data_ptr<int64_t>(),
          next_groups.data_ptr<int64_t>(), sizes.data_ptr<int64_t>(),
-         overflow.data_ptr<int64_t>(), experts, ranks);
-  launch(affinity_swaps_kernel, dim3(1), dim3(256), stream.stream(),
+         overflow.data_ptr<int64_t>(), experts, ranks, dimensions);
+  const auto kernel = experts == 256 && ranks == 4
+                          ? affinity_swaps_kernel<256, 4>
+                          : affinity_swaps_kernel<0, 0>;
+  launch(kernel, dim3(1), dim3(1024), stream.stream(),
          affinity.data_ptr<int64_t>(), groups.data_ptr<int64_t>(),
          group_affinity.data_ptr<int64_t>(), swap_gains.data_ptr<int64_t>(),
          experts, ranks);
   check_cuda(cudaGetLastError());
 }
 
+void balance_affinity_groups_into(
+    torch::Tensor demand, torch::Tensor affinity, torch::Tensor groups,
+    torch::Tensor expert_loads, torch::Tensor group_loads,
+    torch::Tensor group_affinity) {
+  const int64_t experts = demand.size(0);
+  const int64_t ranks = demand.size(1);
+  TORCH_CHECK(demand.is_cuda() && demand.scalar_type() == torch::kInt64 &&
+              demand.is_contiguous() && ranks > 0);
+  TORCH_CHECK(affinity.is_cuda() && affinity.scalar_type() == torch::kInt64 &&
+              affinity.is_contiguous() && affinity.size(0) == experts &&
+              affinity.size(1) == experts);
+  TORCH_CHECK(groups.is_cuda() && groups.scalar_type() == torch::kInt64 &&
+              groups.is_contiguous() && groups.numel() == experts);
+  TORCH_CHECK(expert_loads.is_cuda() &&
+              expert_loads.scalar_type() == torch::kInt64 &&
+              expert_loads.numel() == experts && group_loads.is_cuda() &&
+              group_loads.scalar_type() == torch::kInt64 &&
+              group_loads.numel() == ranks && group_affinity.is_cuda() &&
+              group_affinity.scalar_type() == torch::kInt64 &&
+              group_affinity.numel() == experts * ranks);
+  auto stream = c10::cuda::getCurrentCUDAStream(demand.get_device());
+  const auto kernel = experts == 256 && ranks == 4
+                          ? balance_affinity_groups_kernel<256, 4>
+                          : balance_affinity_groups_kernel<0, 0>;
+  launch(kernel, dim3(1), dim3(1024), stream.stream(),
+         demand.data_ptr<int64_t>(), affinity.data_ptr<int64_t>(),
+         groups.data_ptr<int64_t>(), expert_loads.data_ptr<int64_t>(),
+         group_loads.data_ptr<int64_t>(), group_affinity.data_ptr<int64_t>(),
+         experts, ranks);
+  check_cuda(cudaGetLastError());
+}
+
 void group_source_into(torch::Tensor source, torch::Tensor topk,
                        torch::Tensor count, torch::Tensor groups,
-                       torch::Tensor group_source) {
+                       torch::Tensor group_source, int64_t solver_sms) {
+  TORCH_CHECK(solver_sms > 0, "solver_sms must be positive");
   TORCH_CHECK(source.is_cuda() && topk.is_cuda() && count.is_cuda() &&
               groups.is_cuda() && group_source.is_cuda());
   TORCH_CHECK(source.scalar_type() == torch::kInt64 &&
@@ -986,14 +1625,37 @@ void group_source_into(torch::Tensor source, torch::Tensor topk,
               count.scalar_type() == torch::kInt64 &&
               groups.scalar_type() == torch::kInt64 &&
               group_source.scalar_type() == torch::kInt64);
-  group_source.zero_();
   auto stream = c10::cuda::getCurrentCUDAStream(source.get_device());
   const int64_t tokens = source.size(0);
-  launch(group_source_kernel, dim3((tokens + 255) / 256), dim3(256),
-         stream.stream(), source.data_ptr<int64_t>(), topk.data_ptr<int64_t>(),
-         count.data_ptr<int64_t>(), groups.data_ptr<int64_t>(),
-         group_source.data_ptr<int64_t>(), tokens, topk.size(1),
-         group_source.size(0));
+  const int ranks = group_source.size(0);
+  if (solver_sms > 1)
+    check_cuda(cudaMemsetAsync(group_source.data_ptr<int64_t>(), 0,
+                               group_source.numel() * sizeof(int64_t),
+                               stream.stream()));
+  if (ranks <= 16)
+    launch(group_source_shared_kernel<16>, dim3(solver_sms), dim3(256),
+           stream.stream(), source.data_ptr<int64_t>(), topk.data_ptr<int64_t>(),
+           count.data_ptr<int64_t>(), groups.data_ptr<int64_t>(),
+           group_source.data_ptr<int64_t>(), tokens, topk.size(1), ranks,
+           solver_sms > 1);
+  else if (ranks <= 32)
+    launch(group_source_shared_kernel<32>, dim3(solver_sms), dim3(256),
+           stream.stream(), source.data_ptr<int64_t>(), topk.data_ptr<int64_t>(),
+           count.data_ptr<int64_t>(), groups.data_ptr<int64_t>(),
+           group_source.data_ptr<int64_t>(), tokens, topk.size(1), ranks,
+           solver_sms > 1);
+  else if (ranks <= 64)
+    launch(group_source_shared_kernel<64>, dim3(solver_sms), dim3(256),
+           stream.stream(), source.data_ptr<int64_t>(), topk.data_ptr<int64_t>(),
+           count.data_ptr<int64_t>(), groups.data_ptr<int64_t>(),
+           group_source.data_ptr<int64_t>(), tokens, topk.size(1), ranks,
+           solver_sms > 1);
+  else
+    launch(group_source_kernel, dim3(solver_sms), dim3(256), stream.stream(),
+           source.data_ptr<int64_t>(), topk.data_ptr<int64_t>(),
+           count.data_ptr<int64_t>(), groups.data_ptr<int64_t>(),
+           group_source.data_ptr<int64_t>(), tokens, topk.size(1), ranks,
+           solver_sms == 1);
   check_cuda(cudaGetLastError());
 }
 
@@ -1015,6 +1677,14 @@ void congestion_hungarian_into(
               assignment.scalar_type() == torch::kInt64 &&
               primary.scalar_type() == torch::kInt64);
   auto stream = c10::cuda::getCurrentCUDAStream(group_source.get_device());
+  if (ranks > 16) {
+    launch(map_groups_kernel, dim3(1), dim3(128), stream.stream(),
+           group_source.data_ptr<int64_t>(), groups.data_ptr<int64_t>(),
+           assignment.data_ptr<int64_t>(), primary.data_ptr<int64_t>(),
+           groups.numel(), ranks);
+    check_cuda(cudaGetLastError());
+    return;
+  }
   launch(congestion_hungarian_kernel, dim3(1), dim3(1), stream.stream(),
          group_source.data_ptr<int64_t>(), groups.data_ptr<int64_t>(),
          allowed.data_ptr<bool>(), values.data_ptr<int64_t>(),

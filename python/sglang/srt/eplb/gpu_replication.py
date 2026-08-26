@@ -108,6 +108,7 @@ def _route_cuda(
     )
 
 
+
 def _within_communication_budget(
     metrics: ReplicaMetrics, baseline: ReplicaMetrics, ratio: float
 ) -> bool:
@@ -200,8 +201,7 @@ def _bundle_ordinals_cuda(
 ) -> torch.Tensor:
     keys = (source[:, None] * experts + topk).reshape(-1)
     weights = count[:, None].expand_as(topk).reshape(-1)
-    order = torch.argsort(keys, stable=True)
-    sorted_keys = keys[order]
+    sorted_keys, order = torch.sort(keys, stable=True)
     sorted_weights = weights[order]
     before = sorted_weights.cumsum(0) - sorted_weights
     starts = torch.empty_like(sorted_keys, dtype=torch.bool)
@@ -385,10 +385,17 @@ class GraceCudaRuntime:
     """GPU-resident state for repeated plans with fixed EP geometry."""
 
     def __init__(
-        self, num_experts: int, num_ranks: int, device: str | torch.device = "cuda"
+        self,
+        num_experts: int,
+        num_ranks: int,
+        device: str | torch.device = "cuda",
+        solver_sms: int = 1,
     ) -> None:
         self.num_experts = int(num_experts)
         self.num_ranks = int(num_ranks)
+        self.solver_sms = int(solver_sms)
+        if self.solver_sms < 1:
+            raise ValueError("solver_sms must be positive")
         self.device = torch.device(device)
         if self.device.type != "cuda":
             raise ValueError("CUDA runtime requires a CUDA device")
@@ -433,6 +440,13 @@ class GraceCudaRuntime:
             (self.num_experts, self.num_ranks), device=self.device, dtype=torch.bool
         )
         self.replica_gains = torch.empty_like(self.replicas, dtype=torch.int64)
+        rank_group_workspace = (
+            self.num_ranks * (self.num_ranks + 1) * (self.num_experts + 1)
+        )
+        self.rank_group_values = torch.empty(
+            rank_group_workspace, device=self.device, dtype=torch.int64
+        )
+        self.rank_group_choices = torch.empty_like(self.rank_group_values)
         self.compute_instance = torch.empty_like(self.replicas, dtype=torch.int64)
         self.compute_loads = torch.empty(
             (self.num_ranks,), device=self.device, dtype=torch.int64
@@ -456,19 +470,37 @@ class GraceCudaRuntime:
         self.affinity_group_to_rank = torch.empty(
             (self.num_ranks,), device=self.device, dtype=torch.int64
         )
-        self.affinity_float = torch.empty_like(self.affinity, dtype=torch.float64)
-        self.affinity_scale = torch.empty_like(self.primary, dtype=torch.float64)
         self.affinity_eigenvalues = torch.empty_like(
             self.primary, dtype=torch.float64
         )
-        self.affinity_eigenvectors = torch.empty_like(self.affinity_float)
+        self.affinity_dimensions = min(self.num_ranks, 4)
         self.affinity_embedding = torch.empty(
-            (self.num_experts, self.num_ranks),
+            (self.num_experts, self.affinity_dimensions),
             device=self.device,
             dtype=torch.float64,
         )
+        self._use_affinity_subspace = self.num_experts <= 256
+        if self._use_affinity_subspace:
+            generator = torch.Generator(device=self.device).manual_seed(0)
+            self.affinity_initial = torch.linalg.qr(
+                torch.randn(
+                    self.affinity_embedding.shape,
+                    generator=generator,
+                    device=self.device,
+                    dtype=torch.float64,
+                ),
+                mode="reduced",
+            ).Q.contiguous()
+        else:
+            self.affinity_float = torch.empty_like(
+                self.affinity, dtype=torch.float64
+            )
+            self.affinity_scale = torch.empty_like(
+                self.primary, dtype=torch.float64
+            )
+            self.affinity_eigenvectors = torch.empty_like(self.affinity_float)
         self.affinity_centers = torch.empty(
-            (self.num_ranks, self.num_ranks),
+            (self.num_ranks, self.affinity_dimensions),
             device=self.device,
             dtype=torch.float64,
         )
@@ -555,8 +587,7 @@ class GraceCudaRuntime:
     ) -> torch.Tensor:
         """Build a capacity-strict affinity placement without leaving CUDA."""
         if self.num_experts % self.num_ranks:
-            raise ValueError("strict spectral placement requires experts divisible by ranks")
-        started = _phase_start(timing)
+            raise ValueError("strict affinity placement requires experts divisible by ranks")
         source, topk, count = _cuda_arrays((source, topk, count), self.device)
         phase_started = _phase_start(timing)
         _C.affinity_histogram_into(
@@ -566,30 +597,40 @@ class GraceCudaRuntime:
             self.demand,
             self.affinity,
             self.affinity_degree,
+            self.solver_sms,
         )
         _record(timing, "affinity_histogram_ms", phase_started)
         phase_started = _phase_start(timing)
-        self.affinity_float.copy_(self.affinity)
-        self.affinity_scale.copy_(self.affinity_degree)
-        self.affinity_scale.sqrt_().reciprocal_()
-        self.affinity_scale.masked_fill_(self.affinity_degree == 0, 0)
-        self.affinity_float.mul_(self.affinity_scale[:, None])
-        self.affinity_float.mul_(self.affinity_scale[None, :])
-        torch.linalg.eigh(
-            self.affinity_float,
-            out=(self.affinity_eigenvalues, self.affinity_eigenvectors),
-        )
-        _record(timing, "affinity_eigh_ms", phase_started)
-        phase_started = _phase_start(timing)
-        self.affinity_embedding.copy_(
-            self.affinity_eigenvectors[:, -self.num_ranks :]
-        )
-        torch.nn.functional.normalize(
-            self.affinity_embedding,
-            dim=1,
-            eps=1e-12,
-            out=self.affinity_embedding,
-        )
+        if self._use_affinity_subspace:
+            _C.affinity_subspace_into(
+                self.affinity,
+                self.affinity_degree,
+                self.affinity_initial,
+                self.affinity_embedding,
+                2,
+            )
+        else:
+            _C.normalize_affinity_into(
+                self.affinity,
+                self.affinity_degree,
+                self.affinity_scale,
+                self.affinity_float,
+            )
+            torch.linalg.eigh(
+                self.affinity_float,
+                out=(self.affinity_eigenvalues, self.affinity_eigenvectors),
+            )
+            self.affinity_embedding.copy_(
+                self.affinity_eigenvectors[:, -self.affinity_dimensions :]
+            )
+            torch.nn.functional.normalize(
+                self.affinity_embedding,
+                dim=1,
+                eps=1e-12,
+                out=self.affinity_embedding,
+            )
+        _record(timing, "affinity_embedding_ms", phase_started)
+        spectral_started = _phase_start(timing)
         _C.spectral_groups_into(
             self.affinity_embedding,
             self.affinity,
@@ -602,7 +643,17 @@ class GraceCudaRuntime:
             self.affinity_group_affinity,
             self.affinity_swap_gains,
         )
-        _record(timing, "affinity_grouping_ms", phase_started)
+        _record(timing, "affinity_partition_ms", spectral_started)
+        balance_started = _phase_start(timing)
+        _C.balance_affinity_groups_into(
+            self.demand,
+            self.affinity,
+            self.affinity_groups,
+            self.affinity_overflow,
+            self.affinity_group_sizes,
+            self.affinity_group_affinity,
+        )
+        _record(timing, "affinity_balance_ms", balance_started)
         phase_started = _phase_start(timing)
         _C.group_source_into(
             source,
@@ -610,6 +661,7 @@ class GraceCudaRuntime:
             count,
             self.affinity_groups,
             self.affinity_group_source,
+            self.solver_sms,
         )
         _C.congestion_hungarian_into(
             self.affinity_group_source,
@@ -622,10 +674,30 @@ class GraceCudaRuntime:
             self.primary,
         )
         _record(timing, "affinity_hungarian_ms", phase_started)
-        _record(timing, "communication_replication_ms", started)
         return self.primary
 
-    def plan(
+    def plan_unified(
+        self,
+        source: torch.Tensor,
+        topk: torch.Tensor,
+        count: torch.Tensor,
+        primary: Mapping[int, int] | torch.Tensor,
+        demand: torch.Tensor | None = None,
+        **kwargs,
+    ) -> ReplicaPlacement:
+        """Run the exact capacity-v2 solver through the unified entry point."""
+        return replicate_source_top_experts_cuda(
+            (source, topk, count),
+            primary,
+            num_ranks=self.num_ranks,
+            device=self.device,
+            runtime=self,
+            demand_tensor=demand,
+            compute_solver="unified",
+            **kwargs,
+        )
+
+    def plan_grouped(
         self,
         source: torch.Tensor,
         topk: torch.Tensor,
@@ -644,6 +716,49 @@ class GraceCudaRuntime:
             demand_tensor=demand,
             **kwargs,
         )
+
+    def plan_pure(
+        self,
+        source: torch.Tensor,
+        topk: torch.Tensor,
+        count: torch.Tensor,
+        primary: Mapping[int, int] | torch.Tensor,
+        demand: torch.Tensor | None = None,
+        **kwargs,
+    ) -> ReplicaPlacement:
+        """Run pure Top-N replication without invoking affinity grouping."""
+        return replicate_source_top_experts_cuda(
+            (source, topk, count),
+            primary,
+            num_ranks=self.num_ranks,
+            device=self.device,
+            runtime=self,
+            demand_tensor=demand,
+            pure=True,
+            **kwargs,
+        )
+
+    def plan_rank_group(
+        self,
+        source: torch.Tensor,
+        topk: torch.Tensor,
+        count: torch.Tensor,
+        primary: Mapping[int, int] | torch.Tensor,
+        demand: torch.Tensor | None = None,
+        **kwargs,
+    ) -> ReplicaPlacement:
+        """Choose the better complete plan from rank-group and pure Top-N."""
+        return replicate_rank_group_experts_cuda(
+            (source, topk, count),
+            primary,
+            num_ranks=self.num_ranks,
+            device=self.device,
+            runtime=self,
+            demand_tensor=demand,
+            **kwargs,
+        )
+
+    plan = plan_grouped
 
 
 def evaluate_replicated_placement_cuda(
@@ -687,9 +802,11 @@ def replicate_source_top_experts_cuda(
     materialize_quota: bool = True,
     runtime: GraceCudaRuntime | None = None,
     demand_tensor: torch.Tensor | None = None,
-    compute_solver: str = "legacy",
+    compute_solver: str | None = None,
+    pure: bool = False,
+    rank_group_replication: bool = False,
 ) -> ReplicaPlacement:
-    """Run bundle-aware communication replication with CUDA trace processing.
+    """Run grouped or pure Top-N replication with CUDA trace processing.
 
     Replica gain counts only traffic whose remote destination disappears. With
     a resident runtime, compute replicas and their export quota are produced
@@ -700,8 +817,13 @@ def replicate_source_top_experts_cuda(
         raise ValueError("max_extra_per_rank must be non-negative")
     if max_compute_extra_per_rank < 0:
         raise ValueError("max_compute_extra_per_rank must be non-negative")
-    if compute_solver not in {"legacy", "capacity-v2"}:
-        raise ValueError("compute_solver must be 'legacy' or 'capacity-v2'")
+    if not pure and compute_solver not in {None, "legacy", "capacity-v2", "unified"}:
+        raise ValueError("compute_solver must be 'legacy', 'capacity-v2', or 'unified'")
+    if compute_solver == "unified":
+        # Exact public alias: one implementation keeps output semantics identical.
+        compute_solver = "capacity-v2"
+    if rank_group_replication and not pure:
+        raise ValueError("rank-group replication requires the pure planner")
     if compute_imbalance_limit is not None and (
         compute_imbalance_limit < 1 or not math.isfinite(compute_imbalance_limit)
     ):
@@ -743,15 +865,25 @@ def replicate_source_top_experts_cuda(
         primary_tensor = torch.as_tensor(primary_np, device=device)
     if demand_tensor is None:
         if runtime is None:
-            demand, replica_mask, routing_tensor = _C.fused_source_topn(
-                source,
-                topk,
-                count,
-                primary_tensor,
-                num_experts,
-                num_ranks,
-                max_extra_per_rank,
+            if not pure:
+                demand, replica_mask, routing_tensor = _C.fused_source_topn(
+                    source,
+                    topk,
+                    count,
+                    primary_tensor,
+                    num_experts,
+                    num_ranks,
+                    max_extra_per_rank,
+                )
+            else:
+                demand = _C.source_demand(
+                    source, topk, count, num_experts, num_ranks
+                )
+        elif pure:
+            _C.source_demand_into(
+                source, topk, count, num_experts, num_ranks, runtime.demand
             )
+            demand = runtime.demand
         else:
             _C.fused_source_topn_into(
                 source,
@@ -774,7 +906,7 @@ def replicate_source_top_experts_cuda(
         ).contiguous()
         if demand.shape != (num_experts, num_ranks):
             raise ValueError("demand has the wrong shape")
-        if runtime is None:
+        if not pure and runtime is None:
             gains = torch.empty_like(demand)
             replica_mask = torch.empty_like(demand, dtype=torch.bool)
             routing_tensor = torch.empty(
@@ -789,8 +921,9 @@ def replicate_source_top_experts_cuda(
                 gains,
                 replica_mask,
                 routing_tensor,
+                1,
             )
-        else:
+        elif not pure:
             _C.select_bundle_topn_routing_into(
                 source,
                 topk,
@@ -800,8 +933,56 @@ def replicate_source_top_experts_cuda(
                 runtime.replica_gains,
                 runtime.replicas,
                 runtime.routing,
+                runtime.solver_sms,
             )
             replica_mask, routing_tensor = runtime.replicas, runtime.routing
+    if pure and rank_group_replication:
+        workspace_size = num_ranks * (num_ranks + 1) * (num_experts + 1)
+        if runtime is None:
+            ordinals = torch.empty_like(demand)
+            group_experts = torch.empty_like(demand)
+            gains = torch.empty_like(demand)
+            values = torch.empty(workspace_size, device=device, dtype=torch.int64)
+            choices = torch.empty_like(values)
+            replica_mask = torch.empty_like(demand, dtype=torch.bool)
+            routing_tensor = torch.empty(
+                (num_ranks, num_experts), device=device, dtype=torch.int64
+            )
+        else:
+            ordinals = runtime.compute_instance
+            group_experts = runtime.compute_addition_order
+            gains = runtime.replica_gains
+            values = runtime.rank_group_values
+            choices = runtime.rank_group_choices
+            replica_mask = runtime.replicas
+            routing_tensor = runtime.routing
+        _C.select_rank_group_topn_routing_into(
+            source,
+            topk,
+            count,
+            demand,
+            primary_tensor,
+            max_extra_per_rank,
+            ordinals,
+            group_experts,
+            gains,
+            values,
+            choices,
+            replica_mask,
+            routing_tensor,
+        )
+    elif pure and runtime is None:
+        replica_mask = _C.select_topn(demand, primary_tensor, max_extra_per_rank)
+        routing_tensor = _C.default_routing(replica_mask, primary_tensor)
+    elif pure:
+        _C.select_topn_routing_into(
+            demand,
+            primary_tensor,
+            max_extra_per_rank,
+            runtime.replicas,
+            runtime.routing,
+        )
+        replica_mask, routing_tensor = runtime.replicas, runtime.routing
     _record(timing, "communication_replication_ms", started)
 
     quota = None
@@ -812,11 +993,22 @@ def replicate_source_top_experts_cuda(
         if compute_imbalance_limit is not None
         else -1.0
     )
+    fast_capacity = (
+        runtime is not None
+        and num_ranks > 16
+        and not pure
+        and compute_solver == "capacity-v2"
+    )
     if runtime is None:
         addition_order = torch.zeros_like(demand)
     else:
         addition_order = runtime.compute_addition_order
-        addition_order.zero_()
+        if not (
+            max_compute_extra_per_rank
+            and not pure
+            and compute_solver == "capacity-v2"
+        ):
+            addition_order.zero_()
     quota_out = runtime.quota if runtime is not None else None
     routing_out = runtime.routing if runtime is not None else None
     instance_out = runtime.instance if runtime is not None else None
@@ -825,10 +1017,7 @@ def replicate_source_top_experts_cuda(
     direct_export_quota = (
         runtime is not None
         and max_compute_extra_per_rank > 0
-        and (
-            compute_solver == "capacity-v2"
-            or communication_budget_ratio in (None, 1.0)
-        )
+        and communication_budget_ratio in (None, 1.0)
     )
     if needs_quota and not direct_export_quota:
         expert_demand = demand.sum(dim=1)
@@ -849,7 +1038,35 @@ def replicate_source_top_experts_cuda(
             )
             _record(timing, "communication_replication_ms", metrics_started)
         compute_started = _phase_start(timing)
-        if compute_solver == "capacity-v2":
+        if fast_capacity:
+            _C.current_bundle_gains_fast_into(
+                source,
+                topk,
+                count,
+                primary_tensor,
+                replica_mask,
+                runtime.replica_gains,
+                runtime.solver_sms,
+            )
+            _C.select_compute_replicas_fast_into(
+                demand,
+                runtime.replica_gains,
+                replica_mask,
+                primary_tensor,
+                max_compute_extra_per_rank,
+                quota_compute_limit,
+                runtime.compute_instance,
+                runtime.compute_loads,
+                runtime.compute_added_by_rank,
+                runtime.compute_addition_order,
+                runtime.candidate_workspaces[0][2],
+                runtime.quota,
+                runtime.routing,
+                runtime.compute_added,
+            )
+            balance_copies = runtime.compute_added
+            addition_order = runtime.compute_addition_order
+        elif not pure and compute_solver == "capacity-v2":
             if runtime is None:
                 raise ValueError("capacity-v2 requires a resident CUDA runtime")
             _C.current_bundle_gains_into(
@@ -860,6 +1077,7 @@ def replicate_source_top_experts_cuda(
                 replica_mask,
                 runtime.replica_gains,
                 runtime.candidate_workspaces[0][0],
+                runtime.solver_sms,
             )
             _C.select_compute_replicas_v2_into(
                 demand,
@@ -886,6 +1104,22 @@ def replicate_source_top_experts_cuda(
                 primary_tensor,
                 max_compute_extra_per_rank,
             )
+        elif pure:
+            _C.select_pure_compute_replicas_into(
+                demand,
+                replica_mask,
+                primary_tensor,
+                max_compute_extra_per_rank,
+                runtime.compute_instance,
+                runtime.compute_loads,
+                runtime.compute_added_by_rank,
+                runtime.compute_addition_order,
+                runtime.quota,
+                runtime.routing,
+                runtime.compute_added,
+            )
+            balance_copies = runtime.compute_added
+            addition_order = runtime.compute_addition_order
         else:
             _C.select_compute_replicas_into(
                 demand,
@@ -912,16 +1146,13 @@ def replicate_source_top_experts_cuda(
                 torch.argsort(flexible[demand_order].to(torch.int8), stable=True)
             ]
     if not needs_quota:
-        metrics_started = _phase_start(timing)
         metrics = _route_cuda(
             source, topk, count, primary_tensor, replica_mask, num_ranks
         )
-        _record(timing, "quota_allocation_ms", metrics_started)
     elif direct_export_quota:
         quota_started = _phase_start(timing)
         quota = runtime.quota
         _record(timing, "quota_solve_ms", quota_started)
-        allocation_started = _phase_start(timing)
         bundle_ordinals = _bundle_ordinals_cuda(source, topk, count, num_experts)
         metrics = _quota_route_cuda(
             source,
@@ -934,7 +1165,6 @@ def replicate_source_top_experts_cuda(
             num_ranks,
             bundle_ordinals,
         )
-        _record(timing, "quota_allocation_ms", allocation_started)
     elif communication_budget_ratio is None:
         quota_started = _phase_start(timing)
         quota, routing_tensor = _quota_cuda(
@@ -953,7 +1183,6 @@ def replicate_source_top_experts_cuda(
             loads_out=loads_out,
         )
         _record(timing, "quota_solve_ms", quota_started)
-        allocation_started = _phase_start(timing)
         bundle_ordinals = _bundle_ordinals_cuda(source, topk, count, num_experts)
         metrics = _quota_route_cuda(
             source,
@@ -966,7 +1195,6 @@ def replicate_source_top_experts_cuda(
             num_ranks,
             bundle_ordinals,
         )
-        _record(timing, "quota_allocation_ms", allocation_started)
     else:
         if budget_baseline is None:
             metrics_started = _phase_start(timing)
@@ -990,7 +1218,6 @@ def replicate_source_top_experts_cuda(
             workspaces=runtime.candidate_workspaces if runtime is not None else None,
         )
         _record(timing, "quota_solve_ms", quota_started)
-        allocation_started = _phase_start(timing)
         bundle_ordinals = _bundle_ordinals_cuda(source, topk, count, num_experts)
         metrics = _quota_route_cuda(
             source,
@@ -1003,7 +1230,28 @@ def replicate_source_top_experts_cuda(
             num_ranks,
             bundle_ordinals,
         )
-        _record(timing, "quota_allocation_ms", allocation_started)
+
+    # Preserve the hard compute contract if v2 exhausts its replica slots.
+    if (
+        compute_solver == "capacity-v2"
+        and compute_imbalance_limit is not None
+        and not _within_compute_limit(metrics, compute_imbalance_limit)
+    ):
+        return replicate_source_top_experts_cuda(
+            (source, topk, count),
+            primary_tensor,
+            num_ranks=num_ranks,
+            max_extra_per_rank=max_extra_per_rank,
+            max_compute_extra_per_rank=max_compute_extra_per_rank,
+            compute_imbalance_limit=compute_imbalance_limit,
+            communication_budget_ratio=communication_budget_ratio,
+            device=device,
+            timing=timing,
+            materialize_quota=materialize_quota,
+            runtime=runtime,
+            demand_tensor=demand,
+            compute_solver="legacy",
+        )
 
     if communication_budget_ratio is not None and not _within_compute_limit(
         metrics, compute_imbalance_limit
@@ -1092,3 +1340,53 @@ def replicate_source_top_experts_cuda(
     )
     _flush_cuda_timing(timing)
     return placement_result
+
+
+def replicate_rank_group_experts_cuda(
+    tokens: Sequence[RoutedToken] | RoutedArrays,
+    primary: Mapping[int, int] | torch.Tensor,
+    *,
+    num_ranks: int,
+    max_extra_per_rank: int,
+    max_compute_extra_per_rank: int = 0,
+    compute_imbalance_limit: float | None = None,
+    communication_budget_ratio: float | None = None,
+    device: str | torch.device = "cuda",
+    timing: dict[str, float] | None = None,
+    materialize_quota: bool = True,
+    runtime: GraceCudaRuntime | None = None,
+    demand_tensor: torch.Tensor | None = None,
+) -> ReplicaPlacement:
+    """Keep rank-group replication only when its final balanced plan wins."""
+    kwargs = dict(
+        num_ranks=num_ranks,
+        max_extra_per_rank=max_extra_per_rank,
+        max_compute_extra_per_rank=max_compute_extra_per_rank,
+        compute_imbalance_limit=compute_imbalance_limit,
+        communication_budget_ratio=communication_budget_ratio,
+        device=device,
+        timing=timing,
+        materialize_quota=materialize_quota,
+        runtime=runtime,
+        demand_tensor=demand_tensor,
+        pure=True,
+    )
+    topn = replicate_source_top_experts_cuda(tokens, primary, **kwargs)
+    grouped = replicate_source_top_experts_cuda(
+        tokens, primary, rank_group_replication=True, **kwargs
+    )
+    feasible = [
+        result
+        for result in (topn, grouped)
+        if _within_compute_limit(result.metrics, compute_imbalance_limit)
+    ]
+    return min(
+        feasible or [topn],
+        key=lambda result: (
+            result.metrics.remote,
+            result.metrics.max_pair_traffic,
+            result.metrics.max_ingress,
+            result.metrics.max_egress,
+            result.extra_copies,
+        ),
+    )

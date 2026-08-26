@@ -14,6 +14,7 @@ setup(
                 str(root / "csrc" / "compute_v2.cu"),
                 str(root / "csrc" / "demand.cu"),
                 str(root / "csrc" / "placement.cu"),
+                str(root / "csrc" / "pure_compute.cu"),
                 str(root / "csrc" / "quota.cu"),
                 str(root / "csrc" / "traffic.cu"),
                 str(root / "csrc" / "runtime.cu"),

@@ -16,7 +16,7 @@ void select_topn_routing_into(torch::Tensor, torch::Tensor, int64_t,
                               torch::Tensor, torch::Tensor);
 void select_bundle_topn_routing_into(
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
-    torch::Tensor, torch::Tensor, torch::Tensor);
+    torch::Tensor, torch::Tensor, torch::Tensor, int64_t);
 
 namespace {
 
@@ -41,7 +41,7 @@ void fused_source_topn_into(
               primary.is_cuda());
   source_demand_into(source, topk, count, experts, ranks, demand);
   select_bundle_topn_routing_into(source, topk, count, primary,
-                                  max_extra_per_rank, gains, replicas, routing);
+                                  max_extra_per_rank, gains, replicas, routing, 1);
 }
 
 void default_routing_into(torch::Tensor replicas, torch::Tensor primary,
@@ -89,7 +89,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> fused_source_topn(
   auto replicas = torch::empty({experts, ranks}, demand.options().dtype(torch::kBool));
   auto routing = torch::empty({ranks, experts}, primary.options());
   select_bundle_topn_routing_into(source, topk, count, primary,
-                                  max_extra_per_rank, gains, replicas, routing);
+                                  max_extra_per_rank, gains, replicas, routing, 1);
   return {demand, replicas, routing};
 }
 

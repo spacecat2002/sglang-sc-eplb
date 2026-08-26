@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import time
 from pathlib import Path
 from typing import Sequence
 
@@ -25,13 +24,13 @@ def _rows(
     method: str,
     metrics,
     copies: Sequence[int],
-    elapsed: float,
     balance_copies: int = 0,
     phase_ms: dict[str, float] | None = None,
+    show_affinity: bool = False,
 ):
     phase_ms = phase_ms or {}
     average = sum(metrics.compute_load) / len(metrics.compute_load)
-    return [
+    row = [
         str(layer),
         method,
         str(metrics.remote),
@@ -41,16 +40,39 @@ def _rows(
         f"{max(metrics.compute_load) / average if average else 0:.2f}x",
         f"{min(copies)}-{max(copies)}",
         str(balance_copies),
-        f"{phase_ms.get('affinity_histogram_ms', 0.0):.2f}",
-        f"{phase_ms.get('affinity_eigh_ms', 0.0):.2f}",
-        f"{phase_ms.get('affinity_grouping_ms', 0.0):.2f}",
-        f"{phase_ms.get('affinity_hungarian_ms', 0.0):.2f}",
-        f"{phase_ms.get('communication_replication_ms', 0.0):.1f}",
-        f"{phase_ms.get('compute_replication_ms', 0.0):.1f}",
-        f"{phase_ms.get('quota_solve_ms', 0.0):.1f}",
-        f"{phase_ms.get('quota_allocation_ms', 0.0):.1f}",
-        f"{elapsed * 1000:.1f}",
     ]
+    if show_affinity:
+        row.extend(
+            [
+                f"{phase_ms.get('affinity_histogram_ms', 0.0):.2f}",
+                f"{phase_ms.get('affinity_embedding_ms', 0.0):.2f}",
+                f"{phase_ms.get('affinity_partition_ms', 0.0):.2f}",
+                f"{phase_ms.get('affinity_balance_ms', 0.0):.2f}",
+                f"{phase_ms.get('affinity_hungarian_ms', 0.0):.2f}",
+            ]
+        )
+    solver_keys = [
+        "communication_replication_ms",
+        "compute_replication_ms",
+        "quota_solve_ms",
+    ]
+    if show_affinity:
+        solver_keys[:0] = [
+            "affinity_histogram_ms",
+            "affinity_embedding_ms",
+            "affinity_partition_ms",
+            "affinity_balance_ms",
+            "affinity_hungarian_ms",
+        ]
+    row.extend(
+        [
+            f"{phase_ms.get('communication_replication_ms', 0.0):.1f}",
+            f"{phase_ms.get('compute_replication_ms', 0.0):.1f}",
+            f"{phase_ms.get('quota_solve_ms', 0.0):.1f}",
+            f"{sum(phase_ms.get(key, 0.0) for key in solver_keys):.2f}",
+        ]
+    )
+    return row
 
 
 def _plan_entry(placement):
@@ -85,9 +107,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--compute-solver",
-        choices=("legacy", "capacity-v2"),
+        choices=("legacy", "capacity-v2", "unified"),
         default="legacy",
-        help="CUDA compute solver (default: legacy)",
+        help="CUDA compute solver; unified is the exact capacity-v2 entry point (default: legacy)",
     )
     parser.add_argument(
         "--communication-budget-ratio",
@@ -111,13 +133,47 @@ def main() -> None:
         action="store_true",
         help="cluster co-routed experts and map groups to ranks on CUDA",
     )
+    parser.add_argument(
+        "--solver-sms",
+        type=int,
+        default=1,
+        help="maximum CUDA blocks/SMs used by grouping trace scans (default: 1)",
+    )
+    parser.add_argument(
+        "--affinity-primary-min-improvement",
+        type=float,
+        help=(
+            "minimum affinity-primary ingress/egress bottleneck reduction; "
+            "layers below it use sequential placement with twice the replica cap"
+        ),
+    )
+    parser.add_argument(
+        "--rank-group-replication",
+        action="store_true",
+        help="group pure-replication candidates by source/destination rank",
+    )
     args = parser.parse_args()
     if Path(args.input).suffix != ".pt":
         parser.error("--input must be a compact .pt routing trace")
     if args.affinity_placement and not args.cuda:
         parser.error("--affinity-placement requires --cuda")
+    if args.solver_sms < 1:
+        parser.error("--solver-sms must be positive")
+    if args.solver_sms != 1 and not args.affinity_placement:
+        parser.error("--solver-sms only applies to --affinity-placement")
+    if args.affinity_primary_min_improvement is not None and (
+        not args.affinity_placement
+        or not math.isfinite(args.affinity_primary_min_improvement)
+        or not 0 <= args.affinity_primary_min_improvement <= 1
+    ):
+        parser.error(
+            "--affinity-primary-min-improvement requires --affinity-placement "
+            "and must be between 0 and 1"
+        )
     if args.compute_solver != "legacy" and not args.cuda:
-        parser.error("--compute-solver capacity-v2 requires --cuda")
+        parser.error("--compute-solver requires --cuda")
+    if args.rank_group_replication and (not args.cuda or args.affinity_placement):
+        parser.error("--rank-group-replication requires pure CUDA placement")
     if (
         args.max_extra_experts_per_rank is not None
         and args.max_extra_experts_per_rank < 0
@@ -144,28 +200,36 @@ def main() -> None:
         else 2 * top_k
     )
     budget_ratio = args.communication_budget_ratio
-    rows = [
+    header = [
+        "layer",
+        "method",
+        "remote",
+        "max-pair",
+        "max-ingress",
+        "max-egress",
+        "comp",
+        "extra/rank",
+        "compute-copies",
+    ]
+    if args.affinity_placement:
+        header.extend(
+            [
+                "aff-hist-ms",
+                "aff-embed-ms",
+                "aff-partition-ms",
+                "aff-balance-ms",
+                "aff-map-ms",
+            ]
+        )
+    header.extend(
         [
-            "layer",
-            "method",
-            "remote",
-            "max-pair",
-            "max-ingress",
-            "max-egress",
-            "comp",
-            "extra/rank",
-            "compute-copies",
-            "aff-hist-ms",
-            "aff-eigh-ms",
-            "aff-group-ms",
-            "aff-map-ms",
             "comm-repl-ms",
             "compute-repl-ms",
             "quota-solve-ms",
-            "quota-alloc/eval-ms",
-            "total-ms",
+            "solver-ms",
         ]
-    ]
+    )
+    rows = [header]
     plan = {}
     cuda_runtimes = {}
     for layer, (gate, value, compact) in enumerate(layers):
@@ -175,14 +239,14 @@ def main() -> None:
         # rebuilding three identical NumPy views without changing routing.
         tokens = as_routed_arrays(tokens)
         experts = tuple(range(int(value["topk_experts"].max().item()) + 1))
-        primary = _baseline_placement(experts, num_ranks)
+        sequential_primary = _baseline_placement(experts, num_ranks)
+        primary = sequential_primary
         gpu_tokens = (
             torch.as_tensor(tokens.source_rank, device="cuda", dtype=torch.int64),
             torch.as_tensor(tokens.topk_experts, device="cuda", dtype=torch.int64),
             torch.as_tensor(tokens.count, device="cuda", dtype=torch.int64),
         ) if args.cuda else None
 
-        started = time.perf_counter()
         if args.cuda:
             from sglang.srt.eplb.gpu_replication import (
                 evaluate_replicated_placement_cuda,
@@ -195,33 +259,39 @@ def main() -> None:
             baseline = evaluate_replicated_placement(
                 tokens, primary, num_ranks=num_ranks
             )
-        baseline_elapsed = time.perf_counter() - started
         rows.append(
             _rows(
                 layer,
                 "baseline",
                 baseline,
                 [0] * num_ranks,
-                baseline_elapsed,
+                show_affinity=args.affinity_placement,
             )
         )
         phase_ms: dict[str, float] = {}
         runtime = None
         demand_tensor = None
+        use_affinity = args.affinity_placement
         if args.cuda:
             from sglang.srt.eplb.gpu_replication import GraceCudaRuntime
 
             runtime = cuda_runtimes.get(len(experts))
             if runtime is None:
                 runtime = cuda_runtimes.setdefault(
-                    len(experts), GraceCudaRuntime(len(experts), num_ranks)
+                    len(experts),
+                    GraceCudaRuntime(
+                        len(experts), num_ranks, solver_sms=args.solver_sms
+                    ),
                 )
             # UltraEP's solver consumes an already aggregated expert-load view.
             # Build the equivalent source/expert histogram outside planner timing.
             if args.affinity_placement:
-                started = time.perf_counter()
                 primary = runtime.affinity_primary(*gpu_tokens, timing=phase_ms)
                 demand_tensor = runtime.demand
+                from sglang.srt.eplb.gpu_replication import _flush_cuda_timing
+
+                _flush_cuda_timing(phase_ms)
+
                 from sglang.srt.eplb.gpu_replication import _route_cuda
 
                 primary_metrics = _route_cuda(
@@ -238,24 +308,52 @@ def main() -> None:
                         "affinity-primary",
                         primary_metrics,
                         [0] * num_ranks,
-                        time.perf_counter() - started,
                         phase_ms=phase_ms,
+                        show_affinity=args.affinity_placement,
                     )
                 )
+                if args.affinity_primary_min_improvement is not None:
+                    baseline_bottleneck = max(
+                        baseline.max_ingress, baseline.max_egress
+                    )
+                    primary_bottleneck = max(
+                        primary_metrics.max_ingress, primary_metrics.max_egress
+                    )
+                    improvement = (
+                        1 - primary_bottleneck / baseline_bottleneck
+                        if baseline_bottleneck
+                        else 1.0
+                    )
+                    use_affinity = (
+                        improvement >= args.affinity_primary_min_improvement
+                    )
+                    if not use_affinity:
+                        primary = sequential_primary
             else:
                 demand_tensor = runtime.build_demand(*gpu_tokens)
-        if not args.affinity_placement:
-            started = time.perf_counter()
+        planner_max_extra = max_extra
         if args.cuda:
-            optimized = runtime.plan(
+            if use_affinity:
+                planner = runtime.plan_grouped
+            elif args.rank_group_replication:
+                planner = runtime.plan_rank_group
+            else:
+                planner = runtime.plan_pure
+            if args.affinity_primary_min_improvement is not None and not use_affinity:
+                planner_max_extra *= 2
+            optimized = planner(
                 *gpu_tokens,
                 primary,
                 demand=demand_tensor,
-                max_extra_per_rank=max_extra,
+                max_extra_per_rank=planner_max_extra,
                 max_compute_extra_per_rank=args.max_compute_extra_experts_per_rank,
                 compute_imbalance_limit=args.compute_imbalance_limit,
                 communication_budget_ratio=budget_ratio,
-                compute_solver=args.compute_solver,
+                **(
+                    {"compute_solver": args.compute_solver}
+                    if use_affinity
+                    else {}
+                ),
                 timing=phase_ms,
                 materialize_quota=bool(args.output_plan),
             )
@@ -270,44 +368,33 @@ def main() -> None:
                 communication_budget_ratio=budget_ratio,
                 timing=phase_ms,
             )
-        replication_elapsed = time.perf_counter() - started
-        # The first call contains communication-oriented placement.  When
-        # compute balancing is requested, the remainder is the quota/compute
-        # stage; keep it separate from the communication candidate search.
-        quota_elapsed = sum(
-            phase_ms.get(key, 0.0) for key in ("quota_solve_ms", "quota_allocation_ms")
-        )
-        if "compute_replication_ms" not in phase_ms:
-            phase_ms["compute_replication_ms"] = (
-                max(
-                    0.0,
-                    replication_elapsed * 1000.0
-                    - phase_ms.get("communication_replication_ms", 0.0)
-                    - quota_elapsed,
-                )
-                if args.compute_imbalance_limit is not None
-                or args.max_compute_extra_experts_per_rank
-                else 0.0
-            )
         if args.output_plan:
             plan[gate] = _plan_entry(optimized)
         copies = [0] * num_ranks
         for ranks in optimized.replicas_by_expert.values():
             for rank in ranks[1:]:
                 copies[rank] += 1
+        if args.affinity_primary_min_improvement is not None:
+            method_prefix = "adaptive-affinity+" if use_affinity else "adaptive-pure-"
+        else:
+            method_prefix = (
+                "affinity+"
+                if args.affinity_placement
+                else "rank-group-" if args.rank_group_replication else ""
+            )
         rows.append(
             _rows(
                 layer,
                 (
-                    f"{'affinity+' if args.affinity_placement else ''}remote-top{max_extra}+compute-{args.compute_solver}"
+                    f"{method_prefix}remote-top{planner_max_extra}+compute"
                     if args.max_compute_extra_experts_per_rank
-                    else f"{'affinity+' if args.affinity_placement else ''}remote-top{max_extra}"
+                    else f"{method_prefix}remote-top{planner_max_extra}"
                 ),
                 optimized.metrics,
                 copies,
-                time.perf_counter() - started,
                 optimized.balance_copies,
                 phase_ms,
+                show_affinity=args.affinity_placement,
             )
         )
         if (
@@ -332,7 +419,15 @@ def main() -> None:
         f"backend={'cuda' if args.cuda else 'cpu'}  "
         f"remote replica cap/rank={max_extra}  compute limit={compute}  "
         f"compute replica cap/rank={args.max_compute_extra_experts_per_rank}  "
+        f"solver SM cap={args.solver_sms}  "
         f"communication budget={budget_ratio if budget_ratio is not None else 'none'}"
+        + (
+            f"  affinity primary minimum improvement="
+            f"{args.affinity_primary_min_improvement:.2%}  fallback replica cap/rank="
+            f"{2 * max_extra}"
+            if args.affinity_primary_min_improvement is not None
+            else ""
+        )
     )
     print(_table(rows))
     if args.output_plan:

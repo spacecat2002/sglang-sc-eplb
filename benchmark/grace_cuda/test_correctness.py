@@ -46,6 +46,22 @@ def test_kernels() -> None:
     assert torch.bincount(affinity_groups, minlength=2).cpu().tolist() == [2, 2]
     assert sorted(group_to_rank.cpu().tolist()) == [0, 1]
     assert affinity_primary.cpu().tolist() == [0, 1, 0, 1]
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    initial = torch.linalg.qr(
+        torch.randn(
+            (4, 4), generator=generator, device="cuda", dtype=torch.float64
+        ),
+        mode="reduced",
+    ).Q.contiguous()
+    subspace = torch.empty_like(initial)
+    _C.affinity_subspace_into(
+        affinity, affinity_degree, initial, subspace, 2
+    )
+    assert torch.isfinite(subspace).all()
+    assert torch.allclose(
+        torch.linalg.vector_norm(subspace, dim=1),
+        torch.ones(4, device="cuda", dtype=torch.float64),
+    )
     affinity_replicas = torch.nn.functional.one_hot(
         affinity_primary, num_classes=2
     ).bool()
@@ -103,6 +119,7 @@ def test_kernels() -> None:
         affinity_count,
         strict_groups,
         strict_group_source,
+        1,
     )
     strict_primary = torch.empty_like(strict_groups)
     _C.congestion_hungarian_into(
@@ -151,6 +168,23 @@ def test_kernels() -> None:
     )
     assert swap_groups[0].item() == swap_groups[2].item()
     assert swap_groups[1].item() == swap_groups[3].item()
+
+    balance_demand = torch.tensor(
+        [[9, 0], [8, 0], [1, 0], [0, 0]], device="cuda", dtype=torch.int64
+    )
+    balance_groups = torch.tensor([0, 0, 1, 1], device="cuda", dtype=torch.int64)
+    _C.balance_affinity_groups_into(
+        balance_demand,
+        torch.zeros((4, 4), device="cuda", dtype=torch.int64),
+        balance_groups,
+        torch.empty(4, device="cuda", dtype=torch.int64),
+        torch.empty(2, device="cuda", dtype=torch.int64),
+        torch.empty((4, 2), device="cuda", dtype=torch.int64),
+    )
+    balance_loads = torch.zeros(2, device="cuda", dtype=torch.int64)
+    balance_loads.scatter_add_(0, balance_groups, balance_demand.sum(1))
+    assert balance_loads.cpu().tolist() == [9, 9]
+    assert torch.bincount(balance_groups, minlength=2).cpu().tolist() == [2, 2]
 
     move_primary = torch.tensor([0, 0, 1, 1], device="cuda", dtype=torch.int64)
     move_source = torch.tensor([1, 0, 0, 0], device="cuda", dtype=torch.int64)
@@ -227,6 +261,58 @@ def test_kernels() -> None:
     assert torch.equal(fused_all_replicas, replicas)
     assert torch.equal(fused_all_routing, fused_routing)
 
+    # Two independently removable ranks beat copying both experts from one
+    # shared destination, even though the shared experts have higher demand.
+    grouped_source = torch.tensor([0, 0, 0], device="cuda", dtype=torch.int64)
+    grouped_topk = torch.tensor(
+        [[0, 1], [2, 4], [3, 4]], device="cuda", dtype=torch.int64
+    )
+    grouped_count = torch.tensor([8, 7, 7], device="cuda", dtype=torch.int64)
+    grouped_primary = torch.tensor(
+        [1, 1, 2, 3, 0], device="cuda", dtype=torch.int64
+    )
+    grouped_demand = _C.source_demand(
+        grouped_source, grouped_topk, grouped_count, 5, 4
+    )
+    grouped_replicas = torch.empty((5, 4), device="cuda", dtype=torch.bool)
+    grouped_routing = torch.empty((4, 5), device="cuda", dtype=torch.int64)
+    grouped_workspace = 4 * 5 * 6
+    _C.select_rank_group_topn_routing_into(
+        grouped_source,
+        grouped_topk,
+        grouped_count,
+        grouped_demand,
+        grouped_primary,
+        2,
+        torch.empty_like(grouped_demand),
+        torch.empty_like(grouped_demand),
+        torch.empty_like(grouped_demand),
+        torch.empty(grouped_workspace, device="cuda", dtype=torch.int64),
+        torch.empty(grouped_workspace, device="cuda", dtype=torch.int64),
+        grouped_replicas,
+        grouped_routing,
+    )
+    grouped_traffic, _ = _C.traffic(
+        grouped_source,
+        grouped_topk,
+        grouped_count,
+        grouped_primary,
+        grouped_replicas,
+        4,
+    )
+    demand_replicas = _C.select_topn(grouped_demand, grouped_primary, 2)
+    demand_traffic, _ = _C.traffic(
+        grouped_source,
+        grouped_topk,
+        grouped_count,
+        grouped_primary,
+        demand_replicas,
+        4,
+    )
+    assert grouped_replicas[:, 0].cpu().tolist() == [False, False, True, True, True]
+    assert grouped_traffic.sum().item() == 8
+    assert demand_traffic.sum().item() == 14
+
     # Replicating either expert would only split one shared remote bundle;
     # bundle-aware selection correctly spends no replica on it.
     shared_source = torch.tensor([0], device="cuda", dtype=torch.int64)
@@ -247,6 +333,7 @@ def test_kernels() -> None:
         torch.tensor([[False, True], [False, True]], device="cuda"),
         shared_gains,
         shared_covers,
+        1,
     )
     assert shared_gains.cpu().tolist() == [[0, 0], [0, 0]]
     assert shared_covers[0].cpu().tolist() == [[0, 10], [0, 10]]
@@ -637,6 +724,7 @@ def test_kernels() -> None:
         1.0,
     )
     assert blocked_quota.sum(dim=(0, 1)).cpu().tolist() == [16, 9, 13]
+
 
 
 if __name__ == "__main__":
