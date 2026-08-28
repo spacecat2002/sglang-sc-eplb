@@ -271,9 +271,24 @@ __global__ void group_source_shared_kernel(
       const auto bit = 1ULL << group;
       if (!(seen & bit)) {
         seen |= bit;
-        atomicAdd(reinterpret_cast<unsigned long long*>(
-                      local + group * ranks + src),
-                  static_cast<unsigned long long>(weight));
+        // Coalesce identical (group, source) updates within a warp before
+        // touching shared memory. Each token emits a group at most once, so
+        // the per-lane `seen` mask preserves the original Top-K semantics.
+        const int key = static_cast<int>(group * MaxRanks + src);
+        const unsigned full_mask = __activemask();
+        const unsigned peers = __match_any_sync(full_mask, key);
+        const int leader = __ffs(peers) - 1;
+        int64_t aggregate = 0;
+        unsigned remaining = peers;
+        while (remaining) {
+          const int peer = __ffs(remaining) - 1;
+          aggregate += __shfl_sync(full_mask, weight, peer);
+          remaining &= remaining - 1;
+        }
+        if ((threadIdx.x & 31) == leader)
+          atomicAdd(reinterpret_cast<unsigned long long*>(
+                        local + group * ranks + src),
+                    static_cast<unsigned long long>(aggregate));
       }
     }
   }

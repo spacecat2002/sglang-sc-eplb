@@ -1,6 +1,6 @@
 # GRACE CUDA 复制、分组与负载均衡优化：对话总结
 
-更新时间：2026-08-26
+更新时间：2026-08-28
 
 本文总结本次对话到目前为止围绕 GRACE CUDA expert placement、通信副本、
 affinity grouping、计算负载均衡和 CUDA solver 性能优化所做的讨论、实验、
@@ -565,3 +565,404 @@ test_correctness.py
   表示，而不是单纯堆叠 TMA、PTX、CTA 或 tcgen05 技术。
 - 当前最直接的性能问题是受 block 数限制后的 trace histogram 和
   group-source 扫描吞吐；这是下一轮优化的首要目标。
+
+## 18. 远端崩溃后的恢复背景
+
+本轮对话开始时，用户说明远端服务器在此前优化尚未 `git push` 时崩溃，
+因此远端会话中完成的代码没有保留下来。恢复工作的输入包括：
+
+1. 本文档此前的版本。
+2. Codex 附件 `pasted-text.txt`，其中保存了服务器崩溃前的终端输出、实现说明、
+   benchmark 和正确性结果。
+3. 当前本地工作区中的未提交修改。
+
+恢复过程中始终遵守以下原则：
+
+- 不使用 `git reset --hard`、整体 checkout 或其他会覆盖用户改动的操作。
+- 先检查当前工作区，再根据历史文本重新实现缺失代码。
+- 远端日志只能作为历史参考；没有在当前代码和当前环境重新验证的结果不能
+  当作本轮已验证结果。
+- 本地没有 `.codegraph/` 索引，因此按仓库常规方式使用 `rg` 和定点文件读取。
+
+用户在恢复过程中多次询问为什么此前能够修改、后面却出现“没有读写工具”的
+说法。最终要求很明确：不再停留在说明层面，要直接继续修改代码。当前工作区
+确实可读写，后续修改均已在 `/Users/zwh/Workspace/sglang` 中完成。
+
+## 19. 本轮需求演进
+
+本轮对话中的优化请求按时间顺序大致为：
+
+1. 根据崩溃前文本重新恢复优化和代码。
+2. 确认并实现 UltraEP 形式的 sparse quota。
+3. 分析 GRACE 与 UltraEP demand 采集方式差异，以及 GRACE 是否因此更慢。
+4. 实现 demand/gain 增量更新，避免每次完整扫描 trace。
+5. 所有 EP size 尽量使用当前最快路径，而不是只优化 EP32/64。
+6. 去掉 ordinal 全量排序并实现真正 CSR sparse quota。
+7. 优化 aggregate capacity solver 和压缩增量索引。
+8. 所有 EP 均支持 single CTA、multi CTA 和 shared-memory 路径；EP 最大值统一为
+   64，不再保留 128-rank 上限。
+9. 继续执行后续编号 2-7 的优化。
+10. 最终聚焦并要求实现新的优化项 2、3、4、5：
+
+| 编号 | 优化项 |
+|---|---|
+| 2 | 真正 incidence CSR，用于增量 current-gain 更新 |
+| 3 | capacity solver active candidate cache |
+| 4 | CSR quota metadata 压缩为 int32 |
+| 5 | group-source warp-aggregated update |
+
+本节中的编号来自连续对话中的优化列表，不等同于本文早期章节编号。
+
+## 20. 崩溃前日志中记录的历史实现与结果
+
+附件记录显示，远端崩溃前曾实现和验证过以下内容，但这些代码当时没有 push，
+因此需要在当前工作区重新实现或核对：
+
+- UltraEP 风格 sparse quota-prefix/export plan。
+- `materialize_quota=False` 时跳过 dense `EP x E x EP` quota。
+- `fused_source_topn_into` 在一次 trace 扫描中同时产生 demand 和初始
+  communication gain。
+- K=8 专用寄存器缓存，减少第二遍读取 `topk` 和 replica state。
+- `current_bundle_gain_fast_kernel` 的 K=8 特化。
+- sparse 和 dense 的 placement、routing、quota、traffic、compute load 严格
+  A/B 对比。
+
+附件中的历史测试配置为 32K token、E=256、K=8、单 SM。记录的结果为：
+
+| EP | dense quota path | sparse quota path |
+|---:|---:|---:|
+| 32 | 约 7.8 ms | 约 3.7 ms |
+| 64 | 约 13.3 ms | 约 5.0 ms |
+
+附件同时指出，即使 sparse quota 已经显著降低 quota 阶段耗时，完整路径仍受
+`current_bundle_gains_fast_into` 的第二次 trace 扫描限制：
+
+| EP | current gain | quota + capacity |
+|---:|---:|---:|
+| 32 | 约 1.6 ms | 约 0.34 ms |
+| 64 | 约 1.7 ms | 约 0.87 ms |
+
+通信采集本身的历史数据约为 EP32 110 us、EP64 135 us。由此形成的重要结论是：
+
+- sparse quota 已不是唯一瓶颈。
+- 要接近 200 us，需要避免或增量化 current-gain 的完整 trace 重扫。
+- 完整 regrouping 和在线 incremental refresh 必须区分。
+
+这些数字来自崩溃前的远端版本，仅作为性能基线，不代表本轮本地代码已经复现。
+
+## 21. EP 与执行路径统一
+
+用户明确要求不要按 EP<=16、EP32/64 分裂成互斥算法，而是所有 EP 1-64 都应
+支持：
+
+- single CTA。
+- cooperative multi CTA。
+- shared-memory fast path。
+- 相同的算法语义和确定性 tie-breaking。
+
+当前统一约束为：
+
+```text
+1 <= EP <= 64
+```
+
+`kMaxEpSize` 已集中定义为 64。single CTA 是所有 EP 的合法执行模式；
+`solver_sms > 1` 时可使用 cooperative persistent kernel，如果设备不支持
+cooperative launch 或驻留 CTA 不足，则回退 single CTA。shared memory 用于
+loads、added counters、当前 overload expert instance 等紧凑状态，而不是复制
+完整 `E x EP` 大矩阵。
+
+## 22. Demand、gain 与增量更新
+
+### 22.1 GRACE 与 UltraEP 的采集差异
+
+讨论中的核心区别是：
+
+- UltraEP 更倾向直接消费 dispatcher/通信阶段已经存在的计数或布局状态。
+- GRACE 如果从 `(source, topk, count)` 原始 trace 重新统计 demand 和 gain，
+  会额外执行全 trace scan。
+- GRACE 常规非 pure 且没有外部 `demand_tensor` 时已经使用 fused demand+initial
+  gain，一次扫描同时产生两个统计量；真正额外的成本是通信副本确定后再次计算
+  current gain。
+
+因此，GRACE 可能比直接复用 dispatcher counters 的 UltraEP 更慢，但根因不是
+demand 与 initial gain 必然分成两次 kernel，而是 refresh 阶段仍可能重新读取
+完整 Top-K trace。
+
+### 22.2 Runtime 增量接口
+
+当前 runtime 已增加或保留：
+
+```python
+GraceCudaRuntime.refresh_incremental(...)
+GraceCudaRuntime.regroup(...)
+```
+
+目标是明确区分：
+
+- `refresh_incremental`：trace 拓扑未变化，只更新 changed counts/primary/replica
+  相关统计。
+- `regroup`：重新执行完整 affinity grouping 和 placement。
+
+runtime 使用 tensor identity、data pointer、shape 和 PyTorch `_version` 构造 trace
+index signature。`source` 或 `topk` 的底层存储、shape 或版本发生变化时，缓存
+自动失效并重建。
+
+## 23. 本轮最终实现的优化 2-5
+
+### 23.1 真正 incidence CSR
+
+此前增量 current-gain 使用：
+
+```text
+bundle_heads[expert, source] -> bundle_next[entry] -> ...
+```
+
+虽然 heads/next 已压缩为 int32，但链表遍历不连续，访存 locality 较差。本轮新增
+真正的 incidence CSR：
+
+```text
+row = source * experts + expert
+offsets[row] : offsets[row + 1] -> contiguous entry ids
+entry id = token * K + column
+```
+
+构建过程分为：
+
+1. 对每个 `(source, expert)` 统计 entry count。
+2. prefix scan 生成 int32 offsets。
+3. 使用独立 cursor workspace 将 entry id 写入连续数组。
+
+新增 CUDA 绑定：
+
+```text
+build_bundle_incidence_csr_into
+incremental_bundle_gains_csr_fast_into
+```
+
+增量 gain kernel 支持 K=1/2/4/8/16 模板特化和 arbitrary-K fallback。runtime 在
+新扩展可用时只构建 CSR，不再同时支付 linked-list 构建成本；旧 linked-list API
+继续保留，用于旧扩展和兼容测试。
+
+### 23.2 Active candidate cache
+
+aggregate capacity solver 原先在每一轮 move 中重新扫描完整 `E x EP` 候选。
+本轮将当前 overload rank 上 `instance[expert, over] > 0` 的 expert 压缩到 shared
+memory 的 active expert 数组，然后只评分：
+
+```text
+active_experts x target_ranks
+```
+
+这项优化已接入：
+
+- single-CTA aggregate capacity kernel。
+- fused current-gain + single-CTA aggregate kernel。
+- cooperative multi-CTA aggregate capacity kernel。
+
+候选比较、amount/gain 排序、copy cap、capacity 校验和确定性 tie-breaking 保持
+不变。对于 E>256，保留完整矩阵 fallback，避免 shared array 越界。
+
+### 23.3 CSR quota metadata int32
+
+本轮将真正 CSR quota 的索引元数据改为：
+
+| 字段 | dtype | 原因 |
+|---|---|---|
+| `offsets` | int32 | nnz 已显式限制不超过 `INT_MAX` |
+| `targets` | int32 | rank 最大为 63 |
+| `boundaries` | int64 | 累计 token/count 可能超过 int32 |
+
+因此没有把所有 CSR 字段机械地压成 int32。`boundaries` 保留 int64 是为了避免
+长 trace 或大权重下溢出。Python runtime、materializer、traffic consumer 和
+correctness fixture 均同步更新 dtype。
+
+### 23.4 Group-source warp aggregation
+
+group-source shared kernel 原先每个 token/group 都执行一次 shared-memory
+`atomicAdd`。本轮使用 warp 内 key：
+
+```text
+key = group * MaxRanks + source
+```
+
+并通过 `__match_any_sync` 找出相同 key 的 lanes，在 warp 内累加 weight，只有
+leader lane 执行一次 shared atomic。每个 token 内仍使用 `seen` bitmask 对 group
+去重，因此统计语义不变。
+
+固定 K dispatch 继续覆盖 K=1/2/4/8/16，其他 K 使用 generic fallback。
+
+## 24. Ordinal 与 sparse quota 结论
+
+对话要求“去掉 ordinal 全量排序”和“真正 CSR sparse quota”。当前实现的方向是：
+
+- 不再为 quota 生成全局 token-entry 排序。
+- bundle ordinal 使用按 source-rank 的计数过程生成，而不是通用全量 sort。
+- quota export 使用每个 `(source, expert)` row 的 CSR boundaries/targets。
+- `materialize_quota=False` 时，metrics 直接消费 CSR，不需要重建 dense quota。
+
+需要注意，quota routing 为了确定一个 token 的 weight 区间落在哪个 target，仍需
+使用 entry ordinal。优化目标是移除昂贵的全量排序和 dense materialization，
+而不是删除所有 ordinal 语义。
+
+## 25. 截图中的旧扩展错误
+
+用户提供的截图显示远端运行：
+
+```text
+AttributeError: module 'grace_cuda._C' has no attribute
+'select_bundle_topn_routing_index_into'
+```
+
+调用栈位于 `gpu_replication.py` 的 grouped planner，说明 Python 已更新，但加载的
+`grace_cuda._C` 仍是旧 `.so`，没有导出新绑定。
+
+本轮做了两层处理：
+
+1. Python 使用 `hasattr` 检测 indexed、CSR、incremental 和 fused-capacity
+   capability。旧扩展缺少新符号时自动回退已有 full-scan API，不再直接崩溃。
+2. 新 C++ binding 正式导出 incidence CSR 和 incremental CSR API。
+
+兼容 fallback 只用于避免版本错配崩溃。要实际启用本轮 CUDA 优化，远端仍必须
+重新编译扩展，并确认 Python 加载的是新生成的 `.so`。
+
+## 26. 本轮修改文件
+
+本轮最终直接修改：
+
+```text
+benchmark/grace_cuda/csrc/affinity.cu
+benchmark/grace_cuda/csrc/bindings.cpp
+benchmark/grace_cuda/csrc/compute_v2.cu
+benchmark/grace_cuda/csrc/demand.cu
+benchmark/grace_cuda/csrc/quota.cu
+benchmark/grace_cuda/test_correctness.py
+python/sglang/srt/eplb/gpu_replication.py
+```
+
+此前对话中还涉及但本轮没有重新覆盖的文件包括：
+
+```text
+benchmark/grace_cuda/csrc/placement.cu
+benchmark/grace_cuda/csrc/runtime.cu
+benchmark/grace_cuda/csrc/launch.cuh
+benchmark/grace_cuda/csrc/limits.cuh
+benchmark/grace_cuda/csrc/pure_compute.cu
+benchmark/grace_cuda/csrc/traffic.cu
+```
+
+`limits.cuh` 中统一最大 EP 为 64。当前工作区仍是未提交状态，不能把本文当作
+git commit 记录。
+
+## 27. 正确性测试扩展
+
+当前 `test_correctness.py` 已覆盖或计划覆盖：
+
+- K=1/2/4/8/16/10 的 demand/current-gain 等价性。
+- linked-list incremental gain 与 full current-gain 等价性。
+- incidence CSR incremental gain 与 full current-gain 等价性。
+- EP32/EP64 的 group-source single/multi block 等价性。
+- single CTA 与 multi CTA aggregate solver 输出等价性。
+- dense、prefix sparse 和 CSR quota 的 reconstructed quota、traffic、compute
+  等价性。
+- CSR offsets/targets 的 int32 dtype。
+
+本轮本地已通过：
+
+```bash
+git diff --check
+python3 -m py_compile \
+  python/sglang/srt/eplb/gpu_replication.py \
+  benchmark/grace_cuda/test_correctness.py
+```
+
+本机环境没有 `nvcc`，当前 Python 环境也没有 PyTorch，因此本轮不能在本地完成：
+
+- CUDA extension 编译。
+- pybind symbol load 验证。
+- GPU correctness test。
+- single/multi CTA A/B benchmark。
+
+因此，本轮新增 CUDA 代码当前状态是“已实现并通过静态检查，等待远端 CUDA
+编译和运行验证”，不能描述为已经通过 GPU 回归。
+
+## 28. 远端重新构建与验证
+
+远端首先重新构建扩展：
+
+```bash
+cd /home/admin/workspace/sglang/benchmark/grace_cuda
+TORCH_CUDA_ARCH_LIST="10.0a" MAX_JOBS=16 \
+  uv pip install -e . --no-build-isolation
+```
+
+也可在对应远端虚拟环境中使用：
+
+```bash
+pip install -e .
+```
+
+然后确认新符号：
+
+```bash
+python - <<'PY'
+from grace_cuda import _C
+for name in (
+    "select_bundle_topn_routing_index_into",
+    "build_bundle_incidence_csr_into",
+    "incremental_bundle_gains_csr_fast_into",
+    "materialize_fast_csr_quota_into",
+    "csr_quota_traffic",
+):
+    print(name, hasattr(_C, name))
+PY
+```
+
+正确性测试：
+
+```bash
+cd /home/admin/workspace/sglang/benchmark/grace_cuda
+PYTHONPATH=../../python ../../.venv/bin/python test_correctness.py
+```
+
+建议矩阵：
+
+```text
+EP:          1, 2, 4, 8, 16, 32, 64
+K:           1, 2, 4, 8, 10, 16
+solver CTAs: 1, 2, 4, 8
+quota:       dense, prefix sparse, CSR sparse
+refresh:     unchanged source/topk; changed source/topk/count/primary
+```
+
+重点断言：
+
+- replicas、addition order、move plan 和 routing 完全一致。
+- dense 与 CSR traffic/compute metrics 完全一致。
+- quota conservation：每个 `(source, expert)` 的 quota sum 等于 demand。
+- quota target 都拥有对应 replica。
+- single CTA 与 cooperative multi CTA 结果一致。
+- EP64 不发生 shared-memory 越界或 int32 metadata 溢出。
+- 第二次相同 trace refresh 使用 CSR incremental path，而不是 full trace scan。
+
+## 29. 当前结论与后续优先级
+
+截至 2026-08-28，本轮请求的优化 2-5 已在当前工作区实现：incidence CSR、
+active expert candidate cache、CSR quota int32 metadata 和 group-source warp
+aggregation。同时增加了旧 CUDA extension 的 capability fallback，解决截图中的
+AttributeError。
+
+在远端 GPU 回归通过之前，最重要的下一步不是继续扩大重构，而是：
+
+1. 编译并检查所有 pybind symbols。
+2. 跑完整 `test_correctness.py`。
+3. 对 EP1-64、K8、single/multi CTA 做确定性 A/B。
+4. profile 第二次相同 trace refresh，确认 incidence CSR 实际减少了链表随机访存
+   和 full current-gain scan。
+5. profile active expert 数量。如果 overload rank 通常覆盖几乎全部 expert，active
+   cache 收益会有限；如果 active set 明显稀疏，则应保留。
+6. 比较 warp aggregation 前后 group-source atomic throughput，确认
+   `__match_any_sync` 的循环归约成本低于减少的 atomic 冲突。
+
+本轮没有进行 git commit 或 push。远端验证通过后，应先审阅完整 diff，再提交，
+避免再次因服务器状态丢失未保存优化。

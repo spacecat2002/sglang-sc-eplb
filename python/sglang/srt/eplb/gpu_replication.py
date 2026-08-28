@@ -454,13 +454,13 @@ class GraceCudaRuntime:
         )
         sparse_rows = self.num_ranks * self.num_experts
         self.sparse_offsets = torch.empty(
-            (sparse_rows + 1,), device=self.device, dtype=torch.int64
+            (sparse_rows + 1,), device=self.device, dtype=torch.int32
         )
         self.sparse_boundaries = torch.empty(
             (0,), device=self.device, dtype=torch.int64
         )
         self.sparse_targets = torch.empty(
-            (0,), device=self.device, dtype=torch.int64
+            (0,), device=self.device, dtype=torch.int32
         )
         self.sparse_replica_counts = torch.empty(
             (self.num_experts,), device=self.device, dtype=torch.int64
@@ -499,6 +499,17 @@ class GraceCudaRuntime:
         )
         self.bundle_next = torch.empty((0,), device=self.device, dtype=torch.int32)
         self.bundle_marks = torch.empty((0,), device=self.device, dtype=torch.int32)
+        # Contiguous incidence index used by incremental gain refreshes.
+        self.bundle_csr_offsets = torch.empty(
+            (sparse_rows + 1,), device=self.device, dtype=torch.int32
+        )
+        self.bundle_csr_entries = torch.empty(
+            (0,), device=self.device, dtype=torch.int32
+        )
+        self.bundle_csr_counts = torch.empty(
+            (sparse_rows,), device=self.device, dtype=torch.int32
+        )
+        self.bundle_csr_cursors = torch.empty_like(self.bundle_csr_counts)
         self._bundle_epoch = 0
         self._bundle_index_signature = None
         self.ordinal_counters = torch.empty_like(self.replica_gains)
@@ -628,6 +639,20 @@ class GraceCudaRuntime:
             self._bundle_epoch,
         )
 
+    def _ensure_bundle_csr(self, entry_count: int):
+        if entry_count > torch.iinfo(torch.int32).max:
+            raise ValueError("incremental bundle CSR exceeds int32 capacity")
+        if self.bundle_csr_entries.numel() < entry_count:
+            self.bundle_csr_entries = torch.empty(
+                (entry_count,), device=self.device, dtype=torch.int32
+            )
+        return (
+            self.bundle_csr_offsets,
+            self.bundle_csr_entries,
+            self.bundle_csr_counts,
+            self.bundle_csr_cursors,
+        )
+
     def _bundle_index_matches(
         self, source: torch.Tensor, topk: torch.Tensor
     ) -> bool:
@@ -680,7 +705,9 @@ class GraceCudaRuntime:
             self.sparse_boundaries = torch.empty(
                 (capacity,), device=self.device, dtype=torch.int64
             )
-            self.sparse_targets = torch.empty_like(self.sparse_boundaries)
+            self.sparse_targets = torch.empty(
+                (capacity,), device=self.device, dtype=torch.int32
+            )
         return self.sparse_offsets, self.sparse_boundaries, self.sparse_targets
 
     def source_topn(
@@ -1065,6 +1092,21 @@ def replicate_source_top_experts_cuda(
     bundle_index_ready = (
         incremental_gains and runtime._bundle_index_matches(source, topk)
     )
+    indexed_extension = all(
+        hasattr(_C, name)
+        for name in (
+            "select_bundle_topn_routing_index_into",
+            "fused_source_topn_index_into",
+        )
+    )
+    fused_capacity_extension = hasattr(
+        _C, "current_bundle_gains_and_select_compute_replicas_fast_into"
+    )
+    incremental_extension = hasattr(_C, "incremental_bundle_gains_fast_into")
+    csr_extension = hasattr(_C, "build_bundle_incidence_csr_into") and hasattr(
+        _C, "incremental_bundle_gains_csr_fast_into"
+    )
+    bundle_csr_ready = bundle_index_ready and csr_extension
     if demand_tensor is None:
         if runtime is None:
             if not pure:
@@ -1087,8 +1129,8 @@ def replicate_source_top_experts_cuda(
             )
             demand = runtime.demand
         else:
-            if incremental_gains and not bundle_index_ready:
-                _C.fused_source_topn_index_into(
+            if incremental_gains and not bundle_index_ready and csr_extension:
+                _C.fused_source_topn_into(
                     source,
                     topk,
                     count,
@@ -1100,8 +1142,20 @@ def replicate_source_top_experts_cuda(
                     runtime.replica_gains,
                     runtime.replicas,
                     runtime.routing,
-                    bundle_state[0],
-                    bundle_state[1],
+                )
+                runtime._mark_bundle_index(source, topk)
+                csr_state = runtime._ensure_bundle_csr(topk.numel())
+                _C.build_bundle_incidence_csr_into(
+                    source, topk, csr_state[0], csr_state[1], csr_state[2],
+                    csr_state[3], num_experts
+                )
+                bundle_csr_ready = True
+            elif incremental_gains and not bundle_index_ready and indexed_extension:
+                _C.fused_source_topn_index_into(
+                    source, topk, count, primary_tensor, num_experts, num_ranks,
+                    max_extra_per_rank, runtime.demand, runtime.replica_gains,
+                    runtime.replicas, runtime.routing, bundle_state[0],
+                    bundle_state[1]
                 )
                 runtime._mark_bundle_index(source, topk)
             else:
@@ -1144,19 +1198,24 @@ def replicate_source_top_experts_cuda(
                 1,
             )
         elif not pure:
-            if incremental_gains and not bundle_index_ready:
+            if incremental_gains and not bundle_index_ready and csr_extension:
+                _C.select_bundle_topn_routing_into(
+                    source, topk, count, primary_tensor, max_extra_per_rank,
+                    runtime.replica_gains, runtime.replicas, runtime.routing,
+                    runtime.solver_sms
+                )
+                runtime._mark_bundle_index(source, topk)
+                csr_state = runtime._ensure_bundle_csr(topk.numel())
+                _C.build_bundle_incidence_csr_into(
+                    source, topk, csr_state[0], csr_state[1], csr_state[2],
+                    csr_state[3], num_experts
+                )
+                bundle_csr_ready = True
+            elif incremental_gains and not bundle_index_ready and indexed_extension:
                 _C.select_bundle_topn_routing_index_into(
-                    source,
-                    topk,
-                    count,
-                    primary_tensor,
-                    max_extra_per_rank,
-                    runtime.replica_gains,
-                    runtime.replicas,
-                    runtime.routing,
-                    bundle_state[0],
-                    bundle_state[1],
-                    runtime.solver_sms,
+                    source, topk, count, primary_tensor, max_extra_per_rank,
+                    runtime.replica_gains, runtime.replicas, runtime.routing,
+                    bundle_state[0], bundle_state[1], runtime.solver_sms
                 )
                 runtime._mark_bundle_index(source, topk)
             else:
@@ -1284,6 +1343,7 @@ def replicate_source_top_experts_cuda(
                 and not bundle_index_ready
                 and runtime.solver_sms == 1
                 and not sparse_export_quota
+                and fused_capacity_extension
             )
             if fused_single_cta:
                 _C.current_bundle_gains_and_select_compute_replicas_fast_into(
@@ -1305,20 +1365,38 @@ def replicate_source_top_experts_cuda(
                     runtime.routing,
                     runtime.compute_added,
                 )
-            elif incremental_gains:
-                _C.incremental_bundle_gains_fast_into(
-                    source,
-                    topk,
-                    count,
-                    primary_tensor,
-                    replica_mask,
-                    runtime.replica_gains,
-                    bundle_state[0],
-                    bundle_state[1],
-                    bundle_state[2],
-                    bundle_state[3],
-                    runtime.solver_sms,
-                )
+            elif incremental_gains and incremental_extension and (
+                bundle_index_ready or bundle_csr_ready
+            ):
+                if bundle_csr_ready:
+                    csr_state = runtime._ensure_bundle_csr(topk.numel())
+                    _C.incremental_bundle_gains_csr_fast_into(
+                        source,
+                        topk,
+                        count,
+                        primary_tensor,
+                        replica_mask,
+                        runtime.replica_gains,
+                        csr_state[0],
+                        csr_state[1],
+                        bundle_state[2],
+                        bundle_state[3],
+                        runtime.solver_sms,
+                    )
+                else:
+                    _C.incremental_bundle_gains_fast_into(
+                        source,
+                        topk,
+                        count,
+                        primary_tensor,
+                        replica_mask,
+                        runtime.replica_gains,
+                        bundle_state[0],
+                        bundle_state[1],
+                        bundle_state[2],
+                        bundle_state[3],
+                        runtime.solver_sms,
+                    )
             else:
                 _C.current_bundle_gains_fast_into(
                     source,

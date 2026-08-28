@@ -1023,9 +1023,9 @@ __global__ void sparse_quota_traffic_kernel(
   }
 }
 
-__device__ int csr_quota_destination(const int64_t* offsets,
+__device__ int csr_quota_destination(const int32_t* offsets,
                                      const int64_t* boundaries,
-                                     const int64_t* targets,
+                                     const int32_t* targets,
                                      const int64_t* primary, int64_t ordinal,
                                      int64_t row, int64_t expert) {
   for (int64_t position = offsets[row]; position < offsets[row + 1];
@@ -1035,7 +1035,7 @@ __device__ int csr_quota_destination(const int64_t* offsets,
   return primary[expert];
 }
 
-__device__ int64_t csr_quota_next_boundary(const int64_t* offsets,
+__device__ int64_t csr_quota_next_boundary(const int32_t* offsets,
                                            const int64_t* boundaries,
                                            int64_t ordinal, int64_t row) {
   for (int64_t position = offsets[row]; position < offsets[row + 1];
@@ -1047,8 +1047,8 @@ __device__ int64_t csr_quota_next_boundary(const int64_t* offsets,
 
 __global__ void csr_quota_traffic_kernel(
     const int64_t* source, const int64_t* topk, const int64_t* count,
-    const int64_t* offsets, const int64_t* boundaries,
-    const int64_t* targets, const int64_t* primary, const int64_t* ordinals,
+    const int32_t* offsets, const int64_t* boundaries,
+    const int32_t* targets, const int64_t* primary, const int64_t* ordinals,
     int64_t* traffic, int64_t* compute, int64_t tokens, int64_t k,
     int64_t experts, int64_t ranks) {
   const int64_t token =
@@ -1401,9 +1401,9 @@ std::tuple<torch::Tensor, torch::Tensor> csr_quota_traffic(
   TORCH_CHECK(source.scalar_type() == torch::kInt64 &&
               topk.scalar_type() == torch::kInt64 &&
               count.scalar_type() == torch::kInt64 &&
-              offsets.scalar_type() == torch::kInt64 &&
+              offsets.scalar_type() == torch::kInt32 &&
               boundaries.scalar_type() == torch::kInt64 &&
-              targets.scalar_type() == torch::kInt64 &&
+              targets.scalar_type() == torch::kInt32 &&
               primary.scalar_type() == torch::kInt64 &&
               ordinals.scalar_type() == torch::kInt64);
   TORCH_CHECK(source.dim() == 1 && topk.dim() == 2 && count.dim() == 1 &&
@@ -1420,8 +1420,8 @@ std::tuple<torch::Tensor, torch::Tensor> csr_quota_traffic(
   launch(csr_quota_traffic_kernel,
          dim3((source.size(0) + 255) / 256), dim3(256), stream.stream(),
          source.data_ptr<int64_t>(), topk.data_ptr<int64_t>(),
-         count.data_ptr<int64_t>(), offsets.data_ptr<int64_t>(),
-         boundaries.data_ptr<int64_t>(), targets.data_ptr<int64_t>(),
+         count.data_ptr<int64_t>(), offsets.data_ptr<int32_t>(),
+         boundaries.data_ptr<int64_t>(), targets.data_ptr<int32_t>(),
          primary.data_ptr<int64_t>(), ordinals.data_ptr<int64_t>(),
          traffic.data_ptr<int64_t>(), compute.data_ptr<int64_t>(),
          source.size(0), topk.size(1), experts, num_ranks);

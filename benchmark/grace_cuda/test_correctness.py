@@ -658,6 +658,41 @@ def test_kernels() -> None:
         )
         assert torch.equal(selected_incremental, selected_reference)
 
+        csr_offsets = torch.empty(
+            gain_experts * gain_ranks + 1, device="cuda", dtype=torch.int32
+        )
+        csr_entries = torch.empty(
+            gain_topk.numel(), device="cuda", dtype=torch.int32
+        )
+        csr_counts = torch.empty(
+            gain_experts * gain_ranks, device="cuda", dtype=torch.int32
+        )
+        csr_cursors = torch.empty_like(csr_counts)
+        _C.build_bundle_incidence_csr_into(
+            gain_source,
+            gain_topk,
+            csr_offsets,
+            csr_entries,
+            csr_counts,
+            csr_cursors,
+            gain_experts,
+        )
+        csr_incremental = indexed_initial.clone()
+        _C.incremental_bundle_gains_csr_fast_into(
+            gain_source,
+            gain_topk,
+            gain_count,
+            gain_primary,
+            gain_replicas,
+            csr_incremental,
+            csr_offsets,
+            csr_entries,
+            bundle_marks,
+            4,
+            2,
+        )
+        assert torch.equal(csr_incremental, reference)
+
     traffic, compute = _C.traffic(source, topk, count, primary, replicas, 2)
     assert traffic.cpu().tolist() == [[0, 5], [3, 0]]
     assert compute.cpu().tolist() == [7, 13]
@@ -939,12 +974,14 @@ def test_kernels() -> None:
     assert torch.equal(sparse_routing, fast_routing)
 
     csr_offsets = torch.empty(
-        (v2_demand.numel() + 1,), device="cuda", dtype=torch.int64
+        (v2_demand.numel() + 1,), device="cuda", dtype=torch.int32
     )
     csr_boundaries = torch.empty(
         v2_quota.numel(), device="cuda", dtype=torch.int64
     )
-    csr_targets = torch.empty_like(csr_boundaries)
+    csr_targets = torch.empty(
+        csr_boundaries.shape, device="cuda", dtype=torch.int32
+    )
     csr_routing = torch.empty_like(v2_routing)
     _C.materialize_fast_csr_quota_into(
         v2_demand,

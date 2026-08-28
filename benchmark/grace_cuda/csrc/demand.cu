@@ -48,17 +48,20 @@ __global__ void bundle_incidence_fill_kernel(
 
 void build_bundle_incidence_csr_into(
     torch::Tensor source, torch::Tensor topk, torch::Tensor offsets,
-    torch::Tensor entries, torch::Tensor counts, int64_t experts) {
+    torch::Tensor entries, torch::Tensor counts, torch::Tensor cursors,
+    int64_t experts) {
   TORCH_CHECK(source.is_cuda() && topk.is_cuda() && offsets.is_cuda() &&
-              entries.is_cuda() && counts.is_cuda());
+              entries.is_cuda() && counts.is_cuda() && cursors.is_cuda());
   TORCH_CHECK(source.scalar_type() == torch::kInt64 &&
               topk.scalar_type() == torch::kInt64 &&
               offsets.scalar_type() == torch::kInt32 &&
               entries.scalar_type() == torch::kInt32 &&
-              counts.scalar_type() == torch::kInt32);
+              counts.scalar_type() == torch::kInt32 &&
+              cursors.scalar_type() == torch::kInt32);
   TORCH_CHECK(source.dim() == 1 && topk.dim() == 2 &&
               source.size(0) == topk.size(0) && offsets.dim() == 1 &&
-              counts.dim() == 1 && offsets.numel() == counts.numel() + 1 &&
+              counts.dim() == 1 && cursors.sizes() == counts.sizes() &&
+              offsets.numel() == counts.numel() + 1 &&
               entries.numel() >= topk.numel() && topk.numel() <= INT_MAX &&
               experts > 0 && counts.numel() % experts == 0 &&
               counts.numel() / experts <= kMaxEpSize);
@@ -73,12 +76,12 @@ void build_bundle_incidence_csr_into(
   launch(bundle_incidence_prefix_kernel, dim3(1), dim3(1), stream.stream(),
          counts.data_ptr<int32_t>(), offsets.data_ptr<int32_t>(),
          counts.numel());
-  check_cuda(cudaMemsetAsync(counts.data_ptr<int32_t>(), 0,
-                             counts.numel() * sizeof(int32_t), stream.stream()));
+  check_cuda(cudaMemsetAsync(cursors.data_ptr<int32_t>(), 0,
+                             cursors.numel() * sizeof(int32_t), stream.stream()));
   launch(bundle_incidence_fill_kernel,
          dim3((topk.numel() + 255) / 256), dim3(256), stream.stream(),
          source.data_ptr<int64_t>(), topk.data_ptr<int64_t>(),
-         offsets.data_ptr<int32_t>(), counts.data_ptr<int32_t>(),
+         offsets.data_ptr<int32_t>(), cursors.data_ptr<int32_t>(),
          entries.data_ptr<int32_t>(), source.size(0), topk.size(1), experts);
   check_cuda(cudaGetLastError());
 }

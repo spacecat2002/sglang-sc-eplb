@@ -247,6 +247,89 @@ __global__ void incremental_bundle_gain_kernel(
   }
 }
 
+template <int FixedK>
+__global__ void incremental_bundle_gain_csr_kernel(
+    const int64_t* source, const int64_t* topk, const int64_t* count,
+    const int64_t* primary, const bool* replicas, int64_t* gains,
+    const int32_t* offsets, const int32_t* incidence_entries,
+    int32_t* bundle_marks, int32_t epoch, int64_t experts, int64_t tokens,
+    int64_t runtime_k, int64_t ranks) {
+  const int64_t actual_k = FixedK ? FixedK : runtime_k;
+  const int64_t matrix_size = experts * ranks;
+  for (int64_t pair = static_cast<int64_t>(blockIdx.x) * blockDim.x +
+                      threadIdx.x;
+       pair < matrix_size; pair += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    const int64_t expert = pair / ranks;
+    const int64_t src = pair % ranks;
+    if (!replicas[pair] || primary[expert] == src) continue;
+    for (int32_t position = offsets[pair]; position < offsets[pair + 1];
+         ++position) {
+      const int64_t entry = incidence_entries[position];
+      const int64_t token = entry / actual_k;
+      if (token >= tokens || atomicExch(bundle_marks + token, epoch) == epoch)
+        continue;
+      const int64_t token_src = source[token];
+      const auto weight = static_cast<unsigned long long>(count[token]);
+      unsigned long long old_seen_low = 0, old_seen_high = 0;
+      unsigned long long old_duplicate_low = 0, old_duplicate_high = 0;
+      unsigned long long new_seen_low = 0, new_seen_high = 0;
+      unsigned long long new_duplicate_low = 0, new_duplicate_high = 0;
+      int64_t cached_experts[FixedK > 0 ? FixedK : 1];
+      int cached_old[FixedK > 0 ? FixedK : 1];
+      int cached_new[FixedK > 0 ? FixedK : 1];
+#pragma unroll
+      for (int64_t column = 0; column < actual_k; ++column) {
+        const int64_t current_expert = topk[token * actual_k + column];
+        const int old_destination = primary[current_expert];
+        const int new_destination = replicas[current_expert * ranks + token_src]
+                                        ? static_cast<int>(token_src)
+                                        : old_destination;
+        if constexpr (FixedK > 0) {
+          cached_experts[column] = current_expert;
+          cached_old[column] = old_destination;
+          cached_new[column] = new_destination;
+        }
+        const auto old_bit = 1ULL << (old_destination & 63);
+        auto& old_seen = old_destination < 64 ? old_seen_low : old_seen_high;
+        auto& old_duplicate = old_destination < 64 ? old_duplicate_low
+                                                   : old_duplicate_high;
+        if (old_seen & old_bit) old_duplicate |= old_bit;
+        old_seen |= old_bit;
+        const auto new_bit = 1ULL << (new_destination & 63);
+        auto& new_seen = new_destination < 64 ? new_seen_low : new_seen_high;
+        auto& new_duplicate = new_destination < 64 ? new_duplicate_low
+                                                   : new_duplicate_high;
+        if (new_seen & new_bit) new_duplicate |= new_bit;
+        new_seen |= new_bit;
+      }
+#pragma unroll
+      for (int64_t column = 0; column < actual_k; ++column) {
+        const int64_t current_expert = FixedK ? cached_experts[column]
+                                              : topk[token * actual_k + column];
+        const int old_destination = FixedK ? cached_old[column]
+                                           : primary[current_expert];
+        const int new_destination = FixedK
+                                        ? cached_new[column]
+                                        : (replicas[current_expert * ranks + token_src]
+                                               ? static_cast<int>(token_src)
+                                               : old_destination);
+        const auto old_bit = 1ULL << (old_destination & 63);
+        const auto new_bit = 1ULL << (new_destination & 63);
+        const bool old_contributes = old_destination != token_src &&
+            !((old_destination < 64 ? old_duplicate_low : old_duplicate_high) &
+              old_bit);
+        const bool new_contributes = new_destination != token_src &&
+            !((new_destination < 64 ? new_duplicate_low : new_duplicate_high) &
+              new_bit);
+        if (old_contributes != new_contributes)
+          atomicAdd(reinterpret_cast<unsigned long long*>(
+                        gains + current_expert * ranks + token_src),
+                    new_contributes ? weight : 0ULL - weight);
+      }
+    }
+  }
+}
+
 struct CapacityCandidate {
   int source;
   int over;
@@ -326,6 +409,8 @@ __global__ void fused_current_gain_aggregate_kernel(
   __shared__ int64_t shared_loads[kMaxEpSize];
   __shared__ int64_t shared_added_by_rank[kMaxEpSize];
   __shared__ int64_t shared_over_instance[256];
+  __shared__ int active_experts[256];
+  __shared__ int active_count;
 
   for (int64_t index = tid; index < matrix_size; index += blockDim.x)
     gains[index] = 0;
@@ -761,6 +846,14 @@ __global__ void aggregate_capacity_single_kernel(
     if (experts <= 256) {
       for (int64_t expert = tid; expert < experts; expert += blockDim.x)
         shared_over_instance[expert] = instance[expert * ranks + over];
+      if (tid == 0) active_count = 0;
+    }
+    __syncthreads();
+    if (experts <= 256) {
+      for (int64_t expert = tid; expert < experts; expert += blockDim.x) {
+        if (shared_over_instance[expert] > 0)
+          active_experts[atomicAdd(&active_count, 1)] = static_cast<int>(expert);
+      }
     }
     __syncthreads();
 
@@ -768,14 +861,19 @@ __global__ void aggregate_capacity_single_kernel(
     // one synchronized batch preserves the same capacity/slot checks while
     // avoiding one full CTA reduction and barrier per individual move.
     FastCandidate best = {-1, -1, 0, 0, true};
-    for (int64_t index = tid; index < matrix_size; index += blockDim.x) {
-      const int64_t expert = index / ranks;
+    const int64_t active_matrix = experts <= 256
+                                      ? static_cast<int64_t>(active_count) * ranks
+                                      : matrix_size;
+    for (int64_t index = tid; index < active_matrix; index += blockDim.x) {
+      const int64_t expert = experts <= 256 ? active_experts[index / ranks]
+                                           : index / ranks;
       const int target = index % ranks;
+      const int64_t pair_index = expert * ranks + target;
       const int64_t available = experts <= 256
                                     ? shared_over_instance[expert]
                                     : instance[expert * ranks + over];
       const int64_t slack = capacity - shared_loads[target];
-      const bool present = replicas[index] || addition_order[index];
+      const bool present = replicas[pair_index] || addition_order[pair_index];
       if (!available || target == over || slack <= 0 ||
           (!present &&
            shared_added_by_rank[target] >= max_extra_per_rank))
@@ -877,6 +975,8 @@ __global__ void aggregate_capacity_cooperative_kernel(
   __shared__ int64_t shared_loads[kMaxEpSize];
   __shared__ int64_t shared_added_by_rank[kMaxEpSize];
   __shared__ int64_t shared_over_instance[256];
+  __shared__ int active_experts[256];
+  __shared__ int active_count;
   constexpr int kCapacity = 0;
   constexpr int kAdded = 1;
   constexpr int kOver = 2;
@@ -945,17 +1045,30 @@ __global__ void aggregate_capacity_cooperative_kernel(
     for (int64_t expert = tid; expert < experts && expert < 256;
          expert += blockDim.x)
       shared_over_instance[expert] = instance[expert * ranks + over];
+    if (experts <= 256 && tid == 0) active_count = 0;
+    __syncthreads();
+    if (experts <= 256) {
+      for (int64_t expert = tid; expert < experts; expert += blockDim.x) {
+        if (shared_over_instance[expert] > 0)
+          active_experts[atomicAdd(&active_count, 1)] = static_cast<int>(expert);
+      }
+    }
     __syncthreads();
     FastCandidate best = {-1, -1, 0, 0, true};
-    for (int64_t index = global_tid; index < matrix_size;
+    const int64_t active_matrix = experts <= 256
+                                      ? static_cast<int64_t>(active_count) * ranks
+                                      : matrix_size;
+    for (int64_t index = global_tid; index < active_matrix;
          index += global_stride) {
-      const int64_t expert = index / ranks;
+      const int64_t expert = experts <= 256 ? active_experts[index / ranks]
+                                           : index / ranks;
       const int target = index % ranks;
+      const int64_t pair_index = expert * ranks + target;
       const int64_t available = experts <= 256
                                     ? shared_over_instance[expert]
                                     : instance[expert * ranks + over];
       const int64_t slack = state[kCapacity] - shared_loads[target];
-      const bool present = replicas[index] || addition_order[index];
+      const bool present = replicas[pair_index] || addition_order[pair_index];
       if (!available || target == over || slack <= 0 ||
           (!present &&
            shared_added_by_rank[target] >= max_extra_per_rank))
@@ -1154,8 +1267,8 @@ __global__ void materialize_fast_sparse_quota_kernel(
   routing[row] = best_target;
 }
 
-__device__ void add_csr_amount(const int64_t* offsets, int64_t* amounts,
-                               const int64_t* targets, int64_t row,
+__device__ void add_csr_amount(const int32_t* offsets, int64_t* amounts,
+                               const int32_t* targets, int64_t row,
                                int target, int64_t amount) {
   if (!amount) return;
   for (int64_t position = offsets[row]; position < offsets[row + 1];
@@ -1169,8 +1282,8 @@ __device__ void add_csr_amount(const int64_t* offsets, int64_t* amounts,
 
 __global__ void layout_fast_csr_quota_kernel(
     const int64_t* primary, const bool* replicas,
-    const int64_t* addition_order, int64_t* replica_counts, int64_t* offsets,
-    int64_t* amounts, int64_t* targets, int64_t experts, int ranks,
+    const int64_t* addition_order, int64_t* replica_counts, int32_t* offsets,
+    int64_t* amounts, int32_t* targets, int64_t experts, int ranks,
     int64_t capacity) {
   if (blockIdx.x) return;
   const int tid = threadIdx.x;
@@ -1185,10 +1298,10 @@ __global__ void layout_fast_csr_quota_kernel(
   if (tid == 0) {
     int64_t cursor = 0;
     for (int64_t row = 0; row < rows; ++row) {
-      offsets[row] = cursor;
+      offsets[row] = static_cast<int32_t>(cursor);
       cursor += replica_counts[row % experts];
     }
-    offsets[rows] = cursor;
+    offsets[rows] = static_cast<int32_t>(cursor);
   }
   __syncthreads();
   if (offsets[rows] > capacity) return;
@@ -1196,7 +1309,7 @@ __global__ void layout_fast_csr_quota_kernel(
   for (int64_t row = tid; row < rows; row += blockDim.x) {
     const int source = row / experts;
     const int64_t expert = row % experts;
-    int64_t position = offsets[row];
+    int32_t position = offsets[row];
     if (replicas[expert * ranks + source]) targets[position++] = source;
     const int primary_rank = primary[expert];
     if (primary_rank != source) targets[position++] = primary_rank;
@@ -1229,7 +1342,7 @@ __global__ void layout_fast_csr_quota_kernel(
 __global__ void fill_fast_csr_quota_kernel(
     const int64_t* demand, const int64_t* primary, const bool* replicas,
     const int64_t* addition_order, int64_t* move_plan, int64_t* remaining,
-    const int64_t* offsets, int64_t* amounts, const int64_t* targets,
+    const int32_t* offsets, int64_t* amounts, const int32_t* targets,
     int64_t experts, int ranks, int64_t capacity) {
   const int64_t expert =
       static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -1277,7 +1390,7 @@ __global__ void fill_fast_csr_quota_kernel(
 }
 
 __global__ void finalize_fast_csr_quota_kernel(
-    const int64_t* offsets, int64_t* boundaries, const int64_t* targets,
+    const int32_t* offsets, int64_t* boundaries, const int32_t* targets,
     int64_t* routing, int64_t rows, int64_t capacity) {
   const int64_t row =
       static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -1581,6 +1694,58 @@ void incremental_bundle_gains_fast_into(
   check_cuda(cudaGetLastError());
 }
 
+void incremental_bundle_gains_csr_fast_into(
+    torch::Tensor source, torch::Tensor topk, torch::Tensor count,
+    torch::Tensor primary, torch::Tensor replicas, torch::Tensor gains,
+    torch::Tensor offsets, torch::Tensor incidence_entries,
+    torch::Tensor bundle_marks, int64_t epoch, int64_t solver_sms) {
+  TORCH_CHECK(source.is_cuda() && topk.is_cuda() && count.is_cuda() &&
+              primary.is_cuda() && replicas.is_cuda() && gains.is_cuda() &&
+              offsets.is_cuda() && incidence_entries.is_cuda() &&
+              bundle_marks.is_cuda());
+  TORCH_CHECK(source.scalar_type() == torch::kInt64 &&
+              topk.scalar_type() == torch::kInt64 &&
+              count.scalar_type() == torch::kInt64 &&
+              primary.scalar_type() == torch::kInt64 &&
+              replicas.scalar_type() == torch::kBool &&
+              gains.scalar_type() == torch::kInt64 &&
+              offsets.scalar_type() == torch::kInt32 &&
+              incidence_entries.scalar_type() == torch::kInt32 &&
+              bundle_marks.scalar_type() == torch::kInt32);
+  const int64_t experts = primary.numel();
+  const int64_t ranks = gains.size(1);
+  const int64_t rows = experts * ranks;
+  TORCH_CHECK(source.dim() == 1 && topk.dim() == 2 && count.dim() == 1 &&
+              source.size(0) == topk.size(0) && source.size(0) == count.size(0) &&
+              gains.dim() == 2 && gains.size(0) == experts &&
+              replicas.sizes() == gains.sizes() && offsets.numel() == rows + 1 &&
+              incidence_entries.numel() >= topk.numel() &&
+              bundle_marks.numel() >= source.numel() && ranks > 0 &&
+              ranks <= kMaxEpSize && epoch > 0 && epoch <= INT_MAX &&
+              solver_sms > 0 && topk.numel() <= INT_MAX);
+  auto stream = c10::cuda::getCurrentCUDAStream(source.get_device());
+  const dim3 blocks(solver_sms);
+  const dim3 threads(256);
+  const auto launch_args = [&](auto kernel) {
+    launch(kernel, blocks, threads, stream.stream(), source.data_ptr<int64_t>(),
+           topk.data_ptr<int64_t>(), count.data_ptr<int64_t>(),
+           primary.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
+           gains.data_ptr<int64_t>(), offsets.data_ptr<int32_t>(),
+           incidence_entries.data_ptr<int32_t>(), bundle_marks.data_ptr<int32_t>(),
+           static_cast<int32_t>(epoch), experts, source.numel(), topk.size(1),
+           ranks);
+  };
+  switch (topk.size(1)) {
+    case 1: launch_args(incremental_bundle_gain_csr_kernel<1>); break;
+    case 2: launch_args(incremental_bundle_gain_csr_kernel<2>); break;
+    case 4: launch_args(incremental_bundle_gain_csr_kernel<4>); break;
+    case 8: launch_args(incremental_bundle_gain_csr_kernel<8>); break;
+    case 16: launch_args(incremental_bundle_gain_csr_kernel<16>); break;
+    default: launch_args(incremental_bundle_gain_csr_kernel<0>); break;
+  }
+  check_cuda(cudaGetLastError());
+}
+
 void select_compute_replicas_v2_into(
     torch::Tensor demand, torch::Tensor bundle_gain,
     torch::Tensor bundle_cover,
@@ -1788,9 +1953,9 @@ void materialize_fast_csr_quota_into(
               move_plan.scalar_type() == torch::kInt64 &&
               remaining.scalar_type() == torch::kInt64 &&
               replica_counts.scalar_type() == torch::kInt64 &&
-              offsets.scalar_type() == torch::kInt64 &&
+              offsets.scalar_type() == torch::kInt32 &&
               boundaries.scalar_type() == torch::kInt64 &&
-              targets.scalar_type() == torch::kInt64 &&
+              targets.scalar_type() == torch::kInt32 &&
               routing.scalar_type() == torch::kInt64);
   const int64_t experts = demand.size(0);
   const int ranks = demand.size(1);
@@ -1803,26 +1968,27 @@ void materialize_fast_csr_quota_into(
               replica_counts.numel() == experts && offsets.numel() == rows + 1 &&
               boundaries.dim() == 1 && targets.dim() == 1 &&
               targets.numel() == boundaries.numel() &&
-              boundaries.numel() >= rows && routing.dim() == 2 &&
+              boundaries.numel() >= rows && boundaries.numel() <= INT_MAX &&
+              routing.dim() == 2 &&
               routing.size(0) == ranks && routing.size(1) == experts);
   auto stream = c10::cuda::getCurrentCUDAStream(demand.get_device());
   const int64_t capacity = boundaries.numel();
   launch(layout_fast_csr_quota_kernel, dim3(1), dim3(256), stream.stream(),
          primary.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
          addition_order.data_ptr<int64_t>(),
-         replica_counts.data_ptr<int64_t>(), offsets.data_ptr<int64_t>(),
-         boundaries.data_ptr<int64_t>(), targets.data_ptr<int64_t>(), experts,
+         replica_counts.data_ptr<int64_t>(), offsets.data_ptr<int32_t>(),
+         boundaries.data_ptr<int64_t>(), targets.data_ptr<int32_t>(), experts,
          ranks, capacity);
   launch(fill_fast_csr_quota_kernel, dim3((experts + 255) / 256), dim3(256),
          stream.stream(), demand.data_ptr<int64_t>(),
          primary.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
          addition_order.data_ptr<int64_t>(), move_plan.data_ptr<int64_t>(),
-         remaining.data_ptr<int64_t>(), offsets.data_ptr<int64_t>(),
-         boundaries.data_ptr<int64_t>(), targets.data_ptr<int64_t>(), experts,
+         remaining.data_ptr<int64_t>(), offsets.data_ptr<int32_t>(),
+         boundaries.data_ptr<int64_t>(), targets.data_ptr<int32_t>(), experts,
          ranks, capacity);
   launch(finalize_fast_csr_quota_kernel, dim3((rows + 255) / 256), dim3(256),
-         stream.stream(), offsets.data_ptr<int64_t>(),
-         boundaries.data_ptr<int64_t>(), targets.data_ptr<int64_t>(),
+         stream.stream(), offsets.data_ptr<int32_t>(),
+         boundaries.data_ptr<int64_t>(), targets.data_ptr<int32_t>(),
          routing.data_ptr<int64_t>(), rows, capacity);
   check_cuda(cudaGetLastError());
 }

@@ -60,6 +60,9 @@ void fused_source_topn_index_into(
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
     int64_t, int64_t, torch::Tensor, torch::Tensor, torch::Tensor,
     torch::Tensor, torch::Tensor, torch::Tensor);
+void build_bundle_incidence_csr_into(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, int64_t);
 torch::Tensor default_routing(torch::Tensor, torch::Tensor);
 void default_routing_into(torch::Tensor, torch::Tensor, torch::Tensor);
 std::tuple<torch::Tensor, torch::Tensor> traffic(
@@ -127,6 +130,10 @@ void incremental_bundle_gains_fast_into(
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
     int64_t);
+void incremental_bundle_gains_csr_fast_into(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
+    int64_t);
 }  // namespace grace_cuda
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -155,6 +162,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fused_source_topn_into", &grace_cuda::fused_source_topn_into);
   m.def("fused_source_topn_index_into",
         &grace_cuda::fused_source_topn_index_into);
+  m.def("build_bundle_incidence_csr_into",
+        &grace_cuda::build_bundle_incidence_csr_into);
   m.def("default_routing", &grace_cuda::default_routing);
   m.def("default_routing_into", &grace_cuda::default_routing_into);
   m.def("traffic", &grace_cuda::traffic);
@@ -185,4 +194,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         &grace_cuda::current_bundle_gains_and_select_compute_replicas_fast_into);
   m.def("incremental_bundle_gains_fast_into",
         &grace_cuda::incremental_bundle_gains_fast_into);
+  m.def("incremental_bundle_gains_csr_fast_into",
+        &grace_cuda::incremental_bundle_gains_csr_fast_into);
 }
