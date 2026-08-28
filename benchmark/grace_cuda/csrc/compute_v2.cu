@@ -787,6 +787,8 @@ __global__ void aggregate_capacity_single_kernel(
   __shared__ int64_t shared_loads[kMaxEpSize];
   __shared__ int64_t shared_added_by_rank[kMaxEpSize];
   __shared__ int64_t shared_over_instance[256];
+  __shared__ int active_experts[256];
+  __shared__ int active_count;
 
   for (int64_t index = tid; index < matrix_size; index += blockDim.x) {
     instance[index] = 0;
