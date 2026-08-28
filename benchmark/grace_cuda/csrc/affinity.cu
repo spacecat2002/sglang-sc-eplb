@@ -258,38 +258,51 @@ __global__ void group_source_shared_kernel(
     local[index] = 0;
   __syncthreads();
   const int64_t actual_k = FixedK ? FixedK : k;
-  for (int64_t token =
-           static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-       token < tokens;
-       token += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+  const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  const int64_t first_token =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t iterations = tokens ? (tokens - 1) / stride + 1 : 0;
+  // Keep every lane in the warp on the same control-flow path. In
+  // particular, the last partial token batch must still execute all warp
+  // intrinsics; invalid lanes contribute the sentinel key and zero weight.
+  for (int64_t iteration = 0; iteration < iterations; ++iteration) {
+    const int64_t token = first_token + iteration * stride;
+    const bool valid = token < tokens;
     unsigned long long seen = 0;
-    const int64_t src = source[token];
-    const int64_t weight = count[token];
+    const int64_t src = valid ? source[token] : 0;
+    const int64_t weight = valid ? count[token] : 0;
 #pragma unroll
     for (int64_t column = 0; column < actual_k; ++column) {
-      const int64_t group = groups[topk[token * actual_k + column]];
+      const int64_t group =
+          valid ? groups[topk[token * actual_k + column]] : 0;
       const auto bit = 1ULL << group;
-      if (!(seen & bit)) {
-        seen |= bit;
-        // Coalesce identical (group, source) updates within a warp before
-        // touching shared memory. Each token emits a group at most once, so
-        // the per-lane `seen` mask preserves the original Top-K semantics.
-        const int key = static_cast<int>(group * MaxRanks + src);
-        const unsigned full_mask = __activemask();
-        const unsigned peers = __match_any_sync(full_mask, key);
-        const int leader = __ffs(peers) - 1;
-        int64_t aggregate = 0;
-        unsigned remaining = peers;
-        while (remaining) {
-          const int peer = __ffs(remaining) - 1;
-          aggregate += __shfl_sync(full_mask, weight, peer);
-          remaining &= remaining - 1;
-        }
-        if ((threadIdx.x & 31) == leader)
-          atomicAdd(reinterpret_cast<unsigned long long*>(
-                        local + group * ranks + src),
-                    static_cast<unsigned long long>(aggregate));
+      const bool emit = valid && !(seen & bit);
+      if (emit) seen |= bit;
+      // Every lane participates in the warp intrinsics. Non-emitting lanes
+      // use a sentinel key and contribute zero, avoiding divergent sync
+      // behavior while retaining one atomic per real (group, source) key.
+      const int key = emit ? static_cast<int>(group * MaxRanks + src) : -1;
+      constexpr unsigned full_mask = 0xffffffffU;
+      const unsigned peers = __match_any_sync(full_mask, key);
+      const int leader = __ffs(peers) - 1;
+      int64_t aggregate = 0;
+      // Use a fixed 32-step exchange. A peer-list loop would execute a
+      // different number of __shfl calls for different keys in the same warp,
+      // which can deadlock on architectures requiring all lanes in the mask
+      // to reach each intrinsic together. The peer mask already identifies
+      // matching keys, so only the weight needs to be shuffled.
+#pragma unroll
+      for (int peer = 0; peer < 32; ++peer) {
+        const unsigned peer_bit = 1U << peer;
+        const int source_lane = (peers & peer_bit) ? peer : (threadIdx.x & 31);
+        const int64_t peer_weight = __shfl_sync(full_mask, weight, source_lane);
+        if ((threadIdx.x & 31) == leader && (peers & peer_bit))
+          aggregate += peer_weight;
       }
+      if (emit && (threadIdx.x & 31) == leader)
+        atomicAdd(reinterpret_cast<unsigned long long*>(
+                      local + group * ranks + src),
+                  static_cast<unsigned long long>(aggregate));
     }
   }
   __syncthreads();
