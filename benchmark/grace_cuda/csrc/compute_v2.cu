@@ -881,7 +881,8 @@ __global__ void aggregate_capacity_single_kernel(
            shared_added_by_rank[target] >= max_extra_per_rank))
         continue;
       FastCandidate candidate = {
-          expert, target, min(available, slack), bundle_gain[index], !present};
+          expert, target, min(available, slack), bundle_gain[pair_index],
+          !present};
       if (better_fast_candidate(candidate, best)) best = candidate;
     }
     best = warp_best_fast_candidate(best);
@@ -1076,7 +1077,8 @@ __global__ void aggregate_capacity_cooperative_kernel(
            shared_added_by_rank[target] >= max_extra_per_rank))
         continue;
       FastCandidate candidate = {
-          expert, target, min(available, slack), bundle_gain[index], !present};
+          expert, target, min(available, slack), bundle_gain[pair_index],
+          !present};
       if (better_fast_candidate(candidate, best)) best = candidate;
     }
     best = warp_best_fast_candidate(best);

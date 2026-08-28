@@ -125,7 +125,7 @@ void current_bundle_gains_and_select_compute_replicas_fast_into(
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
     torch::Tensor, torch::Tensor, int64_t, double, torch::Tensor, torch::Tensor,
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
-    torch::Tensor, torch::Tensor);
+    torch::Tensor);
 void incremental_bundle_gains_fast_into(
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
