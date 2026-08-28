@@ -3,6 +3,7 @@
 #include <tuple>
 
 #include "launch.cuh"
+#include "limits.cuh"
 
 namespace grace_cuda {
 
@@ -39,7 +40,8 @@ std::tuple<torch::Tensor, torch::Tensor> traffic(
     torch::Tensor primary, torch::Tensor replicas, int64_t num_ranks) {
   TORCH_CHECK(source.is_cuda() && topk.is_cuda() && count.is_cuda() &&
               primary.is_cuda() && replicas.is_cuda());
-  TORCH_CHECK(num_ranks <= 128, "traffic supports at most 128 ranks");
+  TORCH_CHECK(num_ranks > 0 && num_ranks <= kMaxEpSize,
+              "traffic supports 1-64 ranks");
   auto traffic_out = torch::zeros({num_ranks, num_ranks},
                                   source.options().dtype(torch::kInt64));
   auto compute = torch::zeros({num_ranks},

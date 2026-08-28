@@ -5,6 +5,7 @@
 #include <climits>
 
 #include "launch.cuh"
+#include "limits.cuh"
 
 namespace grace_cuda {
 namespace {
@@ -246,7 +247,7 @@ __global__ void group_source_kernel(
   }
 }
 
-template <int MaxRanks>
+template <int MaxRanks, int FixedK = 0>
 __global__ void group_source_shared_kernel(
     const int64_t* source, const int64_t* topk, const int64_t* count,
     const int64_t* groups, int64_t* group_source, int64_t tokens, int64_t k,
@@ -256,6 +257,7 @@ __global__ void group_source_shared_kernel(
   for (int index = threadIdx.x; index < bins; index += blockDim.x)
     local[index] = 0;
   __syncthreads();
+  const int64_t actual_k = FixedK ? FixedK : k;
   for (int64_t token =
            static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        token < tokens;
@@ -263,8 +265,9 @@ __global__ void group_source_shared_kernel(
     unsigned long long seen = 0;
     const int64_t src = source[token];
     const int64_t weight = count[token];
-    for (int64_t column = 0; column < k; ++column) {
-      const int64_t group = groups[topk[token * k + column]];
+#pragma unroll
+    for (int64_t column = 0; column < actual_k; ++column) {
+      const int64_t group = groups[topk[token * actual_k + column]];
       const auto bit = 1ULL << group;
       if (!(seen & bit)) {
         seen |= bit;
@@ -284,23 +287,59 @@ __global__ void group_source_shared_kernel(
   }
 }
 
-
-
+template <int MaxRanks>
+void launch_group_source_shared(
+    const int64_t* source, const int64_t* topk, const int64_t* count,
+    const int64_t* groups, int64_t* group_source, int64_t tokens, int64_t k,
+    int ranks, bool merge_output, int blocks, cudaStream_t stream) {
+  switch (k) {
+    case 1:
+      launch(group_source_shared_kernel<MaxRanks, 1>, dim3(blocks), dim3(256),
+             stream, source, topk, count, groups, group_source, tokens, k,
+             ranks, merge_output);
+      break;
+    case 2:
+      launch(group_source_shared_kernel<MaxRanks, 2>, dim3(blocks), dim3(256),
+             stream, source, topk, count, groups, group_source, tokens, k,
+             ranks, merge_output);
+      break;
+    case 4:
+      launch(group_source_shared_kernel<MaxRanks, 4>, dim3(blocks), dim3(256),
+             stream, source, topk, count, groups, group_source, tokens, k,
+             ranks, merge_output);
+      break;
+    case 8:
+      launch(group_source_shared_kernel<MaxRanks, 8>, dim3(blocks), dim3(256),
+             stream, source, topk, count, groups, group_source, tokens, k,
+             ranks, merge_output);
+      break;
+    case 16:
+      launch(group_source_shared_kernel<MaxRanks, 16>, dim3(blocks), dim3(256),
+             stream, source, topk, count, groups, group_source, tokens, k,
+             ranks, merge_output);
+      break;
+    default:
+      launch(group_source_shared_kernel<MaxRanks, 0>, dim3(blocks), dim3(256),
+             stream, source, topk, count, groups, group_source, tokens, k,
+             ranks, merge_output);
+      break;
+  }
+}
 
 __global__ void map_groups_kernel(const int64_t* group_source,
                                   const int64_t* groups,
                                   int64_t* group_to_rank, int64_t* primary,
                                   int64_t experts, int ranks) {
   if (blockIdx.x) return;
-  __shared__ bool used_group[128];
-  __shared__ bool used_rank[128];
-  __shared__ int64_t egress[128];
-  __shared__ int64_t group_totals[128];
-  __shared__ int64_t group_peaks[128];
-  __shared__ int64_t bottlenecks[128];
-  __shared__ int64_t pairs[128];
-  __shared__ int64_t remotes[128];
-  __shared__ int group_order[128];
+  __shared__ bool used_group[kMaxEpSize];
+  __shared__ bool used_rank[kMaxEpSize];
+  __shared__ int64_t egress[kMaxEpSize];
+  __shared__ int64_t group_totals[kMaxEpSize];
+  __shared__ int64_t group_peaks[kMaxEpSize];
+  __shared__ int64_t bottlenecks[kMaxEpSize];
+  __shared__ int64_t pairs[kMaxEpSize];
+  __shared__ int64_t remotes[kMaxEpSize];
+  __shared__ int group_order[kMaxEpSize];
   __shared__ int selected_rank;
   __shared__ int64_t max_ingress;
   __shared__ int64_t max_pair;
@@ -427,6 +466,8 @@ __global__ void spectral_exact_groups_kernel(
   __shared__ int64_t selected_item;
   __shared__ int overflow_count;
   __shared__ int chosen_group;
+  __shared__ double center_best_dist[256];
+  __shared__ int64_t center_best_index[256];
   for (int64_t expert = threadIdx.x; expert < experts; expert += blockDim.x)
     labels[expert] = 0;
   if (threadIdx.x == 0) overflow[0] = 0;
@@ -444,17 +485,37 @@ __global__ void spectral_exact_groups_kernel(
   }
   __syncthreads();
   for (int center_count = 1; center_count < ranks; ++center_count) {
-    if (threadIdx.x == 0) {
-      int64_t selected = -1;
-      double best = -1.0;
-      for (int64_t expert = 0; expert < experts; ++expert) {
-        if (distances[expert] > best) {
-          best = distances[expert];
-          selected = expert;
+    double best_distance = -1.0;
+    int64_t best_expert = -1;
+    for (int64_t expert = threadIdx.x; expert < experts;
+         expert += blockDim.x) {
+      const double value = distances[expert];
+      if (value > best_distance ||
+          (value == best_distance &&
+           (best_expert < 0 || expert < best_expert))) {
+        best_distance = value;
+        best_expert = expert;
+      }
+    }
+    center_best_dist[threadIdx.x] = best_distance;
+    center_best_index[threadIdx.x] = best_expert;
+    __syncthreads();
+    for (int offset = blockDim.x / 2; offset; offset >>= 1) {
+      if (threadIdx.x < offset) {
+        const double candidate_distance = center_best_dist[threadIdx.x + offset];
+        const int64_t candidate_expert = center_best_index[threadIdx.x + offset];
+        if (candidate_distance > center_best_dist[threadIdx.x] ||
+            (candidate_distance == center_best_dist[threadIdx.x] &&
+             candidate_expert >= 0 &&
+             (center_best_index[threadIdx.x] < 0 ||
+              candidate_expert < center_best_index[threadIdx.x]))) {
+          center_best_dist[threadIdx.x] = candidate_distance;
+          center_best_index[threadIdx.x] = candidate_expert;
         }
       }
-      overflow[center_count] = selected;
+      __syncthreads();
     }
+    if (threadIdx.x == 0) overflow[center_count] = center_best_index[0];
     __syncthreads();
     const int64_t center_expert = overflow[center_count];
     for (int64_t expert = threadIdx.x; expert < experts;
@@ -1402,7 +1463,7 @@ void affinity_primary_into(
               topk.size(0) == source.size(0) && count.size(0) == source.size(0));
   const int64_t experts = demand.size(0);
   const int64_t ranks = demand.size(1);
-  TORCH_CHECK(experts >= ranks && ranks > 0 && ranks <= 128);
+  TORCH_CHECK(experts >= ranks && ranks > 0 && ranks <= 64);
   TORCH_CHECK(demand.is_cuda() && demand.scalar_type() == torch::kInt64 &&
               demand.is_contiguous());
   TORCH_CHECK(affinity.is_cuda() && affinity.scalar_type() == torch::kInt64 &&
@@ -1438,20 +1499,23 @@ void affinity_primary_into(
          degree.data_ptr<int64_t>(), score.data_ptr<int64_t>(),
          groups.data_ptr<int64_t>(), experts, ranks);
   if (ranks <= 16)
-    launch(group_source_shared_kernel<16>, dim3(1), dim3(256), stream.stream(),
-           source.data_ptr<int64_t>(), topk.data_ptr<int64_t>(),
-           count.data_ptr<int64_t>(), groups.data_ptr<int64_t>(),
-           group_source.data_ptr<int64_t>(), tokens, topk.size(1), ranks, false);
+    launch_group_source_shared<16>(
+        source.data_ptr<int64_t>(), topk.data_ptr<int64_t>(),
+        count.data_ptr<int64_t>(), groups.data_ptr<int64_t>(),
+        group_source.data_ptr<int64_t>(), tokens, topk.size(1), ranks, false, 1,
+        stream.stream());
   else if (ranks <= 32)
-    launch(group_source_shared_kernel<32>, dim3(1), dim3(256), stream.stream(),
-           source.data_ptr<int64_t>(), topk.data_ptr<int64_t>(),
-           count.data_ptr<int64_t>(), groups.data_ptr<int64_t>(),
-           group_source.data_ptr<int64_t>(), tokens, topk.size(1), ranks, false);
+    launch_group_source_shared<32>(
+        source.data_ptr<int64_t>(), topk.data_ptr<int64_t>(),
+        count.data_ptr<int64_t>(), groups.data_ptr<int64_t>(),
+        group_source.data_ptr<int64_t>(), tokens, topk.size(1), ranks, false, 1,
+        stream.stream());
   else if (ranks <= 64)
-    launch(group_source_shared_kernel<64>, dim3(1), dim3(256), stream.stream(),
-           source.data_ptr<int64_t>(), topk.data_ptr<int64_t>(),
-           count.data_ptr<int64_t>(), groups.data_ptr<int64_t>(),
-           group_source.data_ptr<int64_t>(), tokens, topk.size(1), ranks, false);
+    launch_group_source_shared<64>(
+        source.data_ptr<int64_t>(), topk.data_ptr<int64_t>(),
+        count.data_ptr<int64_t>(), groups.data_ptr<int64_t>(),
+        group_source.data_ptr<int64_t>(), tokens, topk.size(1), ranks, false, 1,
+        stream.stream());
   else
     launch(group_source_kernel, dim3(1), dim3(256), stream.stream(),
            source.data_ptr<int64_t>(), topk.data_ptr<int64_t>(),
@@ -1548,6 +1612,7 @@ void spectral_groups_into(torch::Tensor embedding, torch::Tensor affinity,
   const int ranks = sizes.numel();
   TORCH_CHECK(embedding.is_cuda() && embedding.scalar_type() == torch::kFloat64 &&
               embedding.is_contiguous() && dimensions > 0 && ranks > 0 &&
+              ranks <= kMaxEpSize &&
               experts % ranks == 0);
   TORCH_CHECK(affinity.is_cuda() && affinity.scalar_type() == torch::kInt64 &&
               affinity.size(0) == experts && affinity.size(1) == experts);
@@ -1589,7 +1654,7 @@ void balance_affinity_groups_into(
   const int64_t experts = demand.size(0);
   const int64_t ranks = demand.size(1);
   TORCH_CHECK(demand.is_cuda() && demand.scalar_type() == torch::kInt64 &&
-              demand.is_contiguous() && ranks > 0);
+              demand.is_contiguous() && ranks > 0 && ranks <= kMaxEpSize);
   TORCH_CHECK(affinity.is_cuda() && affinity.scalar_type() == torch::kInt64 &&
               affinity.is_contiguous() && affinity.size(0) == experts &&
               affinity.size(1) == experts);
@@ -1628,28 +1693,29 @@ void group_source_into(torch::Tensor source, torch::Tensor topk,
   auto stream = c10::cuda::getCurrentCUDAStream(source.get_device());
   const int64_t tokens = source.size(0);
   const int ranks = group_source.size(0);
+  TORCH_CHECK(ranks > 0 && ranks <= kMaxEpSize && group_source.size(1) == ranks);
   if (solver_sms > 1)
     check_cuda(cudaMemsetAsync(group_source.data_ptr<int64_t>(), 0,
                                group_source.numel() * sizeof(int64_t),
                                stream.stream()));
   if (ranks <= 16)
-    launch(group_source_shared_kernel<16>, dim3(solver_sms), dim3(256),
-           stream.stream(), source.data_ptr<int64_t>(), topk.data_ptr<int64_t>(),
-           count.data_ptr<int64_t>(), groups.data_ptr<int64_t>(),
-           group_source.data_ptr<int64_t>(), tokens, topk.size(1), ranks,
-           solver_sms > 1);
+    launch_group_source_shared<16>(
+        source.data_ptr<int64_t>(), topk.data_ptr<int64_t>(),
+        count.data_ptr<int64_t>(), groups.data_ptr<int64_t>(),
+        group_source.data_ptr<int64_t>(), tokens, topk.size(1), ranks,
+        solver_sms > 1, solver_sms, stream.stream());
   else if (ranks <= 32)
-    launch(group_source_shared_kernel<32>, dim3(solver_sms), dim3(256),
-           stream.stream(), source.data_ptr<int64_t>(), topk.data_ptr<int64_t>(),
-           count.data_ptr<int64_t>(), groups.data_ptr<int64_t>(),
-           group_source.data_ptr<int64_t>(), tokens, topk.size(1), ranks,
-           solver_sms > 1);
+    launch_group_source_shared<32>(
+        source.data_ptr<int64_t>(), topk.data_ptr<int64_t>(),
+        count.data_ptr<int64_t>(), groups.data_ptr<int64_t>(),
+        group_source.data_ptr<int64_t>(), tokens, topk.size(1), ranks,
+        solver_sms > 1, solver_sms, stream.stream());
   else if (ranks <= 64)
-    launch(group_source_shared_kernel<64>, dim3(solver_sms), dim3(256),
-           stream.stream(), source.data_ptr<int64_t>(), topk.data_ptr<int64_t>(),
-           count.data_ptr<int64_t>(), groups.data_ptr<int64_t>(),
-           group_source.data_ptr<int64_t>(), tokens, topk.size(1), ranks,
-           solver_sms > 1);
+    launch_group_source_shared<64>(
+        source.data_ptr<int64_t>(), topk.data_ptr<int64_t>(),
+        count.data_ptr<int64_t>(), groups.data_ptr<int64_t>(),
+        group_source.data_ptr<int64_t>(), tokens, topk.size(1), ranks,
+        solver_sms > 1, solver_sms, stream.stream());
   else
     launch(group_source_kernel, dim3(solver_sms), dim3(256), stream.stream(),
            source.data_ptr<int64_t>(), topk.data_ptr<int64_t>(),
@@ -1664,7 +1730,7 @@ void congestion_hungarian_into(
     torch::Tensor values, torch::Tensor cost, torch::Tensor work,
     torch::Tensor assignment, torch::Tensor primary) {
   const int ranks = group_source.size(0);
-  TORCH_CHECK(ranks > 0 && ranks <= 128 && group_source.size(1) == ranks);
+  TORCH_CHECK(ranks > 0 && ranks <= kMaxEpSize && group_source.size(1) == ranks);
   TORCH_CHECK(group_source.is_cuda() && groups.is_cuda() && allowed.is_cuda() &&
               values.is_cuda() && cost.is_cuda() && work.is_cuda() &&
               assignment.is_cuda() && primary.is_cuda());
@@ -1716,7 +1782,7 @@ void refine_congestion_into(
               count.scalar_type() == torch::kInt64 &&
               demand.scalar_type() == torch::kInt64 &&
               primary.scalar_type() == torch::kInt64);
-  TORCH_CHECK(experts >= ranks && ranks > 0 && ranks <= 128 &&
+  TORCH_CHECK(experts >= ranks && ranks > 0 && ranks <= kMaxEpSize &&
               minimum_capacity >= 1 && maximum_capacity >= minimum_capacity &&
               compute_limit >= 1 && rounds >= 0);
   TORCH_CHECK(occurrence_counts.numel() == experts &&

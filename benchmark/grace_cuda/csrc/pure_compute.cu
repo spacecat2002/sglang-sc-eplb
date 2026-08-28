@@ -2,11 +2,12 @@
 #include <torch/extension.h>
 
 #include "launch.cuh"
+#include "limits.cuh"
 
 namespace grace_cuda {
 namespace {
 
-constexpr int kMaxRanks = 128;
+constexpr int kMaxRanks = kMaxEpSize;
 
 template <int MaxRanks = kMaxRanks, int FixedRanks = 0>
 __device__ void waterfill(const int64_t* loads, const bool* replicas,
@@ -491,7 +492,7 @@ void select_pure_compute_replicas_into(
               demand.sizes() == replicas.sizes());
   const int64_t experts = demand.size(0);
   const int64_t ranks = demand.size(1);
-  TORCH_CHECK(ranks > 0 && ranks <= kMaxRanks, "compute replicas support 1-128 ranks");
+  TORCH_CHECK(ranks > 0 && ranks <= kMaxRanks, "compute replicas support 1-64 ranks");
   TORCH_CHECK(primary.numel() == experts && max_extra_per_rank >= 0);
   TORCH_CHECK(instance.is_cuda() && instance.scalar_type() == torch::kInt64 &&
               instance.sizes() == demand.sizes());
@@ -545,7 +546,7 @@ void select_pure_compute_replicas_into(
            plan_quota.data_ptr<int64_t>(), routing.data_ptr<int64_t>(),
            added.data_ptr<int64_t>(), experts, ranks, max_extra_per_rank);
   } else {
-    launch(select_compute_replicas_kernel<128>, dim3(1), dim3(128), stream.stream(),
+    launch(select_compute_replicas_kernel<64>, dim3(1), dim3(128), stream.stream(),
            demand.data_ptr<int64_t>(), primary.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
            instance.data_ptr<int64_t>(), loads.data_ptr<int64_t>(),
            added_by_rank.data_ptr<int64_t>(), addition_order.data_ptr<int64_t>(),

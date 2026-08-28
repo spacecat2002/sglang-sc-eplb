@@ -24,6 +24,7 @@ from .grace_plus_replication import (
 
 
 _PENDING_CUDA_TIMING = "_pending_cuda_timing"
+_MAX_EP_SIZE = 64
 
 
 def _phase_start(timing: dict[str, float] | None):
@@ -197,21 +198,24 @@ def _quota_cuda(
 
 
 def _bundle_ordinals_cuda(
-    source: torch.Tensor, topk: torch.Tensor, count: torch.Tensor, experts: int
+    source: torch.Tensor,
+    topk: torch.Tensor,
+    count: torch.Tensor,
+    experts: int,
+    ranks: int,
+    counters: torch.Tensor | None = None,
+    ordinals: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    keys = (source[:, None] * experts + topk).reshape(-1)
-    weights = count[:, None].expand_as(topk).reshape(-1)
-    sorted_keys, order = torch.sort(keys, stable=True)
-    sorted_weights = weights[order]
-    before = sorted_weights.cumsum(0) - sorted_weights
-    starts = torch.empty_like(sorted_keys, dtype=torch.bool)
-    starts[0] = True
-    starts[1:] = sorted_keys[1:] != sorted_keys[:-1]
-    group_base = torch.cummax(torch.where(starts, before, 0), dim=0).values
-    within = before - group_base
-    ordinals = torch.empty_like(within)
-    ordinals.scatter_(0, order, within)
-    return ordinals.view_as(topk)
+    if counters is None:
+        counters = torch.empty(
+            (experts, ranks), device=source.device, dtype=torch.int64
+        )
+    if ordinals is None:
+        ordinals = torch.empty_like(topk)
+    _C.bundle_ordinals_into(
+        source, topk, count, experts, ranks, counters, ordinals
+    )
+    return ordinals
 
 
 def _quota_route_cuda(
@@ -227,7 +231,7 @@ def _quota_route_cuda(
 ) -> ReplicaMetrics:
     experts = replica_mask.shape[0]
     if ordinals is None:
-        ordinals = _bundle_ordinals_cuda(source, topk, count, experts)
+        ordinals = _bundle_ordinals_cuda(source, topk, count, experts, ranks)
     traffic, compute = _C.quota_traffic(
         source,
         topk,
@@ -237,6 +241,38 @@ def _quota_route_cuda(
         primary,
         addition_order,
         ordinals.view_as(topk),
+        ranks,
+    )
+    traffic = traffic.cpu().numpy()
+    return ReplicaMetrics(
+        remote=int(traffic.sum()),
+        max_pair_traffic=int(traffic.max()),
+        max_ingress=int(traffic.sum(axis=0).max()),
+        max_egress=int(traffic.sum(axis=1).max()),
+        compute_load=tuple(int(x) for x in compute.cpu().tolist()),
+    )
+
+
+def _csr_quota_route_cuda(
+    source: torch.Tensor,
+    topk: torch.Tensor,
+    count: torch.Tensor,
+    offsets: torch.Tensor,
+    boundaries: torch.Tensor,
+    targets: torch.Tensor,
+    primary: torch.Tensor,
+    ranks: int,
+    ordinals: torch.Tensor,
+) -> ReplicaMetrics:
+    traffic, compute = _C.csr_quota_traffic(
+        source,
+        topk,
+        count,
+        offsets,
+        boundaries,
+        targets,
+        primary,
+        ordinals,
         ranks,
     )
     traffic = traffic.cpu().numpy()
@@ -393,6 +429,8 @@ class GraceCudaRuntime:
     ) -> None:
         self.num_experts = int(num_experts)
         self.num_ranks = int(num_ranks)
+        if not 0 < self.num_ranks <= _MAX_EP_SIZE:
+            raise ValueError(f"num_ranks must be in [1, {_MAX_EP_SIZE}]")
         self.solver_sms = int(solver_sms)
         if self.solver_sms < 1:
             raise ValueError("solver_sms must be positive")
@@ -414,11 +452,26 @@ class GraceCudaRuntime:
             device=self.device,
             dtype=torch.int64,
         )
+        sparse_rows = self.num_ranks * self.num_experts
+        self.sparse_offsets = torch.empty(
+            (sparse_rows + 1,), device=self.device, dtype=torch.int64
+        )
+        self.sparse_boundaries = torch.empty(
+            (0,), device=self.device, dtype=torch.int64
+        )
+        self.sparse_targets = torch.empty(
+            (0,), device=self.device, dtype=torch.int64
+        )
+        self.sparse_replica_counts = torch.empty(
+            (self.num_experts,), device=self.device, dtype=torch.int64
+        )
+        self.sparse_remaining = torch.empty_like(self.demand)
         self.routing = torch.empty(
             (self.num_ranks, self.num_experts),
             device=self.device,
             dtype=torch.int64,
         )
+        self.sparse_routing = torch.empty_like(self.routing)
         self.instance = torch.empty(
             (self.num_experts, self.num_ranks),
             device=self.device,
@@ -440,6 +493,18 @@ class GraceCudaRuntime:
             (self.num_experts, self.num_ranks), device=self.device, dtype=torch.bool
         )
         self.replica_gains = torch.empty_like(self.replicas, dtype=torch.int64)
+        # Heads/next form an inverted index from (expert, source) to Top-K entries.
+        self.bundle_heads = torch.empty_like(
+            self.replica_gains, dtype=torch.int32
+        )
+        self.bundle_next = torch.empty((0,), device=self.device, dtype=torch.int32)
+        self.bundle_marks = torch.empty((0,), device=self.device, dtype=torch.int32)
+        self._bundle_epoch = 0
+        self._bundle_index_signature = None
+        self.ordinal_counters = torch.empty_like(self.replica_gains)
+        self.bundle_ordinals = torch.empty(
+            (0,), device=self.device, dtype=torch.int64
+        )
         rank_group_workspace = (
             self.num_ranks * (self.num_ranks + 1) * (self.num_experts + 1)
         )
@@ -454,6 +519,11 @@ class GraceCudaRuntime:
         self.compute_added_by_rank = torch.empty_like(self.compute_loads)
         self.compute_addition_order = torch.empty_like(self.compute_instance)
         self.compute_added = torch.empty((1,), device=self.device, dtype=torch.int64)
+        self.compute_candidate_workspace = torch.empty(
+            (self.solver_sms * 8 * 5 + 4,),
+            device=self.device,
+            dtype=torch.int64,
+        )
         self.affinity = torch.empty(
             (self.num_experts, self.num_experts),
             device=self.device,
@@ -533,6 +603,85 @@ class GraceCudaRuntime:
             device=self.device,
             dtype=torch.int64,
         )
+
+    def _ensure_bundle_index(
+        self, token_count: int, entry_count: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        if entry_count > torch.iinfo(torch.int32).max:
+            raise ValueError("incremental bundle index exceeds int32 capacity")
+        if self.bundle_next.numel() < entry_count:
+            self.bundle_next = torch.empty(
+                (entry_count,), device=self.device, dtype=torch.int32
+            )
+        if self.bundle_marks.numel() < token_count:
+            self.bundle_marks = torch.zeros(
+                (token_count,), device=self.device, dtype=torch.int32
+            )
+        self._bundle_epoch += 1
+        if self._bundle_epoch >= torch.iinfo(torch.int32).max:
+            self.bundle_marks.zero_()
+            self._bundle_epoch = 1
+        return (
+            self.bundle_heads,
+            self.bundle_next,
+            self.bundle_marks,
+            self._bundle_epoch,
+        )
+
+    def _bundle_index_matches(
+        self, source: torch.Tensor, topk: torch.Tensor
+    ) -> bool:
+        signature = (
+            id(source),
+            id(topk),
+            source.data_ptr(),
+            topk.data_ptr(),
+            source.numel(),
+            topk.numel(),
+            tuple(source.shape),
+            tuple(topk.shape),
+            getattr(source, "_version", 0),
+            getattr(topk, "_version", 0),
+        )
+        return self._bundle_index_signature == signature
+
+    def _mark_bundle_index(self, source: torch.Tensor, topk: torch.Tensor) -> None:
+        self._bundle_index_signature = (
+            id(source),
+            id(topk),
+            source.data_ptr(),
+            topk.data_ptr(),
+            source.numel(),
+            topk.numel(),
+            tuple(source.shape),
+            tuple(topk.shape),
+            getattr(source, "_version", 0),
+            getattr(topk, "_version", 0),
+        )
+
+    def _ensure_bundle_ordinals(
+        self, topk: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.bundle_ordinals.numel() < topk.numel():
+            self.bundle_ordinals = torch.empty_like(topk)
+        ordinals = self.bundle_ordinals.view(-1)[: topk.numel()].view_as(topk)
+        return self.ordinal_counters, ordinals
+
+    def _ensure_sparse_quota(
+        self, max_communication_extra: int, max_compute_extra: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        max_replica_edges = min(
+            self.num_experts * self.num_ranks,
+            self.num_experts
+            + self.num_ranks * (max_communication_extra + max_compute_extra),
+        )
+        capacity = self.num_ranks * max_replica_edges
+        if self.sparse_boundaries.numel() < capacity:
+            self.sparse_boundaries = torch.empty(
+                (capacity,), device=self.device, dtype=torch.int64
+            )
+            self.sparse_targets = torch.empty_like(self.sparse_boundaries)
+        return self.sparse_offsets, self.sparse_boundaries, self.sparse_targets
 
     def source_topn(
         self,
@@ -685,7 +834,7 @@ class GraceCudaRuntime:
         demand: torch.Tensor | None = None,
         **kwargs,
     ) -> ReplicaPlacement:
-        """Run the exact capacity-v2 solver through the unified entry point."""
+        """Run the aggregate capacity-v2 solver through the unified entry point."""
         return replicate_source_top_experts_cuda(
             (source, topk, count),
             primary,
@@ -758,6 +907,41 @@ class GraceCudaRuntime:
             **kwargs,
         )
 
+    def refresh_incremental(
+        self,
+        source: torch.Tensor,
+        topk: torch.Tensor,
+        count: torch.Tensor,
+        primary: Mapping[int, int] | torch.Tensor,
+        **kwargs,
+    ) -> ReplicaPlacement:
+        """Refresh a fixed placement while reusing the trace incidence index.
+
+        This is the online path: it does not rebuild affinity groups. The
+        linked-list index is reused when ``source`` and ``topk`` are unchanged;
+        changed counts or primary ranks only update the aggregate statistics.
+        """
+        kwargs.setdefault("compute_solver", "capacity-v2")
+        return replicate_source_top_experts_cuda(
+            (source, topk, count),
+            primary,
+            num_ranks=self.num_ranks,
+            device=self.device,
+            runtime=self,
+            **kwargs,
+        )
+
+    def regroup(
+        self,
+        source: torch.Tensor,
+        topk: torch.Tensor,
+        count: torch.Tensor,
+        **kwargs,
+    ) -> ReplicaPlacement:
+        """Rebuild affinity placement before running the normal grouped plan."""
+        primary = self.affinity_primary(source, topk, count)
+        return self.plan_grouped(source, topk, count, primary, **kwargs)
+
     plan = plan_grouped
 
 
@@ -771,6 +955,8 @@ def evaluate_replicated_placement_cuda(
 ) -> ReplicaMetrics:
     """Evaluate a placement with CUDA histogram and traffic operations."""
 
+    if not 0 < num_ranks <= _MAX_EP_SIZE:
+        raise ValueError(f"num_ranks must be in [1, {_MAX_EP_SIZE}]")
     device = torch.device(device)
     if device.type != "cuda":
         raise ValueError("CUDA backend requires a CUDA device")
@@ -815,6 +1001,8 @@ def replicate_source_top_experts_cuda(
 
     if max_extra_per_rank < 0:
         raise ValueError("max_extra_per_rank must be non-negative")
+    if not 0 < num_ranks <= _MAX_EP_SIZE:
+        raise ValueError(f"num_ranks must be in [1, {_MAX_EP_SIZE}]")
     if max_compute_extra_per_rank < 0:
         raise ValueError("max_compute_extra_per_rank must be non-negative")
     if not pure and compute_solver not in {None, "legacy", "capacity-v2", "unified"}:
@@ -863,6 +1051,20 @@ def replicate_source_top_experts_cuda(
             [primary[e] for e in range(num_experts)], dtype=np.int64
         )
         primary_tensor = torch.as_tensor(primary_np, device=device)
+    fast_capacity = (
+        runtime is not None
+        and not pure
+        and compute_solver == "capacity-v2"
+    )
+    incremental_gains = fast_capacity and max_compute_extra_per_rank > 0
+    bundle_state = (
+        runtime._ensure_bundle_index(source.numel(), topk.numel())
+        if incremental_gains
+        else None
+    )
+    bundle_index_ready = (
+        incremental_gains and runtime._bundle_index_matches(source, topk)
+    )
     if demand_tensor is None:
         if runtime is None:
             if not pure:
@@ -885,19 +1087,37 @@ def replicate_source_top_experts_cuda(
             )
             demand = runtime.demand
         else:
-            _C.fused_source_topn_into(
-                source,
-                topk,
-                count,
-                primary_tensor,
-                num_experts,
-                num_ranks,
-                max_extra_per_rank,
-                runtime.demand,
-                runtime.replica_gains,
-                runtime.replicas,
-                runtime.routing,
-            )
+            if incremental_gains and not bundle_index_ready:
+                _C.fused_source_topn_index_into(
+                    source,
+                    topk,
+                    count,
+                    primary_tensor,
+                    num_experts,
+                    num_ranks,
+                    max_extra_per_rank,
+                    runtime.demand,
+                    runtime.replica_gains,
+                    runtime.replicas,
+                    runtime.routing,
+                    bundle_state[0],
+                    bundle_state[1],
+                )
+                runtime._mark_bundle_index(source, topk)
+            else:
+                _C.fused_source_topn_into(
+                    source,
+                    topk,
+                    count,
+                    primary_tensor,
+                    num_experts,
+                    num_ranks,
+                    max_extra_per_rank,
+                    runtime.demand,
+                    runtime.replica_gains,
+                    runtime.replicas,
+                    runtime.routing,
+                )
             demand = runtime.demand
             replica_mask, routing_tensor = runtime.replicas, runtime.routing
     else:
@@ -924,17 +1144,33 @@ def replicate_source_top_experts_cuda(
                 1,
             )
         elif not pure:
-            _C.select_bundle_topn_routing_into(
-                source,
-                topk,
-                count,
-                primary_tensor,
-                max_extra_per_rank,
-                runtime.replica_gains,
-                runtime.replicas,
-                runtime.routing,
-                runtime.solver_sms,
-            )
+            if incremental_gains and not bundle_index_ready:
+                _C.select_bundle_topn_routing_index_into(
+                    source,
+                    topk,
+                    count,
+                    primary_tensor,
+                    max_extra_per_rank,
+                    runtime.replica_gains,
+                    runtime.replicas,
+                    runtime.routing,
+                    bundle_state[0],
+                    bundle_state[1],
+                    runtime.solver_sms,
+                )
+                runtime._mark_bundle_index(source, topk)
+            else:
+                _C.select_bundle_topn_routing_into(
+                    source,
+                    topk,
+                    count,
+                    primary_tensor,
+                    max_extra_per_rank,
+                    runtime.replica_gains,
+                    runtime.replicas,
+                    runtime.routing,
+                    runtime.solver_sms,
+                )
             replica_mask, routing_tensor = runtime.replicas, runtime.routing
     if pure and rank_group_replication:
         workspace_size = num_ranks * (num_ranks + 1) * (num_experts + 1)
@@ -993,12 +1229,6 @@ def replicate_source_top_experts_cuda(
         if compute_imbalance_limit is not None
         else -1.0
     )
-    fast_capacity = (
-        runtime is not None
-        and num_ranks > 16
-        and not pure
-        and compute_solver == "capacity-v2"
-    )
     if runtime is None:
         addition_order = torch.zeros_like(demand)
     else:
@@ -1018,6 +1248,16 @@ def replicate_source_top_experts_cuda(
         runtime is not None
         and max_compute_extra_per_rank > 0
         and communication_budget_ratio in (None, 1.0)
+    )
+    sparse_export_quota = (
+        direct_export_quota and not materialize_quota and fast_capacity
+    )
+    sparse_state = (
+        runtime._ensure_sparse_quota(
+            max_extra_per_rank, max_compute_extra_per_rank
+        )
+        if sparse_export_quota
+        else None
     )
     if needs_quota and not direct_export_quota:
         expert_demand = demand.sum(dim=1)
@@ -1039,31 +1279,92 @@ def replicate_source_top_experts_cuda(
             _record(timing, "communication_replication_ms", metrics_started)
         compute_started = _phase_start(timing)
         if fast_capacity:
-            _C.current_bundle_gains_fast_into(
-                source,
-                topk,
-                count,
-                primary_tensor,
-                replica_mask,
-                runtime.replica_gains,
-                runtime.solver_sms,
+            fused_single_cta = (
+                incremental_gains
+                and not bundle_index_ready
+                and runtime.solver_sms == 1
+                and not sparse_export_quota
             )
-            _C.select_compute_replicas_fast_into(
-                demand,
-                runtime.replica_gains,
-                replica_mask,
-                primary_tensor,
-                max_compute_extra_per_rank,
-                quota_compute_limit,
-                runtime.compute_instance,
-                runtime.compute_loads,
-                runtime.compute_added_by_rank,
-                runtime.compute_addition_order,
-                runtime.candidate_workspaces[0][2],
-                runtime.quota,
-                runtime.routing,
-                runtime.compute_added,
-            )
+            if fused_single_cta:
+                _C.current_bundle_gains_and_select_compute_replicas_fast_into(
+                    source,
+                    topk,
+                    count,
+                    primary_tensor,
+                    replica_mask,
+                    runtime.replica_gains,
+                    demand,
+                    max_compute_extra_per_rank,
+                    quota_compute_limit,
+                    runtime.compute_instance,
+                    runtime.compute_loads,
+                    runtime.compute_added_by_rank,
+                    runtime.compute_addition_order,
+                    runtime.candidate_workspaces[0][2],
+                    runtime.quota,
+                    runtime.routing,
+                    runtime.compute_added,
+                )
+            elif incremental_gains:
+                _C.incremental_bundle_gains_fast_into(
+                    source,
+                    topk,
+                    count,
+                    primary_tensor,
+                    replica_mask,
+                    runtime.replica_gains,
+                    bundle_state[0],
+                    bundle_state[1],
+                    bundle_state[2],
+                    bundle_state[3],
+                    runtime.solver_sms,
+                )
+            else:
+                _C.current_bundle_gains_fast_into(
+                    source,
+                    topk,
+                    count,
+                    primary_tensor,
+                    replica_mask,
+                    runtime.replica_gains,
+                    runtime.solver_sms,
+                )
+            if sparse_export_quota:
+                _C.select_compute_replicas_fast_sparse_into(
+                    demand,
+                    runtime.replica_gains,
+                    replica_mask,
+                    primary_tensor,
+                    max_compute_extra_per_rank,
+                    quota_compute_limit,
+                    runtime.compute_instance,
+                    runtime.compute_loads,
+                    runtime.compute_added_by_rank,
+                    runtime.compute_addition_order,
+                    runtime.candidate_workspaces[0][2],
+                    runtime.compute_added,
+                    runtime.compute_candidate_workspace,
+                    runtime.solver_sms,
+                )
+            elif not fused_single_cta:
+                _C.select_compute_replicas_fast_into(
+                    demand,
+                    runtime.replica_gains,
+                    replica_mask,
+                    primary_tensor,
+                    max_compute_extra_per_rank,
+                    quota_compute_limit,
+                    runtime.compute_instance,
+                    runtime.compute_loads,
+                    runtime.compute_added_by_rank,
+                    runtime.compute_addition_order,
+                    runtime.candidate_workspaces[0][2],
+                    runtime.quota,
+                    runtime.routing,
+                    runtime.compute_added,
+                    runtime.compute_candidate_workspace,
+                    runtime.solver_sms,
+                )
             balance_copies = runtime.compute_added
             addition_order = runtime.compute_addition_order
         elif not pure and compute_solver == "capacity-v2":
@@ -1151,20 +1452,58 @@ def replicate_source_top_experts_cuda(
         )
     elif direct_export_quota:
         quota_started = _phase_start(timing)
-        quota = runtime.quota
+        if sparse_export_quota:
+            _C.materialize_fast_csr_quota_into(
+                demand,
+                primary_tensor,
+                replica_mask,
+                addition_order,
+                runtime.candidate_workspaces[0][2],
+                runtime.sparse_remaining,
+                runtime.sparse_replica_counts,
+                sparse_state[0],
+                sparse_state[1],
+                sparse_state[2],
+                runtime.sparse_routing,
+            )
+            routing_tensor = runtime.sparse_routing
+        else:
+            quota = runtime.quota
         _record(timing, "quota_solve_ms", quota_started)
-        bundle_ordinals = _bundle_ordinals_cuda(source, topk, count, num_experts)
-        metrics = _quota_route_cuda(
+        ordinal_state = runtime._ensure_bundle_ordinals(topk)
+        bundle_ordinals = _bundle_ordinals_cuda(
             source,
             topk,
             count,
-            quota,
-            replica_mask,
-            primary_tensor,
-            addition_order,
+            num_experts,
             num_ranks,
-            bundle_ordinals,
+            ordinal_state[0],
+            ordinal_state[1],
         )
+        if sparse_export_quota:
+            metrics = _csr_quota_route_cuda(
+                source,
+                topk,
+                count,
+                sparse_state[0],
+                sparse_state[1],
+                sparse_state[2],
+                primary_tensor,
+                num_ranks,
+                bundle_ordinals,
+            )
+        else:
+            metrics = _quota_route_cuda(
+                source,
+                topk,
+                count,
+                quota,
+                replica_mask,
+                primary_tensor,
+                addition_order,
+                num_ranks,
+                bundle_ordinals,
+            )
     elif communication_budget_ratio is None:
         quota_started = _phase_start(timing)
         quota, routing_tensor = _quota_cuda(
@@ -1183,7 +1522,17 @@ def replicate_source_top_experts_cuda(
             loads_out=loads_out,
         )
         _record(timing, "quota_solve_ms", quota_started)
-        bundle_ordinals = _bundle_ordinals_cuda(source, topk, count, num_experts)
+        ordinal_state = (
+            runtime._ensure_bundle_ordinals(topk) if runtime is not None else None
+        )
+        bundle_ordinals = _bundle_ordinals_cuda(
+            source,
+            topk,
+            count,
+            num_experts,
+            num_ranks,
+            *(ordinal_state or (None, None)),
+        )
         metrics = _quota_route_cuda(
             source,
             topk,
@@ -1218,7 +1567,17 @@ def replicate_source_top_experts_cuda(
             workspaces=runtime.candidate_workspaces if runtime is not None else None,
         )
         _record(timing, "quota_solve_ms", quota_started)
-        bundle_ordinals = _bundle_ordinals_cuda(source, topk, count, num_experts)
+        ordinal_state = (
+            runtime._ensure_bundle_ordinals(topk) if runtime is not None else None
+        )
+        bundle_ordinals = _bundle_ordinals_cuda(
+            source,
+            topk,
+            count,
+            num_experts,
+            num_ranks,
+            *(ordinal_state or (None, None)),
+        )
         metrics = _quota_route_cuda(
             source,
             topk,

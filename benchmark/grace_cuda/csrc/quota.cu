@@ -6,11 +6,62 @@
 #include <tuple>
 
 #include "launch.cuh"
+#include "limits.cuh"
 
 namespace grace_cuda {
 namespace {
 
-constexpr int kMaxRanks = 128;
+constexpr int kMaxRanks = kMaxEpSize;
+constexpr int kOrdinalWarpsPerBlock = 8;
+
+__global__ void bundle_ordinals_kernel(
+    const int64_t* source, const int64_t* topk, const int64_t* count,
+    int64_t* counters, int64_t* ordinals, int64_t tokens, int64_t k,
+    int64_t experts, int64_t ranks) {
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int source_rank = blockIdx.x * kOrdinalWarpsPerBlock + warp;
+  if (source_rank >= ranks) return;
+
+  for (int64_t expert = lane; expert < experts; expert += 32)
+    counters[expert * ranks + source_rank] = 0;
+  __syncwarp();
+
+  constexpr unsigned kFullMask = 0xffffffff;
+  for (int64_t token = 0; token < tokens; ++token) {
+    if (source[token] != source_rank) continue;
+    const int64_t weight = count[token];
+    for (int64_t column_base = 0; column_base < k; column_base += 32) {
+      const int64_t column = column_base + lane;
+      const bool active = column < k;
+      const int64_t entry = token * k + column;
+      const int64_t expert = active ? topk[entry] : -1;
+      unsigned remaining = __ballot_sync(kFullMask, active);
+      while (remaining) {
+        const int leader = __ffs(remaining) - 1;
+        const int64_t leader_expert =
+            __shfl_sync(kFullMask, expert, leader);
+        const unsigned group =
+            __ballot_sync(kFullMask, active && expert == leader_expert);
+        int64_t base = 0;
+        if (lane == leader) {
+          const int64_t counter_index = leader_expert * ranks + source_rank;
+          base = counters[counter_index];
+          counters[counter_index] =
+              base + static_cast<int64_t>(__popc(group)) * weight;
+        }
+        base = __shfl_sync(kFullMask, base, leader);
+        if (group & (1U << lane)) {
+          const unsigned preceding = group & ((1U << lane) - 1);
+          ordinals[entry] =
+              base + static_cast<int64_t>(__popc(preceding)) * weight;
+        }
+        remaining &= ~group;
+      }
+      __syncwarp();
+    }
+  }
+}
 
 template <int MaxRanks = kMaxRanks, int FixedRanks = 0>
 __device__ void waterfill(const int64_t* loads, const bool* replicas,
@@ -905,7 +956,174 @@ __global__ void quota_traffic_kernel(
   }
 }
 
+__device__ int sparse_quota_destination(const int64_t* prefix,
+                                        const int64_t* targets,
+                                        const int64_t* primary,
+                                        int64_t ordinal, int64_t source,
+                                        int64_t expert, int64_t experts,
+                                        int64_t ranks) {
+  const int64_t offset = (source * experts + expert) * ranks;
+  for (int rank = 0; rank < ranks; ++rank) {
+    if (prefix[offset + rank] > ordinal) return targets[offset + rank];
+  }
+  return primary[expert];
+}
+
+__device__ int64_t sparse_quota_next_boundary(
+    const int64_t* prefix, int64_t ordinal, int64_t source, int64_t expert,
+    int64_t experts, int64_t ranks) {
+  const int64_t offset = (source * experts + expert) * ranks;
+  for (int rank = 0; rank < ranks; ++rank) {
+    if (prefix[offset + rank] > ordinal) return prefix[offset + rank];
+  }
+  return std::numeric_limits<int64_t>::max();
+}
+
+__global__ void sparse_quota_traffic_kernel(
+    const int64_t* source, const int64_t* topk, const int64_t* count,
+    const int64_t* prefix, const int64_t* targets, const int64_t* primary,
+    const int64_t* ordinals, int64_t* traffic, int64_t* compute,
+    int64_t tokens, int64_t k, int64_t experts, int64_t ranks) {
+  const int64_t token = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (token >= tokens) return;
+  const int64_t src = source[token];
+  const int64_t weight = count[token];
+  int64_t position = 0;
+  while (position < weight) {
+    int64_t next = weight;
+    for (int64_t col = 0; col < k; ++col) {
+      const int64_t index = token * k + col;
+      const int64_t boundary = sparse_quota_next_boundary(
+          prefix, ordinals[index] + position, src, topk[index], experts, ranks);
+      if (boundary > ordinals[index] + position &&
+          boundary - ordinals[index] < next)
+        next = boundary - ordinals[index];
+    }
+    if (next <= position) next = position + 1;
+    const int64_t segment = next - position;
+    unsigned long long seen_low = 0;
+    unsigned long long seen_high = 0;
+    for (int64_t col = 0; col < k; ++col) {
+      const int64_t index = token * k + col;
+      const int destination = sparse_quota_destination(
+          prefix, targets, primary, ordinals[index] + position, src,
+          topk[index], experts, ranks);
+      atomicAdd(reinterpret_cast<unsigned long long*>(compute + destination),
+                static_cast<unsigned long long>(segment));
+      const auto bit = 1ULL << (destination & 63);
+      auto& seen = destination < 64 ? seen_low : seen_high;
+      if (destination != src && !(seen & bit)) {
+        seen |= bit;
+        atomicAdd(reinterpret_cast<unsigned long long*>(
+                      traffic + src * ranks + destination),
+                  static_cast<unsigned long long>(segment));
+      }
+    }
+    position = next;
+  }
+}
+
+__device__ int csr_quota_destination(const int64_t* offsets,
+                                     const int64_t* boundaries,
+                                     const int64_t* targets,
+                                     const int64_t* primary, int64_t ordinal,
+                                     int64_t row, int64_t expert) {
+  for (int64_t position = offsets[row]; position < offsets[row + 1];
+       ++position) {
+    if (boundaries[position] > ordinal) return targets[position];
+  }
+  return primary[expert];
+}
+
+__device__ int64_t csr_quota_next_boundary(const int64_t* offsets,
+                                           const int64_t* boundaries,
+                                           int64_t ordinal, int64_t row) {
+  for (int64_t position = offsets[row]; position < offsets[row + 1];
+       ++position) {
+    if (boundaries[position] > ordinal) return boundaries[position];
+  }
+  return std::numeric_limits<int64_t>::max();
+}
+
+__global__ void csr_quota_traffic_kernel(
+    const int64_t* source, const int64_t* topk, const int64_t* count,
+    const int64_t* offsets, const int64_t* boundaries,
+    const int64_t* targets, const int64_t* primary, const int64_t* ordinals,
+    int64_t* traffic, int64_t* compute, int64_t tokens, int64_t k,
+    int64_t experts, int64_t ranks) {
+  const int64_t token =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (token >= tokens) return;
+  const int64_t src = source[token];
+  const int64_t weight = count[token];
+  int64_t position = 0;
+  while (position < weight) {
+    int64_t next = weight;
+    for (int64_t col = 0; col < k; ++col) {
+      const int64_t index = token * k + col;
+      const int64_t row = src * experts + topk[index];
+      const int64_t boundary = csr_quota_next_boundary(
+          offsets, boundaries, ordinals[index] + position, row);
+      if (boundary > ordinals[index] + position &&
+          boundary - ordinals[index] < next)
+        next = boundary - ordinals[index];
+    }
+    if (next <= position) next = position + 1;
+    const int64_t segment = next - position;
+    unsigned long long seen_low = 0;
+    unsigned long long seen_high = 0;
+    for (int64_t col = 0; col < k; ++col) {
+      const int64_t index = token * k + col;
+      const int64_t expert = topk[index];
+      const int64_t row = src * experts + expert;
+      const int destination = csr_quota_destination(
+          offsets, boundaries, targets, primary, ordinals[index] + position,
+          row, expert);
+      atomicAdd(reinterpret_cast<unsigned long long*>(compute + destination),
+                static_cast<unsigned long long>(segment));
+      const auto bit = 1ULL << (destination & 63);
+      auto& seen = destination < 64 ? seen_low : seen_high;
+      if (destination != src && !(seen & bit)) {
+        seen |= bit;
+        atomicAdd(reinterpret_cast<unsigned long long*>(
+                      traffic + src * ranks + destination),
+                  static_cast<unsigned long long>(segment));
+      }
+    }
+    position = next;
+  }
+}
+
 }  // namespace
+
+void bundle_ordinals_into(torch::Tensor source, torch::Tensor topk,
+                          torch::Tensor count, int64_t num_experts,
+                          int64_t num_ranks, torch::Tensor counters,
+                          torch::Tensor ordinals) {
+  TORCH_CHECK(source.is_cuda() && topk.is_cuda() && count.is_cuda() &&
+              counters.is_cuda() && ordinals.is_cuda());
+  TORCH_CHECK(source.scalar_type() == torch::kInt64 &&
+              topk.scalar_type() == torch::kInt64 &&
+              count.scalar_type() == torch::kInt64 &&
+              counters.scalar_type() == torch::kInt64 &&
+              ordinals.scalar_type() == torch::kInt64);
+  TORCH_CHECK(source.dim() == 1 && topk.dim() == 2 && count.dim() == 1 &&
+              source.size(0) == topk.size(0) && source.size(0) == count.size(0) &&
+              ordinals.sizes() == topk.sizes());
+  TORCH_CHECK(num_experts > 0 && num_ranks > 0 && num_ranks <= kMaxRanks &&
+              counters.dim() == 2 && counters.size(0) == num_experts &&
+              counters.size(1) == num_ranks);
+  auto stream = c10::cuda::getCurrentCUDAStream(source.get_device());
+  launch(bundle_ordinals_kernel,
+         dim3((num_ranks + kOrdinalWarpsPerBlock - 1) /
+              kOrdinalWarpsPerBlock),
+         dim3(kOrdinalWarpsPerBlock * 32), stream.stream(),
+         source.data_ptr<int64_t>(), topk.data_ptr<int64_t>(),
+         count.data_ptr<int64_t>(), counters.data_ptr<int64_t>(),
+         ordinals.data_ptr<int64_t>(), source.size(0), topk.size(1),
+         num_experts, num_ranks);
+  check_cuda(cudaGetLastError());
+}
 
 void solve_quota_into(
     torch::Tensor demand, torch::Tensor replicas, torch::Tensor primary,
@@ -923,7 +1141,7 @@ void solve_quota_into(
   TORCH_CHECK(demand.dim() == 2 && replicas.sizes() == demand.sizes());
   const int64_t experts = demand.size(0);
   const int64_t ranks = demand.size(1);
-  TORCH_CHECK(ranks > 0 && ranks <= kMaxRanks, "quota supports 1-128 ranks");
+  TORCH_CHECK(ranks > 0 && ranks <= kMaxRanks, "quota supports 1-64 ranks");
   TORCH_CHECK(primary.numel() == experts && routing.size(0) == ranks &&
               routing.size(1) == experts && expert_order.numel() == experts &&
               source_order.sizes() == routing.sizes());
@@ -979,7 +1197,7 @@ void solve_quota_into(
         next_routing.data_ptr<int64_t>(), instance.data_ptr<int64_t>(),
         loads.data_ptr<int64_t>(), experts, ranks, stream.stream());
   } else {
-    launch_fused_quota<128>(
+    launch_fused_quota<64>(
         demand.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
         primary.data_ptr<int64_t>(), routing.data_ptr<int64_t>(),
         expert_order.data_ptr<int64_t>(), source_order.data_ptr<int64_t>(),
@@ -1018,7 +1236,7 @@ void select_compute_replicas_into(
               demand.sizes() == replicas.sizes());
   const int64_t experts = demand.size(0);
   const int64_t ranks = demand.size(1);
-  TORCH_CHECK(ranks > 0 && ranks <= kMaxRanks, "compute replicas support 1-128 ranks");
+  TORCH_CHECK(ranks > 0 && ranks <= kMaxRanks, "compute replicas support 1-64 ranks");
   TORCH_CHECK(primary.numel() == experts && max_extra_per_rank >= 0);
   TORCH_CHECK(instance.is_cuda() && instance.scalar_type() == torch::kInt64 &&
               instance.sizes() == demand.sizes());
@@ -1072,7 +1290,7 @@ void select_compute_replicas_into(
            plan_quota.data_ptr<int64_t>(), routing.data_ptr<int64_t>(),
            added.data_ptr<int64_t>(), experts, ranks, max_extra_per_rank);
   } else {
-    launch(select_compute_replicas_kernel<128>, dim3(1), dim3(128), stream.stream(),
+    launch(select_compute_replicas_kernel<64>, dim3(1), dim3(128), stream.stream(),
            demand.data_ptr<int64_t>(), primary.data_ptr<int64_t>(), replicas.data_ptr<bool>(),
            instance.data_ptr<int64_t>(), loads.data_ptr<int64_t>(),
            added_by_rank.data_ptr<int64_t>(), addition_order.data_ptr<int64_t>(),
@@ -1108,7 +1326,7 @@ std::tuple<torch::Tensor, torch::Tensor> quota_traffic(
               quota.is_cuda() && replicas.is_cuda() && primary.is_cuda() &&
               addition_order.is_cuda() && ordinals.is_cuda());
   TORCH_CHECK(num_ranks > 0 && num_ranks <= kMaxRanks,
-              "quota traffic supports 1-128 ranks");
+              "quota traffic supports 1-64 ranks");
   TORCH_CHECK(source.scalar_type() == torch::kInt64 &&
               topk.scalar_type() == torch::kInt64 &&
               count.scalar_type() == torch::kInt64 &&
@@ -1133,6 +1351,80 @@ std::tuple<torch::Tensor, torch::Tensor> quota_traffic(
          addition_order.data_ptr<int64_t>(), ordinals.data_ptr<int64_t>(),
          traffic.data_ptr<int64_t>(), compute.data_ptr<int64_t>(), tokens,
          topk.size(1), experts, num_ranks);
+  check_cuda(cudaGetLastError());
+  return {traffic, compute};
+}
+
+std::tuple<torch::Tensor, torch::Tensor> sparse_quota_traffic(
+    torch::Tensor source, torch::Tensor topk, torch::Tensor count,
+    torch::Tensor prefix, torch::Tensor targets, torch::Tensor primary,
+    torch::Tensor ordinals, int64_t num_ranks) {
+  TORCH_CHECK(source.is_cuda() && topk.is_cuda() && count.is_cuda() &&
+              prefix.is_cuda() && targets.is_cuda() && primary.is_cuda() &&
+              ordinals.is_cuda());
+  TORCH_CHECK(source.scalar_type() == torch::kInt64 &&
+              topk.scalar_type() == torch::kInt64 &&
+              count.scalar_type() == torch::kInt64 &&
+              prefix.scalar_type() == torch::kInt64 &&
+              targets.scalar_type() == torch::kInt64 &&
+              primary.scalar_type() == torch::kInt64 &&
+              ordinals.scalar_type() == torch::kInt64);
+  TORCH_CHECK(source.dim() == 1 && topk.dim() == 2 && count.dim() == 1 &&
+              source.size(0) == topk.size(0) && source.size(0) == count.size(0) &&
+              topk.sizes() == ordinals.sizes());
+  const int64_t experts = primary.numel();
+  TORCH_CHECK(num_ranks > 0 && num_ranks <= kMaxRanks && prefix.dim() == 3 &&
+              prefix.size(0) == num_ranks && prefix.size(1) == experts &&
+              prefix.size(2) == num_ranks && targets.sizes() == prefix.sizes());
+  auto traffic = torch::zeros({num_ranks, num_ranks}, source.options());
+  auto compute = torch::zeros({num_ranks}, source.options());
+  auto stream = c10::cuda::getCurrentCUDAStream(source.get_device());
+  launch(sparse_quota_traffic_kernel,
+         dim3((source.size(0) + 255) / 256), dim3(256), stream.stream(),
+         source.data_ptr<int64_t>(), topk.data_ptr<int64_t>(),
+         count.data_ptr<int64_t>(), prefix.data_ptr<int64_t>(),
+         targets.data_ptr<int64_t>(), primary.data_ptr<int64_t>(),
+         ordinals.data_ptr<int64_t>(), traffic.data_ptr<int64_t>(),
+         compute.data_ptr<int64_t>(), source.size(0), topk.size(1), experts,
+         num_ranks);
+  check_cuda(cudaGetLastError());
+  return {traffic, compute};
+}
+
+std::tuple<torch::Tensor, torch::Tensor> csr_quota_traffic(
+    torch::Tensor source, torch::Tensor topk, torch::Tensor count,
+    torch::Tensor offsets, torch::Tensor boundaries, torch::Tensor targets,
+    torch::Tensor primary, torch::Tensor ordinals, int64_t num_ranks) {
+  TORCH_CHECK(source.is_cuda() && topk.is_cuda() && count.is_cuda() &&
+              offsets.is_cuda() && boundaries.is_cuda() && targets.is_cuda() &&
+              primary.is_cuda() && ordinals.is_cuda());
+  TORCH_CHECK(source.scalar_type() == torch::kInt64 &&
+              topk.scalar_type() == torch::kInt64 &&
+              count.scalar_type() == torch::kInt64 &&
+              offsets.scalar_type() == torch::kInt64 &&
+              boundaries.scalar_type() == torch::kInt64 &&
+              targets.scalar_type() == torch::kInt64 &&
+              primary.scalar_type() == torch::kInt64 &&
+              ordinals.scalar_type() == torch::kInt64);
+  TORCH_CHECK(source.dim() == 1 && topk.dim() == 2 && count.dim() == 1 &&
+              source.size(0) == topk.size(0) && source.size(0) == count.size(0) &&
+              topk.sizes() == ordinals.sizes());
+  const int64_t experts = primary.numel();
+  const int64_t rows = experts * num_ranks;
+  TORCH_CHECK(num_ranks > 0 && num_ranks <= kMaxRanks && offsets.dim() == 1 &&
+              offsets.numel() == rows + 1 && boundaries.dim() == 1 &&
+              targets.dim() == 1 && boundaries.numel() == targets.numel());
+  auto traffic = torch::zeros({num_ranks, num_ranks}, source.options());
+  auto compute = torch::zeros({num_ranks}, source.options());
+  auto stream = c10::cuda::getCurrentCUDAStream(source.get_device());
+  launch(csr_quota_traffic_kernel,
+         dim3((source.size(0) + 255) / 256), dim3(256), stream.stream(),
+         source.data_ptr<int64_t>(), topk.data_ptr<int64_t>(),
+         count.data_ptr<int64_t>(), offsets.data_ptr<int64_t>(),
+         boundaries.data_ptr<int64_t>(), targets.data_ptr<int64_t>(),
+         primary.data_ptr<int64_t>(), ordinals.data_ptr<int64_t>(),
+         traffic.data_ptr<int64_t>(), compute.data_ptr<int64_t>(),
+         source.size(0), topk.size(1), experts, num_ranks);
   check_cuda(cudaGetLastError());
   return {traffic, compute};
 }

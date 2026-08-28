@@ -121,6 +121,106 @@ def test_kernels() -> None:
         strict_group_source,
         1,
     )
+    # Fixed-K demand/gain paths must remain equivalent to the generic kernels.
+    for k in (1, 2, 4, 8, 16, 10):
+        test_tokens = 257
+        test_ranks = 4
+        test_experts = 16
+        test_source = torch.arange(test_tokens, device="cuda") % test_ranks
+        test_topk = (
+            torch.arange(test_tokens * k, device="cuda")
+            .view(test_tokens, k)
+            .remainder(test_experts)
+            .to(torch.int64)
+        )
+        test_count = (torch.arange(test_tokens, device="cuda") % 7 + 1).to(
+            torch.int64
+        )
+        test_primary = torch.arange(test_experts, device="cuda") % test_ranks
+        generic_demand = _C.source_demand(
+            test_source, test_topk, test_count, test_experts, test_ranks
+        )
+        fused_demand, _, _ = _C.fused_source_topn(
+            test_source,
+            test_topk,
+            test_count,
+            test_primary,
+            test_experts,
+            test_ranks,
+            2,
+        )
+        assert torch.equal(fused_demand, generic_demand)
+
+        replicas = torch.nn.functional.one_hot(
+            test_primary, num_classes=test_ranks
+        ).bool()
+        replicas[:, 1] |= test_primary != 1
+        fast_gain = torch.empty_like(generic_demand)
+        generic_gain = torch.empty_like(generic_demand)
+        generic_cover = torch.empty(
+            (test_ranks, test_experts, test_ranks),
+            device="cuda",
+            dtype=torch.int64,
+        )
+        _C.current_bundle_gains_into(
+            test_source,
+            test_topk,
+            test_count,
+            test_primary,
+            replicas,
+            generic_gain,
+            generic_cover,
+            1,
+        )
+        _C.current_bundle_gains_fast_into(
+            test_source,
+            test_topk,
+            test_count,
+            test_primary,
+            replicas,
+            fast_gain,
+            1,
+        )
+        assert torch.equal(fast_gain, generic_gain)
+
+    # The shared group-source implementation is used for EP32/64 and must
+    # agree with its single-block and multi-block reductions.
+    for test_ranks in (32, 64):
+        test_experts = test_ranks
+        test_tokens = 513
+        test_k = 8
+        test_source = torch.arange(test_tokens, device="cuda") % test_ranks
+        test_topk = (
+            torch.arange(test_tokens * test_k, device="cuda")
+            .view(test_tokens, test_k)
+            .remainder(test_experts)
+            .to(torch.int64)
+        )
+        test_count = (torch.arange(test_tokens, device="cuda") % 11 + 1).to(
+            torch.int64
+        )
+        test_groups = torch.arange(test_experts, device="cuda") % test_ranks
+        single_group_source = torch.empty(
+            (test_ranks, test_ranks), device="cuda", dtype=torch.int64
+        )
+        multi_group_source = torch.empty_like(single_group_source)
+        _C.group_source_into(
+            test_source,
+            test_topk,
+            test_count,
+            test_groups,
+            single_group_source,
+            1,
+        )
+        _C.group_source_into(
+            test_source,
+            test_topk,
+            test_count,
+            test_groups,
+            multi_group_source,
+            4,
+        )
+        assert torch.equal(single_group_source, multi_group_source)
     strict_primary = torch.empty_like(strict_groups)
     _C.congestion_hungarian_into(
         strict_group_source,
@@ -338,6 +438,226 @@ def test_kernels() -> None:
     assert shared_gains.cpu().tolist() == [[0, 0], [0, 0]]
     assert shared_covers[0].cpu().tolist() == [[0, 10], [0, 10]]
 
+    # The fast current-gain path must remain bit-for-bit equivalent for the
+    # compile-time K specializations and for the dynamic fallback.
+    gain_tokens = 19
+    gain_experts = 5
+    gain_ranks = 4
+    gain_source = (
+        torch.arange(gain_tokens, device="cuda", dtype=torch.int64) % gain_ranks
+    )
+    gain_count = torch.arange(1, gain_tokens + 1, device="cuda", dtype=torch.int64)
+    gain_primary = torch.tensor([0, 1, 2, 3, 0], device="cuda", dtype=torch.int64)
+    gain_replicas = torch.nn.functional.one_hot(
+        gain_primary, num_classes=gain_ranks
+    ).bool()
+    gain_replicas[1, 0] = True
+    gain_replicas[4, 2] = True
+    for gain_k in (1, 2, 4, 8, 16, 10):
+        gain_topk = (
+            torch.arange(gain_tokens * gain_k, device="cuda", dtype=torch.int64)
+            % gain_experts
+        ).view(gain_tokens, gain_k)
+        ordinal_keys = (gain_source[:, None] * gain_experts + gain_topk).reshape(
+            -1
+        )
+        ordinal_weights = gain_count[:, None].expand_as(gain_topk).reshape(-1)
+        sorted_keys, ordinal_order = torch.sort(ordinal_keys, stable=True)
+        sorted_weights = ordinal_weights[ordinal_order]
+        ordinal_before = sorted_weights.cumsum(0) - sorted_weights
+        ordinal_starts = torch.empty_like(sorted_keys, dtype=torch.bool)
+        ordinal_starts[0] = True
+        ordinal_starts[1:] = sorted_keys[1:] != sorted_keys[:-1]
+        ordinal_base = torch.cummax(
+            torch.where(ordinal_starts, ordinal_before, 0), dim=0
+        ).values
+        expected_ordinals = torch.empty_like(ordinal_before)
+        expected_ordinals.scatter_(
+            0, ordinal_order, ordinal_before - ordinal_base
+        )
+        expected_ordinals = expected_ordinals.view_as(gain_topk)
+        actual_ordinals = torch.empty_like(gain_topk)
+        _C.bundle_ordinals_into(
+            gain_source,
+            gain_topk,
+            gain_count,
+            gain_experts,
+            gain_ranks,
+            torch.empty(
+                (gain_experts, gain_ranks), device="cuda", dtype=torch.int64
+            ),
+            actual_ordinals,
+        )
+        assert torch.equal(actual_ordinals, expected_ordinals)
+        reference = torch.empty_like(gain_replicas, dtype=torch.int64)
+        reference_covers = torch.empty(
+            (gain_ranks, gain_experts, gain_ranks),
+            device="cuda",
+            dtype=torch.int64,
+        )
+        fast = torch.empty_like(reference)
+        _C.current_bundle_gains_into(
+            gain_source,
+            gain_topk,
+            gain_count,
+            gain_primary,
+            gain_replicas,
+            reference,
+            reference_covers,
+            1,
+        )
+        _C.current_bundle_gains_fast_into(
+            gain_source,
+            gain_topk,
+            gain_count,
+            gain_primary,
+            gain_replicas,
+            fast,
+            1,
+        )
+        assert torch.equal(fast, reference)
+        fast_multi = torch.empty_like(reference)
+        _C.current_bundle_gains_fast_into(
+            gain_source,
+            gain_topk,
+            gain_count,
+            gain_primary,
+            gain_replicas,
+            fast_multi,
+            2,
+        )
+        assert torch.equal(fast_multi, reference)
+
+        # The indexed path starts from primary-only gains and applies deltas
+        # only for bundles touched by newly local replicas.
+        indexed_demand = torch.empty_like(reference)
+        indexed_initial = torch.empty_like(reference)
+        indexed_replicas = torch.empty_like(gain_replicas)
+        indexed_routing = torch.empty(
+            (gain_ranks, gain_experts), device="cuda", dtype=torch.int64
+        )
+        bundle_heads = torch.empty_like(reference, dtype=torch.int32)
+        bundle_next = torch.empty(
+            gain_topk.numel(), device="cuda", dtype=torch.int32
+        )
+        _C.fused_source_topn_index_into(
+            gain_source,
+            gain_topk,
+            gain_count,
+            gain_primary,
+            gain_experts,
+            gain_ranks,
+            0,
+            indexed_demand,
+            indexed_initial,
+            indexed_replicas,
+            indexed_routing,
+            bundle_heads,
+            bundle_next,
+        )
+        assert torch.equal(
+            indexed_demand,
+            _C.source_demand(
+                gain_source, gain_topk, gain_count, gain_experts, gain_ranks
+            ),
+        )
+        bundle_marks = torch.zeros(
+            gain_tokens, device="cuda", dtype=torch.int32
+        )
+        assert bundle_heads.element_size() == 4
+        assert bundle_next.element_size() == 4
+        assert bundle_marks.element_size() == 4
+        for incremental_sms, epoch in ((1, 1), (2, 2)):
+            incremental = indexed_initial.clone()
+            _C.incremental_bundle_gains_fast_into(
+                gain_source,
+                gain_topk,
+                gain_count,
+                gain_primary,
+                gain_replicas,
+                incremental,
+                bundle_heads,
+                bundle_next,
+                bundle_marks,
+                epoch,
+                incremental_sms,
+            )
+            assert torch.equal(incremental, reference)
+
+        fused_demand_k, fused_replicas_k, fused_routing_k = _C.fused_source_topn(
+            gain_source,
+            gain_topk,
+            gain_count,
+            gain_primary,
+            gain_experts,
+            gain_ranks,
+            2,
+        )
+        expected_demand_k = _C.source_demand(
+            gain_source, gain_topk, gain_count, gain_experts, gain_ranks
+        )
+        expected_gains_k = torch.empty_like(expected_demand_k)
+        expected_replicas_k = torch.empty_like(gain_replicas)
+        expected_routing_k = torch.empty_like(fused_routing_k)
+        _C.select_bundle_topn_routing_into(
+            gain_source,
+            gain_topk,
+            gain_count,
+            gain_primary,
+            2,
+            expected_gains_k,
+            expected_replicas_k,
+            expected_routing_k,
+            1,
+        )
+        assert torch.equal(fused_demand_k, expected_demand_k)
+        assert torch.equal(fused_replicas_k, expected_replicas_k)
+        assert torch.equal(fused_routing_k, expected_routing_k)
+
+        selected_initial = torch.empty_like(reference)
+        selected_replicas = torch.empty_like(gain_replicas)
+        selected_routing = torch.empty_like(fused_routing_k)
+        _C.select_bundle_topn_routing_index_into(
+            gain_source,
+            gain_topk,
+            gain_count,
+            gain_primary,
+            2,
+            selected_initial,
+            selected_replicas,
+            selected_routing,
+            bundle_heads,
+            bundle_next,
+            1,
+        )
+        assert torch.equal(selected_replicas, fused_replicas_k)
+        assert torch.equal(selected_routing, fused_routing_k)
+        selected_reference = torch.empty_like(reference)
+        _C.current_bundle_gains_fast_into(
+            gain_source,
+            gain_topk,
+            gain_count,
+            gain_primary,
+            selected_replicas,
+            selected_reference,
+            1,
+        )
+        selected_incremental = selected_initial.clone()
+        _C.incremental_bundle_gains_fast_into(
+            gain_source,
+            gain_topk,
+            gain_count,
+            gain_primary,
+            selected_replicas,
+            selected_incremental,
+            bundle_heads,
+            bundle_next,
+            bundle_marks,
+            3,
+            1,
+        )
+        assert torch.equal(selected_incremental, selected_reference)
+
     traffic, compute = _C.traffic(source, topk, count, primary, replicas, 2)
     assert traffic.cpu().tolist() == [[0, 5], [3, 0]]
     assert compute.cpu().tolist() == [7, 13]
@@ -503,6 +823,265 @@ def test_kernels() -> None:
     assert v2_quota.sum(dim=(0, 1)).cpu().tolist() == [10, 10]
     assert v2_loads.cpu().tolist() == [10, 10]
     assert torch.equal(v2_quota.sum(dim=2), v2_demand.t())
+
+    # Sparse export must reconstruct the dense fast-capacity plan exactly.
+    fast_replicas = initial.clone()
+    fast_instance = torch.empty_like(v2_demand)
+    fast_loads = torch.empty_like(v2_loads)
+    fast_slots = torch.empty_like(v2_slots)
+    fast_order = torch.empty_like(v2_order)
+    fast_move_plan = torch.empty_like(v2_demand)
+    fast_quota = torch.empty_like(v2_quota)
+    fast_routing = torch.empty_like(v2_routing)
+    fast_added = torch.empty_like(v2_added)
+    fast_candidates = torch.empty(44, device="cuda", dtype=torch.int64)
+    _C.select_compute_replicas_fast_into(
+        v2_demand,
+        torch.tensor([[0, 0], [0, 10]], device="cuda", dtype=torch.int64),
+        fast_replicas,
+        torch.tensor([0, 0], device="cuda", dtype=torch.int64),
+        1,
+        1.0,
+        fast_instance,
+        fast_loads,
+        fast_slots,
+        fast_order,
+        fast_move_plan,
+        fast_quota,
+        fast_routing,
+        fast_added,
+        fast_candidates,
+        1,
+    )
+    multi_replicas = initial.clone()
+    multi_instance = torch.empty_like(v2_demand)
+    multi_loads = torch.empty_like(v2_loads)
+    multi_slots = torch.empty_like(v2_slots)
+    multi_order = torch.empty_like(v2_order)
+    multi_move_plan = torch.empty_like(v2_demand)
+    multi_quota = torch.empty_like(v2_quota)
+    multi_routing = torch.empty_like(v2_routing)
+    multi_added = torch.empty_like(v2_added)
+    multi_candidates = torch.empty(164, device="cuda", dtype=torch.int64)
+    _C.select_compute_replicas_fast_into(
+        v2_demand,
+        torch.tensor([[0, 0], [0, 10]], device="cuda", dtype=torch.int64),
+        multi_replicas,
+        torch.tensor([0, 0], device="cuda", dtype=torch.int64),
+        1,
+        1.0,
+        multi_instance,
+        multi_loads,
+        multi_slots,
+        multi_order,
+        multi_move_plan,
+        multi_quota,
+        multi_routing,
+        multi_added,
+        multi_candidates,
+        4,
+    )
+    for single_value, multi_value in zip(
+        (fast_replicas, fast_instance, fast_loads, fast_slots, fast_order,
+         fast_move_plan, fast_quota, fast_routing, fast_added),
+        (multi_replicas, multi_instance, multi_loads, multi_slots, multi_order,
+         multi_move_plan, multi_quota, multi_routing, multi_added),
+    ):
+        assert torch.equal(single_value, multi_value)
+    sparse_replicas = initial.clone()
+    sparse_instance = torch.empty_like(v2_demand)
+    sparse_loads = torch.empty_like(v2_loads)
+    sparse_slots = torch.empty_like(v2_slots)
+    sparse_order = torch.empty_like(v2_order)
+    sparse_move_plan = torch.empty_like(v2_demand)
+    sparse_added = torch.empty_like(v2_added)
+    _C.select_compute_replicas_fast_sparse_into(
+        v2_demand,
+        torch.tensor([[0, 0], [0, 10]], device="cuda", dtype=torch.int64),
+        sparse_replicas,
+        torch.tensor([0, 0], device="cuda", dtype=torch.int64),
+        1,
+        1.0,
+        sparse_instance,
+        sparse_loads,
+        sparse_slots,
+        sparse_order,
+        sparse_move_plan,
+        sparse_added,
+        fast_candidates,
+        1,
+    )
+    sparse_prefix = torch.empty_like(v2_quota)
+    sparse_targets = torch.empty_like(v2_quota)
+    sparse_routing = torch.empty_like(v2_routing)
+    csr_move_plan = sparse_move_plan.clone()
+    _C.materialize_fast_sparse_quota_into(
+        v2_demand,
+        torch.tensor([0, 0], device="cuda", dtype=torch.int64),
+        sparse_replicas,
+        sparse_order,
+        sparse_move_plan,
+        sparse_prefix,
+        sparse_targets,
+        sparse_routing,
+    )
+    sparse_delta = sparse_prefix.clone()
+    sparse_delta[:, :, 1:] = torch.where(
+        sparse_prefix[:, :, 1:] > 0,
+        sparse_prefix[:, :, 1:] - sparse_prefix[:, :, :-1],
+        torch.zeros_like(sparse_prefix[:, :, 1:]),
+    )
+    reconstructed = torch.zeros_like(v2_quota)
+    reconstructed.scatter_add_(2, sparse_targets, sparse_delta)
+    assert torch.equal(reconstructed, fast_quota)
+    assert torch.equal(sparse_replicas, fast_replicas)
+    assert torch.equal(sparse_order, fast_order)
+    assert torch.equal(sparse_routing, fast_routing)
+
+    csr_offsets = torch.empty(
+        (v2_demand.numel() + 1,), device="cuda", dtype=torch.int64
+    )
+    csr_boundaries = torch.empty(
+        v2_quota.numel(), device="cuda", dtype=torch.int64
+    )
+    csr_targets = torch.empty_like(csr_boundaries)
+    csr_routing = torch.empty_like(v2_routing)
+    _C.materialize_fast_csr_quota_into(
+        v2_demand,
+        torch.tensor([0, 0], device="cuda", dtype=torch.int64),
+        sparse_replicas,
+        sparse_order,
+        csr_move_plan,
+        torch.empty_like(v2_demand),
+        torch.empty(v2_demand.size(0), device="cuda", dtype=torch.int64),
+        csr_offsets,
+        csr_boundaries,
+        csr_targets,
+        csr_routing,
+    )
+    csr_offsets_cpu = csr_offsets.cpu().tolist()
+    csr_nnz = csr_offsets_cpu[-1]
+    assert csr_nnz == 6
+    assert csr_nnz < v2_quota.numel()
+    csr_boundaries_cpu = csr_boundaries[:csr_nnz].cpu().tolist()
+    csr_targets_cpu = csr_targets[:csr_nnz].cpu().tolist()
+    csr_reconstructed = torch.zeros_like(v2_quota).view(-1, 2)
+    for row in range(v2_demand.numel()):
+        previous = 0
+        for position in range(csr_offsets_cpu[row], csr_offsets_cpu[row + 1]):
+            boundary = csr_boundaries_cpu[position]
+            csr_reconstructed[row, csr_targets_cpu[position]] = (
+                boundary - previous
+            )
+            previous = boundary
+    assert torch.equal(csr_reconstructed.view_as(v2_quota), fast_quota)
+    assert torch.equal(csr_routing, fast_routing)
+
+    # EP32 exercises both supported CTA modes. Their result must be
+    # independent of the configured number of solver CTAs.
+    large_ranks = 32
+    large_experts = 32
+    large_demand = torch.zeros(
+        (large_experts, large_ranks), device="cuda", dtype=torch.int64
+    )
+    large_demand[:, 0] = 10
+    large_gain = torch.zeros_like(large_demand)
+    large_primary = torch.zeros(
+        large_experts, device="cuda", dtype=torch.int64
+    )
+    large_initial = torch.zeros_like(large_demand, dtype=torch.bool)
+    large_initial[:, 0] = True
+
+    def run_large_aggregate(solver_ctas):
+        replicas_out = large_initial.clone()
+        instance_out = torch.empty_like(large_demand)
+        loads_out = torch.empty(
+            large_ranks, device="cuda", dtype=torch.int64
+        )
+        slots_out = torch.empty_like(loads_out)
+        order_out = torch.empty_like(large_demand)
+        moves_out = torch.empty_like(large_demand)
+        added_out = torch.empty(1, device="cuda", dtype=torch.int64)
+        candidates = torch.empty(
+            solver_ctas * 8 * 5 + 4, device="cuda", dtype=torch.int64
+        )
+        _C.select_compute_replicas_fast_sparse_into(
+            large_demand,
+            large_gain,
+            replicas_out,
+            large_primary,
+            1,
+            1.0,
+            instance_out,
+            loads_out,
+            slots_out,
+            order_out,
+            moves_out,
+            added_out,
+            candidates,
+            solver_ctas,
+        )
+        return (
+            replicas_out,
+            loads_out,
+            slots_out,
+            order_out,
+            moves_out,
+            added_out,
+        )
+
+    large_single = run_large_aggregate(1)
+    large_multi = run_large_aggregate(4)
+    # The single-CTA path is valid even when EP is larger than the
+    # shared-memory-specialized range.
+    assert large_single[1].cpu().tolist() == [10] * large_ranks
+    assert large_single[5].item() == large_ranks - 1
+    for single_value, multi_value in zip(large_single, large_multi):
+        assert torch.equal(single_value, multi_value)
+    assert large_multi[1].cpu().tolist() == [10] * large_ranks
+    assert large_multi[2].cpu().tolist() == [0] + [1] * (large_ranks - 1)
+    assert large_multi[5].item() == large_ranks - 1
+
+    sparse_source = torch.tensor([1, 1], device="cuda", dtype=torch.int64)
+    sparse_topk = torch.tensor([[0], [1]], device="cuda", dtype=torch.int64)
+    sparse_count = torch.tensor([10, 10], device="cuda", dtype=torch.int64)
+    sparse_ordinals = torch.zeros_like(sparse_topk)
+    dense_traffic, dense_compute = _C.quota_traffic(
+        sparse_source,
+        sparse_topk,
+        sparse_count,
+        fast_quota,
+        fast_replicas,
+        torch.tensor([0, 0], device="cuda", dtype=torch.int64),
+        fast_order,
+        sparse_ordinals,
+        2,
+    )
+    sparse_traffic, sparse_compute = _C.sparse_quota_traffic(
+        sparse_source,
+        sparse_topk,
+        sparse_count,
+        sparse_prefix,
+        sparse_targets,
+        torch.tensor([0, 0], device="cuda", dtype=torch.int64),
+        sparse_ordinals,
+        2,
+    )
+    csr_traffic, csr_compute = _C.csr_quota_traffic(
+        sparse_source,
+        sparse_topk,
+        sparse_count,
+        csr_offsets,
+        csr_boundaries,
+        csr_targets,
+        torch.tensor([0, 0], device="cuda", dtype=torch.int64),
+        sparse_ordinals,
+        2,
+    )
+    assert torch.equal(sparse_traffic, dense_traffic)
+    assert torch.equal(sparse_compute, dense_compute)
+    assert torch.equal(csr_traffic, dense_traffic)
+    assert torch.equal(csr_compute, dense_compute)
 
     # A scarce replica slot must go to the expert that can remove the
     # overload, even when a tiny candidate has a better communication score.

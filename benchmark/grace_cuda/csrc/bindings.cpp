@@ -48,10 +48,18 @@ void select_rank_group_topn_routing_into(
 void select_bundle_topn_routing_into(
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
     torch::Tensor, torch::Tensor, torch::Tensor, int64_t);
+void select_bundle_topn_routing_index_into(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    int64_t);
 void fused_source_topn_into(torch::Tensor, torch::Tensor, torch::Tensor,
                             torch::Tensor, int64_t, int64_t, int64_t,
                             torch::Tensor, torch::Tensor, torch::Tensor,
                             torch::Tensor);
+void fused_source_topn_index_into(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
+    int64_t, int64_t, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor);
 torch::Tensor default_routing(torch::Tensor, torch::Tensor);
 void default_routing_into(torch::Tensor, torch::Tensor, torch::Tensor);
 std::tuple<torch::Tensor, torch::Tensor> traffic(
@@ -66,6 +74,8 @@ void solve_quota_into(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor
 std::tuple<torch::Tensor, torch::Tensor> quota_traffic(
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
     torch::Tensor, torch::Tensor, torch::Tensor, int64_t);
+void bundle_ordinals_into(torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
+                          int64_t, torch::Tensor, torch::Tensor);
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> select_compute_replicas(
     torch::Tensor, torch::Tensor, torch::Tensor, int64_t);
 void select_compute_replicas_into(
@@ -84,13 +94,39 @@ void select_compute_replicas_v2_into(
 void select_compute_replicas_fast_into(
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t, double,
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t);
+void select_compute_replicas_fast_sparse_into(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t, double,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, int64_t);
+void materialize_fast_sparse_quota_into(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
     torch::Tensor, torch::Tensor, torch::Tensor);
+void materialize_fast_csr_quota_into(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor);
+std::tuple<torch::Tensor, torch::Tensor> sparse_quota_traffic(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, int64_t);
+std::tuple<torch::Tensor, torch::Tensor> csr_quota_traffic(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, int64_t);
 void current_bundle_gains_into(torch::Tensor, torch::Tensor, torch::Tensor,
                                torch::Tensor, torch::Tensor, torch::Tensor,
                                torch::Tensor, int64_t);
 void current_bundle_gains_fast_into(torch::Tensor, torch::Tensor, torch::Tensor,
                                     torch::Tensor, torch::Tensor, torch::Tensor,
                                     int64_t);
+void current_bundle_gains_and_select_compute_replicas_fast_into(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, int64_t, double, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor);
+void incremental_bundle_gains_fast_into(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t,
+    int64_t);
 }  // namespace grace_cuda
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -114,13 +150,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         &grace_cuda::select_rank_group_topn_routing_into);
   m.def("select_bundle_topn_routing_into",
         &grace_cuda::select_bundle_topn_routing_into);
+  m.def("select_bundle_topn_routing_index_into",
+        &grace_cuda::select_bundle_topn_routing_index_into);
   m.def("fused_source_topn_into", &grace_cuda::fused_source_topn_into);
+  m.def("fused_source_topn_index_into",
+        &grace_cuda::fused_source_topn_index_into);
   m.def("default_routing", &grace_cuda::default_routing);
   m.def("default_routing_into", &grace_cuda::default_routing_into);
   m.def("traffic", &grace_cuda::traffic);
   m.def("solve_quota", &grace_cuda::solve_quota);
   m.def("solve_quota_into", &grace_cuda::solve_quota_into);
   m.def("quota_traffic", &grace_cuda::quota_traffic);
+  m.def("bundle_ordinals_into", &grace_cuda::bundle_ordinals_into);
   m.def("select_compute_replicas", &grace_cuda::select_compute_replicas);
   m.def("select_compute_replicas_into", &grace_cuda::select_compute_replicas_into);
   m.def("select_pure_compute_replicas_into",
@@ -129,7 +170,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         &grace_cuda::select_compute_replicas_v2_into);
   m.def("select_compute_replicas_fast_into",
         &grace_cuda::select_compute_replicas_fast_into);
+  m.def("select_compute_replicas_fast_sparse_into",
+        &grace_cuda::select_compute_replicas_fast_sparse_into);
+  m.def("materialize_fast_sparse_quota_into",
+        &grace_cuda::materialize_fast_sparse_quota_into);
+  m.def("materialize_fast_csr_quota_into",
+        &grace_cuda::materialize_fast_csr_quota_into);
+  m.def("sparse_quota_traffic", &grace_cuda::sparse_quota_traffic);
+  m.def("csr_quota_traffic", &grace_cuda::csr_quota_traffic);
   m.def("current_bundle_gains_into", &grace_cuda::current_bundle_gains_into);
   m.def("current_bundle_gains_fast_into",
         &grace_cuda::current_bundle_gains_fast_into);
+  m.def("current_bundle_gains_and_select_compute_replicas_fast_into",
+        &grace_cuda::current_bundle_gains_and_select_compute_replicas_fast_into);
+  m.def("incremental_bundle_gains_fast_into",
+        &grace_cuda::incremental_bundle_gains_fast_into);
 }
